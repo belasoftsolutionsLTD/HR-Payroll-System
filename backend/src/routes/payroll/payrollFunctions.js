@@ -19,11 +19,11 @@ const listPayroll = async (req, res) => {
     findMany('payroll_summaries', filter, { skip, limit, sort: { year: -1, month: -1 } }),
   ]);
 
-  // Join employee name + staffNumber
-  const enriched = await Promise.all(records.map(async (r) => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-    return { ...r, employee: emp ?? null };
-  }));
+  // Batch-load employee names (avoids N+1)
+  const prEmpIds = [...new Set(records.map(r => r.employeeId))];
+  const prEmps = await findMany('employees', { _id: { $in: prEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const prEmpMap = Object.fromEntries(prEmps.map(e => [String(e._id), e]));
+  const enriched = records.map(r => ({ ...r, employee: prEmpMap[String(r.employeeId)] ?? null }));
 
   // Monthly totals (only when filtering by a specific month/year)
   let totals = null;

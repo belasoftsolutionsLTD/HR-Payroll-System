@@ -2,6 +2,8 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR } = require('../inbox/inboxFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { getDefaultOnboardingTasks } = require('../../functions/HR/onboardingTemplates');
 const { sendEmail } = require('../../services/emailService');
@@ -22,6 +24,7 @@ const buildStageEmail = (name, position, stage) => {
 const listApplicants = async (req, res) => {
   const filter = {};
   if (req.query.stage) filter.stage = req.query.stage;
+  if (req.query.source) filter.source = req.query.source;
   if (req.query.positionApplied) filter.positionApplied = new ObjectId(req.query.positionApplied);
   const { page, limit, skip } = getPagination(req.query);
   const [total, data] = await Promise.all([
@@ -45,17 +48,22 @@ const listApplicants = async (req, res) => {
 
 const createApplicant = async (req, res) => {
   if (!validateRequiredFields(req, res, ['fullName', 'email', 'positionApplied'])) return;
+  const position = await findOne('job_positions', { _id: new ObjectId(req.body.positionApplied) }, { projection: { jobTitle: 1 } });
   const doc = {
     fullName: req.body.fullName,
     email: req.body.email,
     phone: req.body.phone || null,
     positionApplied: new ObjectId(req.body.positionApplied),
-    stage: 'applied',
+    positionTitle: position?.jobTitle || null,
+    stage: STAGES.includes(req.body.stage) ? req.body.stage : 'applied',
+    source: req.body.source || 'hr_manual',
+    appliedAt: req.body.appliedAt ? new Date(req.body.appliedAt) : new Date(),
     approvalStatus: 'pending',
     approvedBy: null,
     cvFilePath: req.file ? req.file.path : null,
     cvFilename: req.file ? req.file.filename : null,
     coverLetter: req.body.coverLetter || null,
+    notes: req.body.notes || null,
     otherDocuments: [],
     interviewNotes: null,
     interviewScheduleId: null,
@@ -66,19 +74,18 @@ const createApplicant = async (req, res) => {
   };
   const result = await insertOne('applicants', doc);
 
-  // Notify HR managers
-  const position = await findOne('job_positions', { _id: doc.positionApplied }, { projection: { jobTitle: 1 } });
-  const hrUsers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] } }, { projection: { _id: 1 } });
-  if (hrUsers.length) {
-    await global.dbo.collection('notifications').insertMany(hrUsers.map((u) => ({
-      userId: u._id,
-      title: 'New Application',
-      message: `${doc.fullName} applied for ${position?.jobTitle || 'a position'}.`,
-      type: 'recruitment',
-      read: false,
-      createdAt: new Date(),
-    })));
-  }
+  notifyHR({
+    type: 'recruitment', subType: 'new_application',
+    title: 'New Application',
+    subtitle: `${doc.fullName} applied for ${position?.jobTitle || 'a position'}.`,
+    referenceId: result.insertedId, referenceModel: 'applicants',
+    requiresAction: true, triggeredBy: null,
+  }).catch(() => {});
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'New Application',
+    body: `${doc.fullName} applied for ${position?.jobTitle || 'a position'}.`,
+    type: 'recruitment',
+  }).catch(() => {});
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
@@ -125,6 +132,15 @@ const patchApplicantStage = async (req, res) => {
     }).catch((e) => console.error('Email failed:', e.message));
   }
 
+  let hiredEmployeeId = null;
+
+  if (req.body.stage === applicant.stage) {
+    return returnFunction(res, 400, false, 'Applicant is already at this stage.');
+  }
+  if (applicant.stage === 'hired') {
+    return returnFunction(res, 400, false, 'Hired applicants cannot be moved to another stage.');
+  }
+
   if (req.body.stage === 'hired') {
     const position = applicant.positionApplied
       ? await findOne('job_positions', { _id: applicant.positionApplied })
@@ -157,10 +173,10 @@ const patchApplicantStage = async (req, res) => {
     };
 
     const empResult = await insertOne('employees', empDoc);
-    const employeeId = empResult.insertedId;
+    hiredEmployeeId = empResult.insertedId.toString();
 
     await insertOne('leave_balances', {
-      employeeId,
+      employeeId: empResult.insertedId,
       year: hireDate.getFullYear(),
       balances: {
         annual:    { allocated: 21,   used: 0, remaining: 21 },
@@ -172,27 +188,42 @@ const patchApplicantStage = async (req, res) => {
       },
     });
 
-    const tasks = getDefaultOnboardingTasks(employeeId, hireDate.toISOString());
+    const tasks = getDefaultOnboardingTasks(empResult.insertedId, hireDate.toISOString());
     await global.dbo.collection('onboarding_tasks').insertMany(tasks);
 
-    const hrUsers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] } }, { projection: { _id: 1 } });
-    if (hrUsers.length) {
-      await global.dbo.collection('notifications').insertMany(hrUsers.map((u) => ({
-        userId: u._id,
-        title: 'New Hire',
-        message: `${applicant.fullName} has been hired as ${empDoc.designation}. Staff #: ${staffNumber}`,
-        type: 'new_hire',
-        read: false,
-        createdAt: new Date(),
-      })));
-    }
+    notifyHR({
+      type: 'recruitment', subType: 'new_hire',
+      title: 'New Hire',
+      subtitle: `${applicant.fullName} has been hired as ${empDoc.designation}. Staff #: ${staffNumber}`,
+      referenceId: empResult.insertedId, referenceModel: 'employees',
+      requiresAction: false, triggeredBy: req.user._id,
+    }).catch(() => {});
+    notifyByRoles(['super_admin', 'hr_manager'], {
+      title: 'New Hire',
+      body: `${applicant.fullName} has been hired as ${empDoc.designation}.`,
+      type: 'recruitment',
+    }).catch(() => {});
 
     if (position) {
       await updateOne('job_positions', { _id: applicant.positionApplied }, { $inc: { filledCount: 1 } });
     }
   }
 
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully, hiredEmployeeId ? { employeeId: hiredEmployeeId } : undefined);
+};
+
+const addApplicantNote = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['note'])) return;
+  const note = {
+    note: req.body.note.trim(),
+    addedBy: new ObjectId(req.user._id),
+    addedAt: new Date(),
+  };
+  await global.dbo.collection('applicants').updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $push: { internalNotes: note }, $set: { updatedAt: new Date() } }
+  );
+  return returnFunction(res, 200, true, 'Note added successfully.', note);
 };
 
 // Send offer letter as PDF via email
@@ -275,14 +306,11 @@ const createInterview = async (req, res) => {
 
   const interviewerUser = await findOne('users', { employeeId: doc.interviewerId }, { projection: { _id: 1 } });
   if (interviewerUser) {
-    await insertOne('notifications', {
-      userId: interviewerUser._id,
+    notifyUser(interviewerUser._id, {
       title: 'Interview Scheduled',
-      message: `You have an interview scheduled on ${doc.scheduledDate} at ${doc.scheduledTime}.`,
+      body: `You have an interview scheduled on ${doc.scheduledDate} at ${doc.scheduledTime}.`,
       type: 'interview',
-      read: false,
-      createdAt: new Date(),
-    });
+    }).catch(() => {});
   }
 
   // Email the applicant
@@ -338,4 +366,4 @@ const bulkPatchStage = async (req, res) => {
   return returnFunction(res, 200, true, `${ids.length} applicant(s) updated to ${stage}.`);
 };
 
-module.exports = { listApplicants, createApplicant, updateApplicant, deleteApplicant, patchApplicantStage, bulkPatchStage, sendOfferLetter, createInterview, updateInterview };
+module.exports = { listApplicants, createApplicant, updateApplicant, deleteApplicant, patchApplicantStage, bulkPatchStage, sendOfferLetter, createInterview, updateInterview, addApplicantNote };

@@ -6,8 +6,10 @@ const { validateRequiredFields, getPagination, paginatedResponse } = require('..
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { assignDefaultTasks } = require('../onboarding/onboardingFunctions');
+const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR } = require('../inbox/inboxFunctions');
 
-const DEPARTMENTS = ['Lower Primary','Upper Primary','Junior Secondary','Senior Secondary','Administration','Finance','ICT','Library','Games and Sports','Guidance and Counselling'];
+const DEPARTMENTS = ['Administration','Human Resources','Finance & Accounts','Information Technology','Operations','Sales & Marketing','Customer Service','Legal & Compliance','Procurement','Logistics & Supply Chain','Research & Development','Communications','Health & Safety','Facilities Management','Executive'];
 
 const revertExpiredLeaveStatuses = async () => {
   const today = new Date().toISOString().slice(0, 10);
@@ -51,7 +53,7 @@ const listEmployees = async (req, res) => {
     { staffNumber: { $regex: search, $options: 'i' } },
   ];
 
-  const { page, limit, skip } = getPagination(req.query);
+  const { page, limit, skip } = getPagination(req.query, 500);
   const [total, data] = await Promise.all([
     countDocuments('employees', filter),
     findMany('employees', filter, { skip, limit, sort: { createdAt: -1 }, projection: { password: 0 } }),
@@ -62,7 +64,11 @@ const listEmployees = async (req, res) => {
 const getEmployee = async (req, res) => {
   const employee = await findOne('employees', { _id: new ObjectId(req.params.id) });
   if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
-  return returnFunction(res, 200, true, req.locale.success, employee);
+  let manager = null;
+  if (employee.managerId) {
+    manager = await findOne('employees', { _id: employee.managerId }, { projection: { fullName: 1, designation: 1, department: 1 } });
+  }
+  return returnFunction(res, 200, true, req.locale.success, { ...employee, manager: manager ?? null });
 };
 
 const createEmployee = async (req, res) => {
@@ -84,19 +90,26 @@ const createEmployee = async (req, res) => {
     department: req.body.department,
     jobGroupId: req.body.jobGroupId || null,
     dateOfHire: new Date(req.body.dateOfHire),
+    dateOfBirth: req.body.dateOfBirth ? new Date(req.body.dateOfBirth) : null,
     contractEndDate: req.body.contractEndDate ? new Date(req.body.contractEndDate) : null,
     salaryGrade: req.body.salaryGrade,
     grossPay: req.body.grossPay ? Number(req.body.grossPay) : null,
-    paymentMethod: req.body.paymentMethod || 'bank_transfer', // 'bank_transfer' | 'mpesa' | 'cash'
+    paymentMethod: req.body.paymentMethod || 'bank_transfer',
     bankName: req.body.bankName || null,
     bankAccountNumber: req.body.bankAccountNumber || null,
     mpesaNumber: req.body.mpesaNumber || null,
+    paypalEmail: req.body.paypalEmail || null,
+    cryptoWalletAddress: req.body.cryptoWalletAddress || null,
+    cryptoNetwork: req.body.cryptoNetwork || null,
     email: req.body.email,
     phone: req.body.phone || null,
     nextOfKin: req.body.nextOfKin || null,
     profilePhoto: null,
     documents: [],
     staffCategory: req.body.staffCategory,
+    location:    req.body.location    || null,
+    costCenter:  req.body.costCenter  || null,
+    managerId:   req.body.managerId   ? new ObjectId(req.body.managerId) : null,
     status: 'active',
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -110,17 +123,31 @@ const createEmployee = async (req, res) => {
     employeeId: result.insertedId,
     year,
     balances: {
-      annual:    { allocated: 21,   used: 0, remaining: 21 },
-      sick:      { allocated: 30,   used: 0, remaining: 30 },
-      maternity: { allocated: 90,   used: 0, remaining: 90 },
-      paternity: { allocated: 14,   used: 0, remaining: 14 },
-      unpaid:    { allocated: null, used: 0, remaining: null },
-      emergency: { allocated: 3,    used: 0, remaining: 3 },
+      annual:        { allocated: 21,   used: 0, remaining: 21 },
+      sick:          { allocated: 30,   used: 0, remaining: 30 },
+      maternity:     { allocated: 90,   used: 0, remaining: 90 },
+      paternity:     { allocated: 14,   used: 0, remaining: 14 },
+      unpaid:        { allocated: null, used: 0, remaining: null },
+      compassionate: { allocated: 3,    used: 0, remaining: 3 },
+      study:         { allocated: 5,    used: 0, remaining: 5 },
+      emergency:     { allocated: 3,    used: 0, remaining: 3 },
     },
   });
 
   // Auto-assign onboarding tasks from templates (fire-and-forget)
   assignDefaultTasks(result.insertedId, req.body.dateOfHire).catch(() => {});
+
+  // Notify HR managers and super admins about new employee (fire-and-forget)
+  const newEmpMsg = `${doc.fullName} (${staffNumber}) has been added as ${doc.designation} in ${doc.department}.`;
+  notifyByRoles(['super_admin', 'hr_manager'], { title: '👤 New Employee Added', body: newEmpMsg, type: 'general' }).catch(() => {});
+  notifyHR({
+    type: 'hr', subType: 'new_employee',
+    title: '👤 New Employee Added',
+    subtitle: newEmpMsg,
+    referenceId: result.insertedId, referenceModel: 'employees',
+    requiresAction: false,
+    triggeredBy: req.user._id,
+  }).catch(() => {});
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, staffNumber });
 };
@@ -173,4 +200,25 @@ const downloadDocument = async (req, res) => {
   res.download(doc.filePath, doc.fileName);
 };
 
-module.exports = { listEmployees, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument };
+const getOrgChart = async (req, res) => {
+  const employees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, {
+    projection: { fullName: 1, designation: 1, department: 1, managerId: 1, profilePhoto: 1 },
+  });
+
+  // Build a map for O(1) child lookup
+  const nodeMap = {};
+  employees.forEach(e => { nodeMap[String(e._id)] = { ...e, reports: [] }; });
+
+  const roots = [];
+  employees.forEach(e => {
+    if (e.managerId && nodeMap[String(e.managerId)]) {
+      nodeMap[String(e.managerId)].reports.push(nodeMap[String(e._id)]);
+    } else {
+      roots.push(nodeMap[String(e._id)]);
+    }
+  });
+
+  return returnFunction(res, 200, true, 'Org chart fetched', roots);
+};
+
+module.exports = { listEmployees, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart };

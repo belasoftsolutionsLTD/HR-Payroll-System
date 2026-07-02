@@ -14,6 +14,9 @@ const {
   getMyAwards, getMyEvents,
   getNotificationPreference, toggleNotifications,
   getDepartmentData, deptActOnLeave,
+  getMyOffboardingTasks, completeMyOffboardingTask,
+  getMyTasks,
+  getMyProjects,
 } = require('./meFunctions');
 const { getMyAnnouncements, markAnnouncementRead } = require('../announcements/announcementFunctions');
 
@@ -59,8 +62,19 @@ router.get('/events', auth, AsyncHandler(getMyEvents));
 router.get('/notifications/preference',  auth, AsyncHandler(getNotificationPreference));
 router.patch('/notifications/toggle',    auth, AsyncHandler(toggleNotifications));
 
-// Department portal (department_head)
-router.get('/department',                   auth, AsyncHandler(getDepartmentData));
-router.patch('/department/leave/:id',       auth, AsyncHandler(deptActOnLeave));
+// Department portal (department_head and above only)
+const deptAuth = allowRoles(['super_admin', 'hr_manager', 'department_head']);
+router.get('/department',                   deptAuth, AsyncHandler(getDepartmentData));
+router.patch('/department/leave/:id',       deptAuth, AsyncHandler(deptActOnLeave));
+
+// Tasks assigned to me
+router.get('/tasks', auth, AsyncHandler(getMyTasks));
+
+// Projects I'm a member of
+router.get('/projects', auth, AsyncHandler(getMyProjects));
+
+// Offboarding (self-view for staff)
+router.get('/offboarding',                          auth, AsyncHandler(getMyOffboardingTasks));
+router.patch('/offboarding/tasks/:taskId/complete', auth, AsyncHandler(completeMyOffboardingTask));
 
 module.exports = router;

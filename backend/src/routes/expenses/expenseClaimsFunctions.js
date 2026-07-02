@@ -1,0 +1,400 @@
+const { ObjectId } = require('mongodb');
+const returnFunction = require('../../functions/returnFunction');
+const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
+const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const path = require('path');
+const fs   = require('fs');
+const { createInboxItem, notifyHR, notifyManager } = require('../inbox/inboxFunctions');
+const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
+
+// ── List Claims ───────────────────────────────────────────────────────────────
+
+const listClaims = async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const isHR       = ['super_admin','hr_manager'].includes(req.user?.role);
+  const isDeptHead = req.user?.role === 'department_head';
+  const showAll    = req.query.all === 'true';
+  const filter = {};
+
+  if (isHR) {
+    // HR sees all — no employeeId filter
+  } else if (showAll && isDeptHead) {
+    // Dept head on Team Expenses tab: show their whole department
+    const deptRecord = req.user?.employeeId
+      ? await findOne('employees', { _id: new ObjectId(req.user.employeeId) }, { projection: { department: 1 } })
+      : null;
+    if (deptRecord?.department) {
+      const deptEmps = await findMany('employees', { department: deptRecord.department }, { projection: { _id: 1 } });
+      filter.employeeId = { $in: deptEmps.map(e => e._id) };
+    } else {
+      return returnFunction(res, 200, true, req.locale.success, { data: [], total: 0, page: 1, totalPages: 0, stats: null });
+    }
+  } else {
+    filter.employeeId = req.user?.employeeId ? new ObjectId(req.user.employeeId) : null;
+  }
+  if (req.query.status)     filter.status     = req.query.status;
+  if (req.query.type)       filter.type       = req.query.type;
+  if (req.query.category)   filter.category   = req.query.category;
+  if (req.query.employeeId && isHR) filter.employeeId = new ObjectId(req.query.employeeId);
+
+  const [total, data] = await Promise.all([
+    countDocuments('expense_claims', filter),
+    findMany('expense_claims', filter, { skip, limit, sort: { createdAt: -1 } }),
+  ]);
+
+  const enriched = await Promise.all(data.map(async c => {
+    const emp = await findOne('employees', { _id: c.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+    return { ...c, employee: emp ?? null };
+  }));
+
+  // Stats (HR only)
+  let stats = null;
+  if (isHR) {
+    const now = new Date(); const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const [pendingCount, pendingTotal, thisMonthApproved, violations] = await Promise.all([
+      countDocuments('expense_claims', { status: 'submitted' }),
+      global.dbo.collection('expense_claims').aggregate([{ $match: { status: 'submitted' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]).toArray(),
+      global.dbo.collection('expense_claims').aggregate([{ $match: { status: 'approved', approvedAt: { $gte: startOfMonth } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]).toArray(),
+      countDocuments('expense_claims', { isPolicyViolation: true }),
+    ]);
+    stats = {
+      pendingCount,
+      pendingTotal:   pendingTotal[0]?.total ?? 0,
+      approvedCount:  thisMonthApproved[0]?.count ?? 0,
+      approvedTotal:  thisMonthApproved[0]?.total ?? 0,
+      violations,
+    };
+  }
+
+  return returnFunction(res, 200, true, req.locale.success, { ...paginatedResponse(enriched, total, page, limit), stats });
+};
+
+// ── Get Single ────────────────────────────────────────────────────────────────
+
+const getClaim = async (req, res) => {
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  if (!isHR && String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
+  const emp = await findOne('employees', { _id: claim.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, { ...claim, employee: emp ?? null });
+};
+
+// ── Submit Claim (all 3 types) ────────────────────────────────────────────────
+
+const submitClaim = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['type'])) return;
+  const { type, category, amount, currency, date, description, notes,
+          destination, startDate, endDate, fromLocation, toLocation, distanceKm, isRoundTrip,
+          projectId, isBillable } = req.body;
+
+  if (!['regular','per_diem','mileage'].includes(type)) return returnFunction(res, 400, false, 'Invalid expense type.');
+
+  const employeeId = req.user?.employeeId;
+  if (!employeeId) {
+    return returnFunction(res, 400, false, 'Your account is not linked to an employee profile. Ask your HR admin to create an employee record for you and link it to your account.');
+  }
+
+  // Fetch policy for rate lookups
+  const policy = await findOne('expense_policies', {}) ?? {};
+
+  let finalAmount = Number(amount) || 0;
+  let days = 0;
+
+  if (type === 'per_diem') {
+    if (!destination || !startDate || !endDate) return returnFunction(res, 400, false, 'Per diem requires destination, startDate, endDate.');
+    days = Math.ceil((new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24)) + 1;
+    const rate = policy.perDiemRates?.find(r => r.location?.toLowerCase() === destination?.toLowerCase())?.rate ?? policy.defaultPerDiemRate ?? 3000;
+    finalAmount = days * rate;
+  }
+
+  if (type === 'mileage') {
+    if (!distanceKm) return returnFunction(res, 400, false, 'Mileage requires distanceKm.');
+    const km = Number(distanceKm) * (isRoundTrip ? 2 : 1);
+    const rate = policy.mileageRate ?? 15;
+    finalAmount = km * rate;
+  }
+
+  // Policy violation check
+  let isPolicyViolation = false;
+  let violationReason   = null;
+  if (type === 'regular' && category) {
+    const catLimit = policy.categoryLimits?.find(l => l.category === category);
+    if (catLimit?.maxPerClaim && finalAmount > catLimit.maxPerClaim) {
+      isPolicyViolation = true;
+      violationReason   = `Exceeds per-claim limit of ${catLimit.maxPerClaim} for ${category}.`;
+    }
+  }
+
+  const receiptFile = req.file ? req.file.filename : null;
+
+  const doc = {
+    employeeId:       new ObjectId(employeeId),
+    type,
+    category:         category || null,
+    amount:           finalAmount,
+    currency:         currency || 'KES',
+    date:             date      ? new Date(date) : new Date(),
+    description:      description || null,
+    notes:            notes || null,
+    receiptFile,
+    destination:      destination   || null,
+    startDate:        startDate     ? new Date(startDate)  : null,
+    endDate:          endDate       ? new Date(endDate)    : null,
+    perDiemDays:      days || null,
+    fromLocation:     fromLocation  || null,
+    toLocation:       toLocation    || null,
+    distanceKm:       distanceKm    ? Number(distanceKm)   : null,
+    isRoundTrip:      Boolean(isRoundTrip),
+    projectId:        projectId     ? new ObjectId(projectId) : null,
+    isBillable:       Boolean(isBillable),
+    isPolicyViolation,
+    violationReason,
+    status:           'submitted',
+    approvedBy:       null, approvedAt: null,
+    rejectedBy:       null, rejectedAt: null, rejectionReason: null,
+    reimbursedAt:     null,
+    payrollCycleId:   null,
+    createdAt:        new Date(), updatedAt: new Date(),
+  };
+
+  const result = await insertOne('expense_claims', doc);
+
+  // Inbox: notify manager that an expense claim was submitted
+  const empForInbox = await findOne('employees', { _id: doc.employeeId }, { projection: { fullName: 1 } });
+  const empNameInbox = empForInbox?.fullName || 'An employee';
+  const expensePayload = {
+    type: 'expense', subType: 'expense_claim',
+    title: `Expense claim from ${empNameInbox}`,
+    subtitle: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type} · ${description || ''}`.trim().replace(/·\s*$/, ''),
+    referenceId: result.insertedId, referenceModel: 'expense_claims',
+    requiresAction: true, triggeredBy: req.user._id,
+  };
+  await notifyManager(doc.employeeId, expensePayload);
+  notifyHR(expensePayload).catch(() => {});
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: `Expense claim from ${empNameInbox}`,
+    body: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type}`,
+    type: 'expense',
+  }).catch(() => {});
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, isPolicyViolation });
+};
+
+// ── Update Claim ──────────────────────────────────────────────────────────────
+
+const updateClaim = async (req, res) => {
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  if (claim.status !== 'submitted' && claim.status !== 'draft') return returnFunction(res, 400, false, 'Cannot edit after approval.');
+  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  if (!isHR && String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
+  const { amount, description, category, date, notes } = req.body;
+  const update = { updatedAt: new Date() };
+  if (amount)      update.amount      = Number(amount);
+  if (description) update.description = description;
+  if (category)    update.category    = category;
+  if (date)        update.date        = new Date(date);
+  if (notes)       update.notes       = notes;
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+// ── Delete ────────────────────────────────────────────────────────────────────
+
+const deleteClaim = async (req, res) => {
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  if (isHR) return returnFunction(res, 403, false, 'HR cannot delete employee expense claims.');
+  if (String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
+  if (!['draft','rejected'].includes(claim.status)) return returnFunction(res, 400, false, 'Only draft or rejected claims can be deleted.');
+  await global.dbo.collection('expense_claims').deleteOne({ _id: new ObjectId(req.params.id) });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+const disputeClaim = async (req, res) => {
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  if (isHR) return returnFunction(res, 403, false, 'HR cannot dispute claims.');
+  if (String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
+  if (claim.status !== 'rejected') return returnFunction(res, 400, false, 'Only rejected claims can be disputed.');
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
+    $set: { status: 'disputed', disputeReason: req.body.reason || null, disputedAt: new Date(), updatedAt: new Date() },
+  });
+  const dispEmployee = await findOne('employees', { _id: claim.employeeId }, { projection: { fullName: 1 } });
+  const dispName = dispEmployee?.fullName || 'An employee';
+  notifyHR({
+    type: 'expense', subType: 'expense_dispute',
+    title: `Expense dispute from ${dispName}`,
+    subtitle: req.body.reason ? `"${req.body.reason}"` : 'No reason provided',
+    referenceId: claim._id, referenceModel: 'expense_claims',
+    requiresAction: true, triggeredBy: req.user._id,
+  }).catch(() => {});
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'Expense Claim Disputed',
+    body: `${dispName} disputed a rejected claim${req.body.reason ? `: "${req.body.reason}"` : '.'}`,
+    type: 'expense',
+  }).catch(() => {});
+  return returnFunction(res, 200, true, 'Claim dispute submitted.');
+};
+
+// ── Approve ───────────────────────────────────────────────────────────────────
+
+const approveClaim = async (req, res) => {
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  if (claim.status !== 'submitted') return returnFunction(res, 400, false, 'Claim is not pending approval.');
+  if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
+    return returnFunction(res, 403, false, 'You cannot approve your own expense claim.');
+  }
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
+    $set: { status: 'approved', approvedBy: req.user?._id ?? null, approvedAt: new Date(), updatedAt: new Date() },
+  });
+  if (claim.employeeId) {
+    notifyEmployee(claim.employeeId, {
+      title: 'Expense Claim Approved',
+      body: `Your expense claim${claim.description ? ` "${claim.description}"` : ''} of ${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()} has been approved.`,
+      type: 'expense',
+    }).catch(() => {});
+  }
+  return returnFunction(res, 200, true, 'Claim approved.');
+};
+
+// ── Reject ────────────────────────────────────────────────────────────────────
+
+const rejectClaim = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['reason'])) return;
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!['submitted'].includes(claim.status)) return returnFunction(res, 400, false, 'Claim is not pending approval.');
+  if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
+    return returnFunction(res, 403, false, 'You cannot reject your own expense claim.');
+  }
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
+    $set: { status: 'rejected', rejectedBy: req.user?._id ?? null, rejectedAt: new Date(), rejectionReason: req.body.reason, updatedAt: new Date() },
+  });
+  if (claim.employeeId) {
+    notifyEmployee(claim.employeeId, {
+      title: 'Expense Claim Rejected',
+      body: `Your expense claim${claim.description ? ` "${claim.description}"` : ''} was not approved. Reason: ${req.body.reason}`,
+      type: 'expense',
+    }).catch(() => {});
+  }
+  return returnFunction(res, 200, true, 'Claim rejected.');
+};
+
+// ── Export CSV ────────────────────────────────────────────────────────────────
+
+const exportClaims = async (req, res) => {
+  const data = await findMany('expense_claims', {}, { sort: { createdAt: -1 }, limit: 5000 });
+  const enriched = await Promise.all(data.map(async c => {
+    const emp = await findOne('employees', { _id: c.employeeId }, { projection: { fullName: 1, staffNumber: 1 } });
+    return [
+      emp?.staffNumber ?? '', emp?.fullName ?? '', c.type, c.category ?? '', c.amount,
+      c.currency, c.date?.toISOString().split('T')[0] ?? '', c.status,
+    ].join(',');
+  }));
+  const csv = ['StaffNo,Name,Type,Category,Amount,Currency,Date,Status', ...enriched].join('\n');
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="expenses.csv"');
+  return res.send(csv);
+};
+
+// ── Analytics ─────────────────────────────────────────────────────────────────
+
+const getAnalytics = async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const start = new Date(year, 0, 1); const end = new Date(year + 1, 0, 1);
+  const filter = { createdAt: { $gte: start, $lt: end }, status: { $in: ['approved','reimbursed'] } };
+
+  const [byCategory, byMonth, byDept, topSpenders] = await Promise.all([
+    global.dbo.collection('expense_claims').aggregate([
+      { $match: filter },
+      { $group: { _id: '$category', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+      { $sort: { total: -1 } },
+    ]).toArray(),
+    global.dbo.collection('expense_claims').aggregate([
+      { $match: filter },
+      { $group: { _id: { $month: '$date' }, total: { $sum: '$amount' } } },
+      { $sort: { '_id': 1 } },
+    ]).toArray(),
+    global.dbo.collection('expense_claims').aggregate([
+      { $match: filter },
+      { $lookup: { from: 'employees', localField: 'employeeId', foreignField: '_id', as: 'emp' } },
+      { $unwind: { path: '$emp', preserveNullAndEmptyArrays: true } },
+      { $group: { _id: '$emp.department', total: { $sum: '$amount' } } },
+      { $sort: { total: -1 } }, { $limit: 10 },
+    ]).toArray(),
+    global.dbo.collection('expense_claims').aggregate([
+      { $match: filter },
+      { $group: { _id: '$employeeId', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+      { $sort: { total: -1 } }, { $limit: 10 },
+    ]).toArray(),
+  ]);
+
+  const months = Array(12).fill(0);
+  byMonth.forEach(m => { if (m._id >= 1 && m._id <= 12) months[m._id - 1] = m.total; });
+
+  const topEnriched = await Promise.all(topSpenders.map(async t => {
+    const emp = await findOne('employees', { _id: t._id }, { projection: { fullName: 1, department: 1 } });
+    return { ...t, employee: emp ?? null };
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, { byCategory, byMonth: months, byDept, topSpenders: topEnriched });
+};
+
+// ── Policy ────────────────────────────────────────────────────────────────────
+
+const getPolicy = async (req, res) => {
+  const policy = await findOne('expense_policies', {});
+  return returnFunction(res, 200, true, req.locale.success, policy ?? {});
+};
+
+// ── Mark Reimbursed ───────────────────────────────────────────────────────────
+
+const markReimbursed = async (req, res) => {
+  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
+  if (claim.status !== 'approved') return returnFunction(res, 400, false, 'Only approved claims can be marked as reimbursed.');
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
+    $set: { status: 'reimbursed', reimbursedAt: new Date(), updatedAt: new Date() },
+  });
+  if (claim.employeeId) {
+    notifyEmployee(claim.employeeId, {
+      title: 'Expense Claim Reimbursed',
+      body: `Your expense claim of ${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()} has been reimbursed.`,
+      type: 'expense',
+    }).catch(() => {});
+  }
+  return returnFunction(res, 200, true, 'Claim marked as reimbursed.');
+};
+
+const updatePolicy = async (req, res) => {
+  const existing = await findOne('expense_policies', {});
+  const update = { ...req.body, updatedAt: new Date() };
+  if (existing) {
+    await updateOne('expense_policies', { _id: existing._id }, { $set: update });
+  } else {
+    await insertOne('expense_policies', { ...update, createdAt: new Date() });
+  }
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const calculateDistance = async (req, res) => {
+  const { origin, destination } = req.body;
+  if (!origin?.trim() || !destination?.trim()) return returnFunction(res, 400, false, 'Origin and destination are required.');
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return returnFunction(res, 503, false, 'Google Maps API key is not configured. Please ask your administrator to add GOOGLE_MAPS_API_KEY to the server environment.');
+  const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${encodeURIComponent(origin)}&destinations=${encodeURIComponent(destination)}&mode=driving&key=${apiKey}`;
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (data.status !== 'OK') return returnFunction(res, 400, false, `Maps API error: ${data.status}`);
+  const element = data.rows?.[0]?.elements?.[0];
+  if (!element || element.status !== 'OK') return returnFunction(res, 400, false, 'Could not calculate route. Check that both locations are valid.');
+  const distanceKm = Math.round(element.distance.value / 100) / 10;
+  return returnFunction(res, 200, true, 'Distance calculated.', { distanceKm, distanceText: element.distance.text, durationText: element.duration.text });
+};
+
+module.exports = { listClaims, getClaim, submitClaim, updateClaim, deleteClaim, disputeClaim, approveClaim, rejectClaim, markReimbursed, exportClaims, getAnalytics, getPolicy, updatePolicy, calculateDistance };
