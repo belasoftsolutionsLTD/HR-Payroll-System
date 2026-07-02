@@ -8,6 +8,8 @@ const {
   addEmployeeTask, updateTask, deleteTask, assignDefaultTasksHandler,
   listOnboarding, getEmployeeOnboarding, getOnboardingDetails, completeTask, clearEmployeeOnboarding,
   serveJdPdf,
+  startOffboarding, listOffboarding, getEmployeeOffboarding, completeOffboardingTask, addOffboardingTask, clearEmployeeOffboarding,
+  getOverdueTasks,
 } = require('./onboardingFunctions');
 
 const multer = require('multer');
@@ -36,6 +38,9 @@ router.post('/onboarding/templates',        hrOnly, AsyncHandler(createTemplate)
 router.put('/onboarding/templates/:id',     hrOnly, AsyncHandler(updateTemplate));
 router.delete('/onboarding/templates/:id',  hrOnly, AsyncHandler(deleteTemplate));
 
+// Overdue tasks across all employees
+router.get('/onboarding/overdue',                      hrOnly, AsyncHandler(getOverdueTasks));
+
 // Per-employee tasks
 router.get('/onboarding',                              hrOnly, AsyncHandler(listOnboarding));
 router.get('/onboarding/:employeeId',                  hrOnly, AsyncHandler(getEmployeeOnboarding));
@@ -49,5 +54,13 @@ router.delete('/onboarding/:employeeId',               hrOnly, AsyncHandler(clea
 router.put('/onboarding/tasks/:taskId',    hrOnly, AsyncHandler(updateTask));
 router.delete('/onboarding/tasks/:taskId', hrOnly, AsyncHandler(deleteTask));
 router.patch('/onboarding/tasks/:taskId',  AsyncHandler(completeTask));
+
+// Offboarding
+router.get('/offboarding',                              hrOnly, AsyncHandler(listOffboarding));
+router.post('/offboarding',                             hrOnly, AsyncHandler(startOffboarding));
+router.get('/offboarding/:employeeId',                  hrOnly, AsyncHandler(getEmployeeOffboarding));
+router.post('/offboarding/:employeeId/tasks',           hrOnly, AsyncHandler(addOffboardingTask));
+router.patch('/offboarding/tasks/:taskId',              AsyncHandler(completeOffboardingTask));
+router.delete('/offboarding/:employeeId',               hrOnly, AsyncHandler(clearEmployeeOffboarding));
 
 module.exports = router;
