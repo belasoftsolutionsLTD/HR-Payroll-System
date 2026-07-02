@@ -4,6 +4,8 @@ const fs   = require('fs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR } = require('../inbox/inboxFunctions');
 
 // ── Templates ──────────────────────────────────────────────────────────────────
 const listTemplates = async (req, res) => {
@@ -287,6 +289,11 @@ const completeTask = async (req, res) => {
   const task = await findOne('onboarding_tasks', { _id: new ObjectId(req.params.taskId) });
   if (!task) return returnFunction(res, 404, false, req.locale.notFound);
 
+  const isHR = ['super_admin', 'hr_manager', 'department_head'].includes(req.user?.role);
+  if (!isHR && String(task.employeeId) !== String(req.user?.employeeId)) {
+    return returnFunction(res, 403, false, 'Forbidden.');
+  }
+
   await updateOne('onboarding_tasks',
     { _id: new ObjectId(req.params.taskId) },
     { $set: { status: 'completed', completedAt: new Date(), completedBy: req.user?._id ? new ObjectId(req.user._id) : null } }
@@ -296,21 +303,175 @@ const completeTask = async (req, res) => {
   const remaining = await countDocuments('onboarding_tasks', { employeeId: task.employeeId, status: { $ne: 'completed' } });
   if (remaining === 0) {
     const employee = await findOne('employees', { _id: task.employeeId }, { projection: { fullName: 1 } });
-    const hrManagers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] } }, { projection: { _id: 1 } });
-    if (hrManagers.length && employee) {
-      const notifications = hrManagers.map((u) => ({
-        userId: u._id,
+    if (employee) {
+      notifyHR({
+        type: 'onboarding', subType: 'onboarding_complete',
         title: 'Onboarding Complete',
-        message: `All onboarding tasks for ${employee.fullName} have been completed.`,
+        subtitle: `All onboarding tasks for ${employee.fullName} have been completed.`,
+        referenceId: task.employeeId, referenceModel: 'employees',
+        requiresAction: false, triggeredBy: req.user?._id,
+      }).catch(() => {});
+      notifyByRoles(['super_admin', 'hr_manager'], {
+        title: 'Onboarding Complete',
+        body: `All onboarding tasks for ${employee.fullName} have been completed.`,
         type: 'onboarding',
-        read: false,
-        createdAt: new Date(),
-      }));
-      await global.dbo.collection('notifications').insertMany(notifications);
+      }).catch(() => {});
     }
   }
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+// ── Offboarding ───────────────────────────────────────────────────────────────
+
+const DEFAULT_OFFBOARDING_TASKS = [
+  { taskTitle: 'Submit resignation letter',      taskSection: 'before_last_day', assignedDepartment: 'Employee', daysFromNow: -14 },
+  { taskTitle: 'Complete knowledge transfer doc', taskSection: 'before_last_day', assignedDepartment: 'Employee', daysFromNow: -7  },
+  { taskTitle: 'Schedule handover meetings',      taskSection: 'before_last_day', assignedDepartment: 'Manager',  daysFromNow: -5  },
+  { taskTitle: 'Return company devices',          taskSection: 'before_last_day', assignedDepartment: 'IT',       daysFromNow: -1  },
+  { taskTitle: 'Exit interview completed',        taskSection: 'last_day',        assignedDepartment: 'HR',       daysFromNow: 0   },
+  { taskTitle: 'Revoke email access',             taskSection: 'last_day',        assignedDepartment: 'IT',       daysFromNow: 0   },
+  { taskTitle: 'Revoke system & platform access', taskSection: 'last_day',        assignedDepartment: 'IT',       daysFromNow: 0   },
+  { taskTitle: 'Process final payslip',           taskSection: 'last_day',        assignedDepartment: 'HR',       daysFromNow: 0   },
+  { taskTitle: 'Issue reference letter',          taskSection: 'after_departure', assignedDepartment: 'HR',       daysFromNow: 7   },
+  { taskTitle: 'Send alumni network invite',      taskSection: 'after_departure', assignedDepartment: 'HR',       daysFromNow: 14  },
+];
+
+const startOffboarding = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['employeeId'])) return;
+  const empId = new ObjectId(req.body.employeeId);
+  const employee = await findOne('employees', { _id: empId });
+  if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const existing = await countDocuments('offboarding_tasks', { employeeId: empId, status: 'pending' });
+  if (existing > 0) return returnFunction(res, 409, false, `${employee.fullName} is already in offboarding.`);
+
+  const lastDay = req.body.lastDay ? new Date(req.body.lastDay) : new Date();
+  const tasks = DEFAULT_OFFBOARDING_TASKS.map(t => {
+    const due = new Date(lastDay);
+    due.setDate(due.getDate() + t.daysFromNow);
+    return {
+      employeeId: empId,
+      taskTitle: t.taskTitle,
+      taskSection: t.taskSection,
+      assignedDepartment: t.assignedDepartment,
+      dueDate: due.toISOString().slice(0, 10),
+      status: 'pending',
+      createdAt: new Date(),
+    };
+  });
+  await global.dbo.collection('offboarding_tasks').insertMany(tasks);
+
+  if (req.body.lastDay) {
+    await updateOne('employees', { _id: empId }, { $set: { contractEndDate: new Date(req.body.lastDay), updatedAt: new Date() } });
+  }
+
+  return returnFunction(res, 201, true, 'Offboarding started.');
+};
+
+const listOffboarding = async (req, res) => {
+  const groups = await global.dbo.collection('offboarding_tasks').aggregate([
+    { $group: {
+      _id: '$employeeId',
+      total:     { $sum: 1 },
+      completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+    } },
+  ]).toArray();
+
+  const result = await Promise.all(groups.map(async (g) => {
+    const employee = await findOne('employees', { _id: g._id }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, contractEndDate: 1 } });
+    if (!employee) return null;
+    return {
+      employee,
+      total:      g.total,
+      completed:  g.completed,
+      percentage: g.total ? Math.round((g.completed / g.total) * 100) : 0,
+    };
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, result.filter(Boolean));
+};
+
+const getEmployeeOffboarding = async (req, res) => {
+  const tasks = await findMany('offboarding_tasks',
+    { employeeId: new ObjectId(req.params.employeeId) },
+    { sort: { taskSection: 1, dueDate: 1 } }
+  );
+  return returnFunction(res, 200, true, req.locale.success, tasks);
+};
+
+const completeOffboardingTask = async (req, res) => {
+  const task = await findOne('offboarding_tasks', { _id: new ObjectId(req.params.taskId) });
+  if (!task) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const isHR = ['super_admin', 'hr_manager', 'department_head'].includes(req.user?.role);
+  if (!isHR && String(task.employeeId) !== String(req.user?.employeeId)) {
+    return returnFunction(res, 403, false, 'Forbidden.');
+  }
+
+  await updateOne(
+    'offboarding_tasks',
+    { _id: new ObjectId(req.params.taskId) },
+    { $set: { status: 'completed', completedAt: new Date(), completedBy: req.user?._id ? new ObjectId(req.user._id) : null } }
+  );
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const addOffboardingTask = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['taskTitle', 'dueDate'])) return;
+  const doc = {
+    employeeId: new ObjectId(req.params.employeeId),
+    taskTitle: req.body.taskTitle.trim(),
+    taskSection: req.body.taskSection || 'before_last_day',
+    assignedDepartment: req.body.assignedDepartment || 'HR',
+    dueDate: req.body.dueDate,
+    status: 'pending',
+    createdAt: new Date(),
+  };
+  const result = await insertOne('offboarding_tasks', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const clearEmployeeOffboarding = async (req, res) => {
+  await global.dbo.collection('offboarding_tasks').deleteMany({ employeeId: new ObjectId(req.params.employeeId) });
+  return returnFunction(res, 200, true, 'Offboarding record removed.');
+};
+
+// ── Overdue Tasks ─────────────────────────────────────────────────────────────
+// Returns all incomplete onboarding tasks whose due date has passed.
+// Also sends in-app notifications to HR (once per run, fire-and-forget).
+
+const getOverdueTasks = async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const overdue = await findMany('onboarding_tasks', {
+    status: { $ne: 'completed' },
+    dueDate: { $lt: today, $ne: null },
+  }, { sort: { dueDate: 1 } });
+
+  if (!overdue.length) return returnFunction(res, 200, true, 'No overdue tasks.', []);
+
+  // Enrich with employee names
+  const empIds = [...new Set(overdue.map(t => String(t.employeeId)))];
+  const employees = await findMany('employees', { _id: { $in: empIds.map(id => new ObjectId(id)) } }, { projection: { fullName: 1 } });
+  const empMap = Object.fromEntries(employees.map(e => [String(e._id), e]));
+
+  const enriched = overdue.map(t => ({
+    ...t,
+    employee: empMap[String(t.employeeId)] ?? null,
+    daysOverdue: Math.floor((new Date(today) - new Date(t.dueDate)) / (1000 * 60 * 60 * 24)),
+  }));
+
+  // Notify HR about overdue tasks (fire-and-forget)
+  if (enriched.length) {
+    notifyByRoles(['super_admin', 'hr_manager'], {
+      title: `${enriched.length} Overdue Onboarding Task(s)`,
+      body: `${enriched.length} onboarding task(s) are past their due date and need attention.`,
+      type: 'onboarding',
+    }).catch(() => {});
+  }
+
+  return returnFunction(res, 200, true, 'Overdue tasks fetched', enriched);
 };
 
 module.exports = {
@@ -318,4 +479,6 @@ module.exports = {
   addEmployeeTask, updateTask, deleteTask, assignDefaultTasksHandler, assignDefaultTasks,
   listOnboarding, getEmployeeOnboarding, getOnboardingDetails, completeTask, clearEmployeeOnboarding,
   serveJdPdf,
+  startOffboarding, listOffboarding, getEmployeeOffboarding, completeOffboardingTask, addOffboardingTask, clearEmployeeOffboarding,
+  getOverdueTasks,
 };

@@ -11,12 +11,16 @@ const notifyUser = async (userId, { title, body, type, link = null }) => {
     const user = await findOne('users', { _id: new ObjectId(userId) }, { projection: { notificationsEnabled: 1 } });
     if (user?.notificationsEnabled === false) return;
     await insertOne('notifications', {
+      recipientId: new ObjectId(userId),
       userId: new ObjectId(userId),
       title,
+      subtitle: body,
       body,
       type,   // 'payroll' | 'leave' | 'announcement' | 'onboarding' | 'general'
       link,
+      navigateTo: link,
       read: false,
+      isRead: false,
       createdAt: new Date(),
     });
   } catch {

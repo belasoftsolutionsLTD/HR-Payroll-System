@@ -149,6 +149,62 @@ const getDashboard = async (req, res) => {
   });
 };
 
+// ── Org Chart ────────────────────────────────────────────────────────────────
+
+const getOrgChart = async (req, res) => {
+  const employees = await findMany(
+    'employees',
+    { status: { $nin: ['terminated'] } },
+    {
+      projection: { fullName: 1, designation: 1, department: 1, status: 1, staffNumber: 1, profilePhoto: 1, email: 1, staffCategory: 1 },
+      sort: { fullName: 1 },
+    }
+  );
+
+  const deptMap = {};
+  for (const emp of employees) {
+    const dept = emp.department || 'Unassigned';
+    if (!deptMap[dept]) deptMap[dept] = { name: dept, employees: [] };
+    deptMap[dept].employees.push(emp);
+  }
+
+  const departments = Object.values(deptMap).sort((a, b) => b.employees.length - a.employees.length);
+  return returnFunction(res, 200, true, req.locale.success, { departments, total: employees.length });
+};
+
+// ── Documents ─────────────────────────────────────────────────────────────────
+
+const getAllDocuments = async (req, res) => {
+  const { docType, search } = req.query;
+  const match = { 'documents.0': { $exists: true } };
+  if (docType) match['documents.docType'] = docType;
+
+  const pipeline = [
+    { $match: { documents: { $exists: true, $not: { $size: 0 } } } },
+    { $unwind: '$documents' },
+    ...(docType ? [{ $match: { 'documents.docType': docType } }] : []),
+    ...(search ? [{ $match: { $or: [
+      { 'documents.fileName': { $regex: search, $options: 'i' } },
+      { fullName: { $regex: search, $options: 'i' } },
+    ] } }] : []),
+    { $project: {
+      _id: '$documents.docId',
+      employeeId: '$_id',
+      employeeName: '$fullName',
+      employeeStaffNo: '$staffNumber',
+      department: '$department',
+      docType: '$documents.docType',
+      fileName: '$documents.fileName',
+      filePath: '$documents.filePath',
+      uploadedAt: '$documents.uploadedAt',
+    } },
+    { $sort: { uploadedAt: -1 } },
+  ];
+
+  const documents = await global.dbo.collection('employees').aggregate(pipeline).toArray();
+  return returnFunction(res, 200, true, req.locale.success, { documents, total: documents.length });
+};
+
 // ── Notifications ─────────────────────────────────────────────────────────────
 
 const getNotifications = async (req, res) => {
@@ -178,5 +234,6 @@ const markAllNotificationsRead = async (req, res) => {
 module.exports = {
   listPositions, createPosition, updatePosition, deletePosition, patchPositionStatus,
   getDashboard,
+  getOrgChart, getAllDocuments,
   getNotifications, markNotificationRead, markAllNotificationsRead,
 };

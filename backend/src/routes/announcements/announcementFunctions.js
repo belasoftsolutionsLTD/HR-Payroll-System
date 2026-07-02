@@ -88,6 +88,7 @@ const getMyAnnouncements = async (req, res) => {
   const filter = {
     $or: [
       { audience: 'all' },
+      { audience: 'staff' },
       ...(dept ? [{ audience: 'department', department: dept }] : []),
     ],
   };

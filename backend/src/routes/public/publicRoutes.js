@@ -6,6 +6,8 @@ const router = express.Router();
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne } = require('../../functions/Database/commonDBFunctions');
+const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR } = require('../inbox/inboxFunctions');
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { serveCompanyLogo } = require('../config/companySettingsFunctions');
 
@@ -13,7 +15,15 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
   filename: (req, file, cb) => cb(null, `cv-${Date.now()}-${file.originalname}`),
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max for public CV uploads
+  fileFilter: (req, file, cb) => {
+    const allowed = ['application/pdf', 'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+    cb(null, allowed.includes(file.mimetype));
+  },
+});
 
 // GET /api/public/company-logo — serve logo without auth (used by sidebar img tag)
 router.get('/company-logo', AsyncHandler(serveCompanyLogo));
@@ -117,15 +127,18 @@ router.post('/apply', upload.single('cv'), async (req, res) => {
     // Notify HR managers
     const hrManagers = await findMany('users', { role: 'hr_manager' }, { projection: { _id: 1 } });
     if (hrManagers.length) {
-      const notifications = hrManagers.map((u) => ({
-        userId: u._id,
+      notifyHR({
+        type: 'recruitment', subType: 'new_application',
         title: 'New Application Received',
-        message: `${doc.fullName} applied for ${position.jobTitle} via the public portal.`,
+        subtitle: `${doc.fullName} applied for ${position.jobTitle} via the public portal.`,
+        referenceId: result.insertedId, referenceModel: 'applicants',
+        requiresAction: true, triggeredBy: null,
+      }).catch(() => {});
+      notifyByRoles(['super_admin', 'hr_manager'], {
+        title: 'New Application Received',
+        body: `${doc.fullName} applied for ${position.jobTitle} via the public portal.`,
         type: 'recruitment',
-        read: false,
-        createdAt: new Date(),
-      }));
-      await global.dbo.collection('notifications').insertMany(notifications);
+      }).catch(() => {});
     }
 
     return returnFunction(res, 201, true, 'Application submitted successfully. We will be in touch.', { _id: result.insertedId });

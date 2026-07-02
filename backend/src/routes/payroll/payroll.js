@@ -1,17 +1,61 @@
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
-const { HR_ROLES } = require('../../constants/roles');
+const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
+
 const { listPayroll, getEmployeePayroll, createPayroll, downloadPayslip, bulkGeneratePayroll, disbursePayroll } = require('./payrollFunctions');
+const { listConcepts, createConcept, updateConcept, deleteConcept, getConcept } = require('./payrollConceptsFunctions');
+const { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation } = require('./payrollCompensationsFunctions');
+const { listCycles, getCycle, createCycle, advanceCycleStatus, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult } = require('./payrollCyclesFunctions');
+const { getMyPayslips, downloadPayslipPDF, getPayslip, getEmployeePayslips } = require('./payrollPayslipsFunctions');
 
-const hrOnly = allowRoles(HR_ROLES);
+const hrOnly   = allowRoles(HR_ROLES);
+const mgmtOnly = allowRoles(MGMT_ROLES);
+const allRoles = allowRoles(ALL_ROLES);
 
-router.get('/',                              hrOnly, AsyncHandler(listPayroll));
-router.post('/bulk',                         hrOnly, AsyncHandler(bulkGeneratePayroll));
-router.post('/',                             hrOnly, AsyncHandler(createPayroll));
-router.get('/:employeeId',                   hrOnly, AsyncHandler(getEmployeePayroll));
-router.get('/:employeeId/:month/:year/payslip', hrOnly, AsyncHandler(downloadPayslip));
-router.post('/:payrollId/disburse',             hrOnly, AsyncHandler(disbursePayroll));
+// ── Payroll Concepts ──────────────────────────────────────────────────────────
+router.get('/concepts',          hrOnly, AsyncHandler(listConcepts));
+router.post('/concepts',         hrOnly, AsyncHandler(createConcept));
+router.get('/concepts/:id',      hrOnly, AsyncHandler(getConcept));
+router.put('/concepts/:id',      hrOnly, AsyncHandler(updateConcept));
+router.delete('/concepts/:id',   hrOnly, AsyncHandler(deleteConcept));
+
+// ── Employee Compensations ────────────────────────────────────────────────────
+router.get('/compensations/employees',              hrOnly, AsyncHandler(listEmployeeCompensationSummaries));
+router.get('/compensations/:employeeId',            hrOnly, AsyncHandler(getEmployeeCompensations));
+router.post('/compensations',                       hrOnly, AsyncHandler(addCompensation));
+router.put('/compensations/:id',                    hrOnly, AsyncHandler(updateCompensation));
+router.delete('/compensations/:id',                 hrOnly, AsyncHandler(removeCompensation));
+
+// ── Payroll Cycles ────────────────────────────────────────────────────────────
+router.get('/cycles',                               hrOnly, AsyncHandler(listCycles));
+router.post('/cycles',                              hrOnly, AsyncHandler(createCycle));
+router.get('/cycles/:id',                           hrOnly, AsyncHandler(getCycle));
+router.put('/cycles/:id/status',                    hrOnly, AsyncHandler(advanceCycleStatus));
+router.get('/cycles/:id/results',                   hrOnly, AsyncHandler(getCycleResults));
+router.get('/cycles/:id/exceptions',                hrOnly, AsyncHandler(getCycleExceptions));
+router.post('/cycles/:id/approve',                  hrOnly, AsyncHandler(approveEmployees));
+router.post('/cycles/:id/lock',                     hrOnly, AsyncHandler(lockCycle));
+router.post('/cycles/:id/close',                    hrOnly, AsyncHandler(closeCycle));
+router.get('/cycles/:id/export',                    hrOnly, AsyncHandler(exportCycleCSV));
+router.get('/cycles/:id/bank-file',                 hrOnly, AsyncHandler(exportBankFile));
+
+// ── Payroll Results ───────────────────────────────────────────────────────────
+router.get('/results/:cycleId/:employeeId',         hrOnly, AsyncHandler(getEmployeeResult));
+
+// ── Payslips ──────────────────────────────────────────────────────────────────
+router.get('/payslips',                             allRoles, AsyncHandler(getMyPayslips));
+router.get('/payslips/:id',                         allRoles, AsyncHandler(getPayslip));
+router.get('/payslips/:id/pdf',                     allRoles, AsyncHandler(downloadPayslipPDF));
+router.get('/employee-payslips/:employeeId',        hrOnly,   AsyncHandler(getEmployeePayslips));
+
+// ── Legacy Payroll (preserved) ────────────────────────────────────────────────
+router.get('/',                                     hrOnly, AsyncHandler(listPayroll));
+router.post('/bulk',                                hrOnly, AsyncHandler(bulkGeneratePayroll));
+router.post('/',                                    hrOnly, AsyncHandler(createPayroll));
+router.get('/:employeeId',                          hrOnly, AsyncHandler(getEmployeePayroll));
+router.get('/:employeeId/:month/:year/payslip',     hrOnly, AsyncHandler(downloadPayslip));
+router.post('/:payrollId/disburse',                 hrOnly, AsyncHandler(disbursePayroll));
 
 module.exports = router;

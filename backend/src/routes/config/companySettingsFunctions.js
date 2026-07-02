@@ -9,7 +9,7 @@ const getCompanySettings = async (req, res) => {
 };
 
 const updateCompanySettings = async (req, res) => {
-  const ALLOWED = ['companyName', 'mission', 'vision', 'coreValues', 'address', 'phone', 'email', 'website', 'workStartTime', 'workEndTime', 'primaryColor', 'gradientEndColor', 'gradientEnabled', 'officeLatitude', 'officeLongitude', 'officeRadiusMeters', 'facebook', 'twitter', 'linkedin', 'instagram', 'youtube', 'tiktok'];
+  const ALLOWED = ['companyName', 'mission', 'vision', 'coreValues', 'address', 'phone', 'email', 'website', 'workStartTime', 'workEndTime', 'primaryColor', 'gradientEndColor', 'gradientEnabled', 'officeLatitude', 'officeLongitude', 'officeRadiusMeters', 'facebook', 'twitter', 'linkedin', 'instagram', 'youtube', 'tiktok', 'tagline', 'country', 'currency', 'timezone', 'fiscalYearStart'];
   const patch = { updatedAt: new Date() };
   for (const key of ALLOWED) {
     if (req.body[key] !== undefined) patch[key] = req.body[key];

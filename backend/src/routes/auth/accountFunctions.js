@@ -4,7 +4,7 @@ const { findMany, findOne, insertOne, updateOne } = require('../../functions/Dat
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { sendEmail } = require('../../services/emailService');
-const { DEPT_HEAD, STAFF } = require('../../constants/roles');
+const { HR_MANAGER, DEPT_HEAD, STAFF } = require('../../constants/roles');
 
 const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
 
@@ -14,7 +14,7 @@ const generatePassword = () => {
   return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 };
 
-const ALLOWED_CREATE_ROLES = [DEPT_HEAD, STAFF];
+const ALLOWED_CREATE_ROLES = [HR_MANAGER, DEPT_HEAD, STAFF];
 
 // ── List all user accounts ─────────────────────────────────────────────────────
 const listAccounts = async (req, res) => {
@@ -111,7 +111,13 @@ const updateAccount = async (req, res) => {
     update.employeeId = employeeId ? new ObjectId(employeeId) : null;
   }
 
-  await updateOne('users', { _id: new ObjectId(req.params.id) }, { $set: update });
+  const patch = { $set: update };
+  // Deactivating an account must kill all active sessions immediately
+  if (isActive === false || isActive === 'false') {
+    patch.$unset = { refreshTokenHash: '', refreshTokenExpiresAt: '' };
+  }
+
+  await updateOne('users', { _id: new ObjectId(req.params.id) }, patch);
   return returnFunction(res, 200, true, 'Account updated.');
 };
 
@@ -124,7 +130,8 @@ const adminResetPassword = async (req, res) => {
   const hashed = await bcrypt.hash(rawPassword, 12);
 
   await updateOne('users', { _id: user._id }, {
-    $set: { password: hashed, mustResetPassword: true, updatedAt: new Date() },
+    $set:   { password: hashed, mustResetPassword: true, updatedAt: new Date() },
+    $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
   });
 
   sendEmail({
@@ -163,7 +170,9 @@ const changeOwnPassword = async (req, res) => {
 
   const hashed = await bcrypt.hash(newPassword, 12);
   await updateOne('users', { _id: user._id }, {
-    $set: { password: hashed, mustResetPassword: false, updatedAt: new Date() },
+    $set:   { password: hashed, mustResetPassword: false, updatedAt: new Date() },
+    // Invalidate all existing sessions — forces re-login on all devices
+    $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
   });
 
   return returnFunction(res, 200, true, 'Password updated successfully.');

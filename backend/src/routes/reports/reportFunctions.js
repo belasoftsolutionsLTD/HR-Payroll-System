@@ -322,4 +322,291 @@ const getPerformanceReport = async (req, res) => {
   return returnFunction(res, 200, true, 'OK', employees);
 };
 
-module.exports = { getOverviewReport, getAttendanceReport, getPayrollReport, getLeaveReport, getRecruitmentReport, getOnboardingReport, getPerformanceReport };
+// ── Expense Claims ────────────────────────────────────────────────────────────
+const getExpenseClaimsReport = async (req, res) => {
+  const now   = new Date();
+  const year  = parseInt(req.query.year)  || now.getFullYear();
+  const month = parseInt(req.query.month) || null;
+
+  const filter = {};
+  if (month) {
+    const m = String(month).padStart(2, '0');
+    filter.date = { $gte: new Date(`${year}-${m}-01`), $lte: new Date(`${year}-${m}-31`) };
+  } else {
+    filter.date = { $gte: new Date(`${year}-01-01`), $lte: new Date(`${year}-12-31T23:59:59`) };
+  }
+
+  const claims = await global.dbo.collection('expense_claims').find(filter).toArray();
+
+  const byStatus   = {};
+  const byCategory = {};
+  const empMap     = {};
+
+  for (const c of claims) {
+    const s   = c.status   || 'submitted';
+    const cat = c.category || c.type || 'other';
+
+    if (!byStatus[s])     byStatus[s]   = { count: 0, amount: 0 };
+    if (!byCategory[cat]) byCategory[cat] = { count: 0, amount: 0 };
+    byStatus[s].count++;   byStatus[s].amount   += c.amount || 0;
+    byCategory[cat].count++; byCategory[cat].amount += c.amount || 0;
+
+    const ek = String(c.employeeId);
+    if (!empMap[ek]) empMap[ek] = { employeeId: c.employeeId, claims: [] };
+    empMap[ek].claims.push(c);
+  }
+
+  const employees = await Promise.all(Object.values(empMap).map(async (g) => {
+    const emp = await findOne('employees', { _id: g.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+    const approved = g.claims.filter(c => c.status === 'approved');
+    return {
+      employeeName:   emp?.fullName    || 'Unknown',
+      staffNumber:    emp?.staffNumber || '—',
+      department:     emp?.department  || '—',
+      totalClaims:    g.claims.length,
+      approvedCount:  approved.length,
+      pendingCount:   g.claims.filter(c => c.status === 'submitted').length,
+      rejectedCount:  g.claims.filter(c => c.status === 'rejected').length,
+      totalApproved:  approved.reduce((s, c) => s + (c.amount || 0), 0),
+      totalSubmitted: g.claims.reduce((s, c) => s + (c.amount || 0), 0),
+      violations:     g.claims.filter(c => c.isPolicyViolation).length,
+    };
+  }));
+  employees.sort((a, b) => b.totalSubmitted - a.totalSubmitted);
+
+  return returnFunction(res, 200, true, 'OK', {
+    year, month,
+    summary: {
+      total: claims.length,
+      totalAmount:    claims.reduce((s, c) => s + (c.amount || 0), 0),
+      approvedAmount: claims.filter(c => c.status === 'approved').reduce((s, c) => s + (c.amount || 0), 0),
+      violations:     claims.filter(c => c.isPolicyViolation).length,
+      byStatus,
+    },
+    byCategory,
+    employees,
+  });
+};
+
+// ── Awards / Recognition ──────────────────────────────────────────────────────
+const getAwardsReport = async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+
+  const awards = await global.dbo.collection('employee_awards').find({ year }).toArray();
+
+  const byType = {};
+  const byDept = {};
+  const byEmp  = {};
+
+  for (const a of awards) {
+    const t = a.awardTypeName || 'Other';
+    const d = a.department    || 'Unknown';
+    byType[t] = (byType[t] || 0) + 1;
+    byDept[d] = (byDept[d] || 0) + 1;
+
+    const ek = String(a.employeeId);
+    if (!byEmp[ek]) byEmp[ek] = { employeeName: a.employeeName, staffNumber: a.staffNumber || '—', department: d, count: 0, awards: [] };
+    byEmp[ek].count++;
+    byEmp[ek].awards.push(t);
+  }
+
+  const employees = Object.values(byEmp).sort((a, b) => b.count - a.count);
+
+  return returnFunction(res, 200, true, 'OK', {
+    year,
+    summary: { total: awards.length, uniqueRecipients: employees.length },
+    byType,
+    byDepartment: byDept,
+    employees,
+  });
+};
+
+// ── IT Assets ─────────────────────────────────────────────────────────────────
+const getITAssetsReport = async (req, res) => {
+  const [devices, software] = await Promise.all([
+    global.dbo.collection('devices').find({}).toArray(),
+    global.dbo.collection('software_apps').find({}).toArray(),
+  ]);
+
+  const byCategory = {};
+  const byStatus   = {};
+
+  for (const d of devices) {
+    const cat = d.type || 'Other';
+    if (!byCategory[cat]) byCategory[cat] = { total: 0, assigned: 0, unassigned: 0 };
+    byCategory[cat].total++;
+    if (d.assignedTo) byCategory[cat].assigned++; else byCategory[cat].unassigned++;
+    const s = d.status || 'unassigned';
+    byStatus[s] = (byStatus[s] || 0) + 1;
+  }
+
+  const empCache = {};
+  const deviceList = await Promise.all(devices.map(async (d) => {
+    let assigneeName = 'Unassigned', assigneeDept = '—';
+    if (d.assignedTo) {
+      const k = String(d.assignedTo);
+      if (!empCache[k]) empCache[k] = await findOne('employees', { _id: d.assignedTo }, { projection: { fullName: 1, department: 1 } });
+      assigneeName = empCache[k]?.fullName   || 'Unknown';
+      assigneeDept = empCache[k]?.department || '—';
+    }
+    return {
+      name:              d.name,
+      type:              d.type || 'Other',
+      brand:             d.brand || '—',
+      serialNumber:      d.serialNumber || '—',
+      status:            d.status || 'unassigned',
+      condition:         d.condition || '—',
+      assigneeName,
+      assigneeDepartment: assigneeDept,
+      purchaseDate:      d.purchaseDate || null,
+      purchasePrice:     d.purchasePrice || null,
+      warrantyExpiry:    d.warrantyExpiry || null,
+    };
+  }));
+
+  const softwareList = software.map(a => ({
+    name:             a.name,
+    category:         a.category || 'Other',
+    vendor:           a.vendor || '—',
+    licenseType:      a.licenseType || '—',
+    totalLicenses:    a.totalLicenses || 0,
+    assignedLicenses: a.assignedLicenses || 0,
+    costPerLicense:   a.costPerLicense || 0,
+    billingCycle:     a.billingCycle || '—',
+    renewalDate:      a.renewalDate || null,
+    status:           a.status || 'active',
+  }));
+
+  return returnFunction(res, 200, true, 'OK', {
+    devices: {
+      total:     devices.length,
+      assigned:  devices.filter(d => d.assignedTo).length,
+      unassigned: devices.filter(d => !d.assignedTo).length,
+      byCategory, byStatus,
+      list: deviceList,
+    },
+    software: {
+      totalApps:       software.length,
+      totalLicenses:   software.reduce((s, a) => s + (a.totalLicenses || 0), 0),
+      usedLicenses:    software.reduce((s, a) => s + (a.assignedLicenses || 0), 0),
+      list: softwareList,
+    },
+  });
+};
+
+// ── Spending (company-level expenses) ─────────────────────────────────────────
+const getSpendingReport = async (req, res) => {
+  const now   = new Date();
+  const year  = parseInt(req.query.year)  || now.getFullYear();
+  const month = parseInt(req.query.month) || null;
+
+  const filter = {};
+  if (month) {
+    const m = String(month).padStart(2, '0');
+    filter.date = { $gte: `${year}-${m}-01`, $lte: `${year}-${m}-31` };
+  } else {
+    filter.date = { $gte: `${year}-01-01`, $lte: `${year}-12-31` };
+  }
+
+  const expenses = await global.dbo.collection('expenses').find(filter).sort({ date: -1 }).toArray();
+
+  const byCategory = {};
+  for (const e of expenses) {
+    const cat = e.category || 'Other';
+    if (!byCategory[cat]) byCategory[cat] = { count: 0, amount: 0 };
+    byCategory[cat].count++;
+    byCategory[cat].amount += e.amount || 0;
+  }
+
+  return returnFunction(res, 200, true, 'OK', {
+    year, month,
+    summary: {
+      total:       expenses.length,
+      totalAmount: expenses.reduce((s, e) => s + (e.amount || 0), 0),
+      byCategory,
+    },
+    expenses: expenses.map(e => ({
+      _id:           String(e._id),
+      description:   e.description,
+      category:      e.category || 'Other',
+      amount:        e.amount || 0,
+      currency:      e.currency || 'KES',
+      date:          e.date,
+      vendor:        e.vendor || '—',
+      paymentMethod: e.paymentMethod || '—',
+      recordedBy:    e.recordedBy || '—',
+    })),
+  });
+};
+
+// ── CSV Exports ───────────────────────────────────────────────────────────────
+
+const exportAttendanceCSV = async (req, res) => {
+  const now   = new Date();
+  const month = parseInt(req.query.month) || (now.getMonth() + 1);
+  const year  = parseInt(req.query.year)  || now.getFullYear();
+  const m     = String(month).padStart(2, '0');
+
+  const records = await global.dbo.collection('attendance_records')
+    .find({ date: { $gte: `${year}-${m}-01`, $lte: `${year}-${m}-31` } }).toArray();
+
+  const grouped = {};
+  for (const r of records) {
+    const k = String(r.employeeId);
+    if (!grouped[k]) grouped[k] = { employeeId: r.employeeId, records: [] };
+    grouped[k].records.push(r);
+  }
+
+  const rows = await Promise.all(Object.values(grouped).map(async g => {
+    const emp = await findOne('employees', { _id: g.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+    let present = 0, absent = 0, late = 0, totalMins = 0;
+    for (const r of g.records) {
+      if (['present', 'remote', 'late'].includes(r.status)) present++;
+      if (r.status === 'absent') absent++;
+      if (r.status === 'late') late++;
+      if (r.checkInTime && r.checkOutTime) {
+        const diff = toMins(r.checkOutTime) - toMins(r.checkInTime);
+        if (diff > 0) totalMins += diff;
+      }
+    }
+    return [
+      emp?.staffNumber ?? '', `"${(emp?.fullName ?? '').replace(/"/g, '')}"`,
+      emp?.department ?? '', present, absent, late,
+      parseFloat((totalMins / 60).toFixed(1)),
+    ].join(',');
+  }));
+
+  const csv = ['StaffNo,Name,Department,Present,Absent,Late,TotalHours', ...rows].join('\n');
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="attendance-${year}-${m}.csv"`);
+  return res.send(csv);
+};
+
+const exportLeaveCSV = async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+
+  const requests = await global.dbo.collection('leave_requests')
+    .find({ createdAt: { $gte: new Date(`${year}-01-01`), $lte: new Date(`${year}-12-31T23:59:59`) } })
+    .sort({ createdAt: -1 }).toArray();
+
+  const rows = await Promise.all(requests.map(async r => {
+    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+    return [
+      emp?.staffNumber ?? '', `"${(emp?.fullName ?? '').replace(/"/g, '')}"`,
+      emp?.department ?? '', r.leaveType, r.startDate, r.endDate,
+      r.numberOfDays, r.status,
+    ].join(',');
+  }));
+
+  const csv = ['StaffNo,Name,Department,LeaveType,StartDate,EndDate,Days,Status', ...rows].join('\n');
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="leave-${year}.csv"`);
+  return res.send(csv);
+};
+
+module.exports = {
+  getOverviewReport, getAttendanceReport, getPayrollReport, getLeaveReport,
+  getRecruitmentReport, getOnboardingReport, getPerformanceReport,
+  getExpenseClaimsReport, getAwardsReport, getITAssetsReport, getSpendingReport,
+  exportAttendanceCSV, exportLeaveCSV,
+};

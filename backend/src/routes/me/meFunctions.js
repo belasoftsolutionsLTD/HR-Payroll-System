@@ -5,6 +5,8 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, updateOne, insertOne } = require('../../functions/Database/commonDBFunctions');
 const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
+const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
 
 // ── Profile ────────────────────────────────────────────────────────────────────
 const getMyProfile = async (req, res) => {
@@ -53,8 +55,12 @@ const applyForLeave = async (req, res) => {
   if (!validateRequiredFields(req, res, ['leaveType', 'startDate', 'endDate', 'reason'])) return;
 
   const { leaveType, startDate, endDate, reason } = req.body;
+  if (new Date(endDate) < new Date(startDate)) {
+    return returnFunction(res, 400, false, 'Invalid leave date range. End date must be on or after the start date.');
+  }
   const year = new Date(startDate).getFullYear();
   const numberOfDays = calculateWorkingDays(startDate, endDate);
+  if (numberOfDays < 1) return returnFunction(res, 400, false, 'Invalid leave time range.');
 
   const balance = await findOne('leave_balances', { employeeId: req.user.employeeId, year });
   if (!balance) return returnFunction(res, 400, false, 'No leave balance record found for this year.');
@@ -79,6 +85,25 @@ const applyForLeave = async (req, res) => {
     createdAt: new Date(),
   };
   const result = await insertOne('leave_requests', doc);
+
+  // Notify HR and manager
+  const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1, department: 1 } });
+  const empName = emp?.fullName || 'An employee';
+  const inboxPayload = {
+    type: 'leave', subType: 'leave_request',
+    title: `Leave request from ${empName}`,
+    subtitle: `${leaveType} leave · ${startDate} – ${endDate} · ${numberOfDays} day${numberOfDays !== 1 ? 's' : ''}`,
+    referenceId: result.insertedId, referenceModel: 'leave_requests',
+    requiresAction: true, triggeredBy: req.user._id,
+  };
+  notifyHR(inboxPayload).catch(() => {});
+  notifyManager(req.user.employeeId, inboxPayload).catch(() => {});
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: `Leave request from ${empName}`,
+    body: `${leaveType} leave · ${startDate} – ${endDate}`,
+    type: 'leave',
+  }).catch(() => {});
+
   return returnFunction(res, 201, true, 'Leave request submitted.', { _id: result.insertedId, numberOfDays });
 };
 
@@ -300,11 +325,22 @@ const deptActOnLeave = async (req, res) => {
 // ── Performance ────────────────────────────────────────────────────────────────
 const getMyPerformance = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const records = await findMany('appraisal_records',
-    { employeeId: req.user.employeeId },
-    { sort: { createdAt: -1 } }
-  );
-  return returnFunction(res, 200, true, 'OK', records);
+  const empId = req.user.employeeId;
+
+  const [appraisals, goals, rawReviews] = await Promise.all([
+    findMany('appraisal_records', { employeeId: empId }, { sort: { createdAt: -1 } }),
+    findMany('goals', { employeeId: empId }, { sort: { createdAt: -1 } }),
+    findMany('reviews', { employeeId: empId, status: 'submitted' }, { sort: { submittedAt: -1 } }),
+  ]);
+
+  const reviews = await Promise.all(rawReviews.map(async r => {
+    const cycle = r.cycleId
+      ? await findOne('review_cycles', { _id: r.cycleId }, { projection: { name: 1, type: 1 } })
+      : null;
+    return { ...r, cycleName: cycle?.name ?? null };
+  }));
+
+  return returnFunction(res, 200, true, 'OK', { appraisals, goals, reviews });
 };
 
 // ── Awards ────────────────────────────────────────────────────────────────────
@@ -372,6 +408,95 @@ const serveMyProfilePhoto = async (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 };
 
+// ── Offboarding (self-view) ────────────────────────────────────────────────────
+
+const getMyOffboardingTasks = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
+  const tasks = await findMany(
+    'offboarding_tasks',
+    { employeeId: new ObjectId(String(req.user.employeeId)) },
+    { sort: { taskSection: 1, dueDate: 1 } }
+  );
+  return returnFunction(res, 200, true, 'OK', tasks);
+};
+
+const completeMyOffboardingTask = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
+  const task = await findOne('offboarding_tasks', { _id: new ObjectId(req.params.taskId) });
+  if (!task) return returnFunction(res, 404, false, 'Task not found.');
+  if (String(task.employeeId) !== String(req.user.employeeId))
+    return returnFunction(res, 403, false, 'Not your task.');
+
+  await updateOne(
+    'offboarding_tasks',
+    { _id: new ObjectId(req.params.taskId) },
+    { $set: { status: 'completed', completedAt: new Date(), completedBy: new ObjectId(String(req.user._id)) } }
+  );
+
+  // Notify HR when all tasks belonging to this employee are done
+  const remaining = await global.dbo.collection('offboarding_tasks').countDocuments({
+    employeeId: task.employeeId,
+    status: { $ne: 'completed' },
+  });
+  if (remaining === 0) {
+    const employee = await findOne('employees', { _id: task.employeeId }, { projection: { fullName: 1 } });
+    const hrManagers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] } }, { projection: { _id: 1 } });
+    if (employee) {
+      notifyByRoles(['super_admin', 'hr_manager'], {
+        title: 'Offboarding Complete',
+        body: `All offboarding tasks for ${employee.fullName} have been completed.`,
+        type: 'general',
+      }).catch(() => {});
+    }
+  }
+
+  return returnFunction(res, 200, true, 'Task marked complete.');
+};
+
+// ── My Projects ────────────────────────────────────────────────────────────────
+const getMyProjects = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
+  const empId = req.user.employeeId;
+
+  const memberships = await findMany('project_members', { employeeId: empId });
+  if (!memberships.length) return returnFunction(res, 200, true, 'OK', []);
+
+  const projectIds = memberships.map(m => m.projectId);
+  const projects = await findMany('projects', { _id: { $in: projectIds } }, { sort: { createdAt: -1 } });
+
+  const enriched = await Promise.all(projects.map(async p => {
+    const membership = memberships.find(m => String(m.projectId) === String(p._id));
+    const [timeResult] = await global.dbo.collection('project_time_entries').aggregate([
+      { $match: { projectId: p._id, employeeId: empId } },
+      { $group: { _id: null, totalHours: { $sum: '$hours' } } },
+    ]).toArray();
+    const recentEntries = await findMany(
+      'project_time_entries',
+      { projectId: p._id, employeeId: empId },
+      { sort: { date: -1 }, limit: 5 }
+    );
+    return {
+      ...p,
+      myRole:         membership?.role ?? 'member',
+      myHours:        timeResult?.totalHours ?? 0,
+      myRecentEntries: recentEntries,
+    };
+  }));
+
+  return returnFunction(res, 200, true, 'OK', enriched);
+};
+
+// ── My Tasks ───────────────────────────────────────────────────────────────────
+const getMyTasks = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
+  const tasks = await findMany(
+    'tasks',
+    { assignedTo: req.user.employeeId },
+    { sort: { dueDate: 1, createdAt: -1 }, limit: 100 }
+  );
+  return returnFunction(res, 200, true, 'OK', tasks);
+};
+
 module.exports = {
   getMyProfile, updateMyProfile, uploadMyProfilePhoto, serveMyProfilePhoto,
   getMyLeaveBalance, getMyLeaveRequests, applyForLeave, disputeLeaveRequest, downloadLeavePdf,
@@ -381,4 +506,7 @@ module.exports = {
   getMyAwards, getMyEvents,
   getNotificationPreference, toggleNotifications,
   getDepartmentData, deptActOnLeave,
+  getMyOffboardingTasks, completeMyOffboardingTask,
+  getMyTasks,
+  getMyProjects,
 };

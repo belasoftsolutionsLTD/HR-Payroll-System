@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const logger = require('../lib/logger');
 
 let transporter = null;
 
@@ -27,7 +28,7 @@ const getTransporter = () => {
 const sendEmail = async ({ to, subject, html, attachments = [] }) => {
   const t = getTransporter();
   if (!t) {
-    console.log(`[EMAIL - not configured] To: ${to} | Subject: ${subject}`);
+    logger.warn('Email not sent — SMTP not configured', { to, subject });
     return;
   }
   await t.sendMail({

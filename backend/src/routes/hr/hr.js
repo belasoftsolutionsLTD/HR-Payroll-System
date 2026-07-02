@@ -5,6 +5,7 @@ const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   listPositions, createPosition, updatePosition, deletePosition, patchPositionStatus,
   getDashboard,
+  getOrgChart, getAllDocuments,
   getNotifications, markNotificationRead, markAllNotificationsRead,
 } = require('./hrFunctions');
 
@@ -19,6 +20,12 @@ router.delete('/positions/:id', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHand
 
 // Dashboard
 router.get('/dashboard', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getDashboard));
+
+// Org Chart
+router.get('/org-chart', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getOrgChart));
+
+// Documents (cross-employee document listing)
+router.get('/documents', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getAllDocuments));
 
 // Notifications (any authenticated user sees own)
 router.get('/notifications', AsyncHandler(getNotifications));

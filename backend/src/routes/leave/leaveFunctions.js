@@ -2,8 +2,9 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
+const { calculateWorkingDaysDB } = require('../../functions/HR/leaveCalculator');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { createInboxItem, notifyHR, notifyManager } = require('../inbox/inboxFunctions');
 
 const getLeaveBalances = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
@@ -22,7 +23,7 @@ const listLeaveRequests = async (req, res) => {
   }
 
   if (req.query.status) filter.status = req.query.status;
-  if (req.query.employeeId) filter.employeeId = new ObjectId(req.query.employeeId);
+  if (req.query.employeeId && role !== 'staff') filter.employeeId = new ObjectId(req.query.employeeId);
   if (req.query.leaveType) filter.leaveType = req.query.leaveType;
 
   const { page, limit, skip } = getPagination(req.query);
@@ -31,20 +32,26 @@ const listLeaveRequests = async (req, res) => {
     findMany('leave_requests', filter, { skip, limit, sort: { createdAt: -1 } }),
   ]);
 
-  // Join employee name for HR view (not needed when staff sees own requests)
-  const enriched = await Promise.all(records.map(async (r) => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-    return { ...r, employee: emp ?? null };
-  }));
+  // Batch-load employees for HR view (avoids N+1)
+  const empIds = [...new Set(records.map(r => r.employeeId))];
+  const emps = await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const empMap = Object.fromEntries(emps.map(e => [String(e._id), e]));
+  const enriched = records.map(r => ({ ...r, employee: empMap[String(r.employeeId)] ?? null }));
 
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
 const createLeaveRequest = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'leaveType', 'startDate', 'endDate', 'reason'])) return;
+  if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
+    return returnFunction(res, 400, false, 'Invalid leave date range. End date must be on or after the start date.');
+  }
 
   const year = new Date(req.body.startDate).getFullYear();
-  const numberOfDays = calculateWorkingDays(req.body.startDate, req.body.endDate);
+  const isHalfDay = req.body.isHalfDay === true || req.body.isHalfDay === 'true';
+  let numberOfDays = await calculateWorkingDaysDB(req.body.startDate, req.body.endDate);
+  if (numberOfDays < 1) return returnFunction(res, 400, false, 'Invalid leave time range.');
+  if (isHalfDay) numberOfDays = 0.5;
 
   const balance = await findOne('leave_balances', { employeeId: new ObjectId(req.body.employeeId), year });
   if (!balance) return returnFunction(res, 400, false, 'No leave balance record found for this employee.');
@@ -55,12 +62,23 @@ const createLeaveRequest = async (req, res) => {
     return returnFunction(res, 400, false, `Insufficient ${req.body.leaveType} leave balance. Available: ${typeBalance.remaining} days, Requested: ${numberOfDays} days.`);
   }
 
+  // Block overlapping pending/approved requests
+  const overlap = await findOne('leave_requests', {
+    employeeId: new ObjectId(req.body.employeeId),
+    status: { $in: ['pending', 'approved'] },
+    startDate: { $lte: req.body.endDate },
+    endDate:   { $gte: req.body.startDate },
+  });
+  if (overlap) return returnFunction(res, 400, false, 'A leave request already exists for overlapping dates.');
+
   const doc = {
     employeeId: new ObjectId(req.body.employeeId),
     leaveType: req.body.leaveType,
     startDate: req.body.startDate,
     endDate: req.body.endDate,
     numberOfDays,
+    isHalfDay: isHalfDay || false,
+    halfDayPeriod: isHalfDay ? (req.body.halfDayPeriod || 'morning') : null,
     reason: req.body.reason,
     status: 'pending',
     approvedBy: null,
@@ -70,6 +88,22 @@ const createLeaveRequest = async (req, res) => {
   };
 
   const result = await insertOne('leave_requests', doc);
+
+  // Inbox: notify manager + HR that a leave request was submitted
+  const emp = await findOne('employees', { _id: doc.employeeId }, { projection: { fullName: 1, department: 1 } });
+  const empName = emp?.fullName || 'An employee';
+  const inboxPayload = {
+    type: 'leave', subType: 'leave_request',
+    title: `Leave request from ${empName}`,
+    subtitle: `${req.body.leaveType} leave · ${req.body.startDate} – ${req.body.endDate} · ${numberOfDays} day${numberOfDays !== 1 ? 's' : ''}`,
+    referenceId: result.insertedId, referenceModel: 'leave_requests',
+    requiresAction: true, triggeredBy: req.user._id,
+  };
+  await Promise.all([
+    notifyManager(doc.employeeId, inboxPayload),
+    notifyHR(inboxPayload),
+  ]);
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, numberOfDays });
 };
 
@@ -102,6 +136,18 @@ const approveLeaveRequest = async (req, res) => {
     await updateOne('employees', { _id: request.employeeId }, { $set: { status: 'on_leave', updatedAt: new Date() } });
   }
 
+  // Inbox: notify employee of approval
+  const empUserApprove = await findOne('users', { employeeId: request.employeeId });
+  if (empUserApprove) {
+    await createInboxItem({
+      recipientId: empUserApprove._id, type: 'general', subType: 'leave_approved',
+      title: 'Leave request approved ✓',
+      subtitle: `Your ${request.leaveType} leave (${request.startDate} – ${request.endDate}) has been approved.`,
+      referenceId: request._id, referenceModel: 'leave_requests',
+      requiresAction: false, triggeredBy: req.user._id,
+    });
+  }
+
   return returnFunction(res, 200, true, 'Leave request approved.');
 };
 
@@ -120,6 +166,18 @@ const rejectLeaveRequest = async (req, res) => {
     body: `Your ${request.leaveType} leave from ${request.startDate} to ${request.endDate} was not approved.${req.body.comments ? ` Reason: ${req.body.comments}` : ''}`,
     link: '/staff-portal',
   }).catch(() => {});
+
+  // Inbox: notify employee of rejection
+  const empUserReject = await findOne('users', { employeeId: request.employeeId });
+  if (empUserReject) {
+    await createInboxItem({
+      recipientId: empUserReject._id, type: 'general', subType: 'leave_declined',
+      title: 'Leave request declined',
+      subtitle: `Your ${request.leaveType} leave (${request.startDate} – ${request.endDate}) was not approved.`,
+      referenceId: request._id, referenceModel: 'leave_requests',
+      requiresAction: false, triggeredBy: req.user._id,
+    });
+  }
 
   return returnFunction(res, 200, true, 'Leave request rejected.');
 };
@@ -213,14 +271,17 @@ const getLeaveCalendar = async (req, res) => {
     endDate: { $gte: start },
   });
 
-  // Group by department
+  // Batch-load employees then group by department
+  const calEmpIds = [...new Set(requests.map(r => r.employeeId))];
+  const calEmps = await findMany('employees', { _id: { $in: calEmpIds } }, { projection: { fullName: 1, department: 1 } });
+  const calEmpMap = Object.fromEntries(calEmps.map(e => [String(e._id), e]));
   const grouped = {};
-  await Promise.all(requests.map(async (r) => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, department: 1 } });
-    if (!emp) return;
+  for (const r of requests) {
+    const emp = calEmpMap[String(r.employeeId)];
+    if (!emp) continue;
     if (!grouped[emp.department]) grouped[emp.department] = [];
     grouped[emp.department].push({ ...r, employee: emp });
-  }));
+  }
 
   return returnFunction(res, 200, true, req.locale.success, grouped);
 };
@@ -247,4 +308,378 @@ const getLeaveConflicts = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-module.exports = { getLeaveBalances, listLeaveRequests, createLeaveRequest, approveLeaveRequest, rejectLeaveRequest, deleteLeaveRequest, revokeLeaveRequest, resolveDispute, getLeaveCalendar, getLeaveConflicts };
+// ── New: current user's own balances in array format ─────────────────────────
+
+const getMyBalances = async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const empId = req.user.employeeId;
+  if (!empId) return returnFunction(res, 200, true, req.locale.success, []);
+
+  const record = await findOne('leave_balances', { employeeId: empId, year });
+  if (!record) return returnFunction(res, 200, true, req.locale.success, []);
+
+  const TYPE_COLORS = {
+    annual: '#6366f1', sick: '#3b82f6', maternity: '#8b5cf6',
+    paternity: '#06b6d4', unpaid: '#64748b', compassionate: '#f59e0b',
+    study: '#10b981', emergency: '#ef4444',
+  };
+  const TYPE_LABELS = {
+    annual: 'Annual Leave', sick: 'Sick Leave', maternity: 'Maternity Leave',
+    paternity: 'Paternity Leave', unpaid: 'Unpaid Leave',
+    compassionate: 'Compassionate Leave', study: 'Study Leave', emergency: 'Emergency Leave',
+  };
+
+  const balances = Object.entries(record.balances || {}).map(([type, b]) => ({
+    leaveType: type,
+    leaveTypeName: TYPE_LABELS[type] ?? (type.charAt(0).toUpperCase() + type.slice(1) + ' Leave'),
+    totalDays:     b.allocated ?? b.total ?? 0,
+    usedDays:      b.used ?? 0,
+    pendingDays:   b.pending ?? 0,
+    remainingDays: b.remaining ?? ((b.allocated ?? b.total ?? 0) - (b.used ?? 0)),
+    color:         TYPE_COLORS[type] ?? '#6366f1',
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, balances);
+};
+
+// ── Calendar for date range ───────────────────────────────────────────────────
+
+const getCalendarEntries = async (req, res) => {
+  const from = req.query.from || new Date().toISOString().split('T')[0].slice(0, 7) + '-01';
+  const to   = req.query.to   || new Date().toISOString().split('T')[0].slice(0, 7) + '-31';
+  const dept = req.query.dept;
+
+  const filter = {
+    status: 'approved',
+    startDate: { $lte: to },
+    endDate: { $gte: from },
+  };
+
+  if (dept) {
+    const deptEmps = await findMany('employees', { department: dept }, { projection: { _id: 1 } });
+    filter.employeeId = { $in: deptEmps.map(e => e._id) };
+  }
+
+  const requests = await findMany('leave_requests', filter, { sort: { startDate: 1 } });
+  const holidays = await findMany('public_holidays', { date: { $gte: from, $lte: to } }, { sort: { date: 1 } });
+
+  const calEntEmpIds = [...new Set(requests.map(r => r.employeeId))];
+  const calEntEmps = await findMany('employees', { _id: { $in: calEntEmpIds } }, { projection: { fullName: 1, department: 1 } });
+  const calEntEmpMap = Object.fromEntries(calEntEmps.map(e => [String(e._id), e]));
+  const enriched = requests.map(r => ({ ...r, employee: calEntEmpMap[String(r.employeeId)] ?? null }));
+
+  return returnFunction(res, 200, true, req.locale.success, { leaves: enriched, holidays });
+};
+
+// ── Today's absences ──────────────────────────────────────────────────────────
+
+const getTodayAbsences = async (req, res) => {
+  const today = new Date().toISOString().split('T')[0];
+  const onLeave = await findMany('leave_requests', {
+    status: 'approved',
+    startDate: { $lte: today },
+    endDate:   { $gte: today },
+  });
+
+  const absEmpIds = [...new Set(onLeave.map(r => r.employeeId))];
+  const absEmps = await findMany('employees', { _id: { $in: absEmpIds } }, { projection: { fullName: 1, department: 1, designation: 1 } });
+  const absEmpMap = Object.fromEntries(absEmps.map(e => [String(e._id), e]));
+  const enriched = onLeave.map(r => ({ ...r, employee: absEmpMap[String(r.employeeId)] ?? null }));
+
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+// ── Upcoming leaves (next N days) ─────────────────────────────────────────────
+
+const getUpcomingLeaves = async (req, res) => {
+  const days = Math.min(parseInt(req.query.days) || 30, 90);
+  const today = new Date().toISOString().split('T')[0];
+  const future = new Date(); future.setDate(future.getDate() + days);
+  const to = future.toISOString().split('T')[0];
+
+  const requests = await findMany('leave_requests', {
+    status: { $in: ['approved', 'pending'] },
+    startDate: { $gt: today, $lte: to },
+  }, { sort: { startDate: 1 }, limit: 20 });
+
+  const upEmpIds = [...new Set(requests.map(r => r.employeeId))];
+  const upEmps = await findMany('employees', { _id: { $in: upEmpIds } }, { projection: { fullName: 1, department: 1 } });
+  const upEmpMap = Object.fromEntries(upEmps.map(e => [String(e._id), e]));
+  const enriched = requests.map(r => ({ ...r, employee: upEmpMap[String(r.employeeId)] ?? null }));
+
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+// ── Cancel own request (employee) ─────────────────────────────────────────────
+
+const cancelLeaveRequest = async (req, res) => {
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const empId = req.user.employeeId;
+  if (empId && String(request.employeeId) !== String(empId)) {
+    return returnFunction(res, 403, false, 'You can only cancel your own requests.');
+  }
+  if (!['pending', 'approved'].includes(request.status)) {
+    return returnFunction(res, 400, false, 'Cannot cancel a request that is already ' + request.status);
+  }
+
+  // Restore balance if it was approved
+  if (request.status === 'approved') {
+    const year = new Date(request.startDate).getFullYear();
+    const path = `balances.${request.leaveType}`;
+    await updateOne('leave_balances', { employeeId: request.employeeId, year }, {
+      $inc: { [`${path}.used`]: -(request.numberOfDays || request.totalDays || 0),
+               [`${path}.remaining`]: (request.numberOfDays || request.totalDays || 0) },
+    });
+  }
+
+  await updateOne('leave_requests', { _id: request._id }, {
+    $set: { status: 'cancelled', cancelledAt: new Date(), cancelledBy: new ObjectId(req.user._id) },
+  });
+
+  return returnFunction(res, 200, true, 'Leave request cancelled.');
+};
+
+// ── Single request by ID ──────────────────────────────────────────────────────
+
+const getLeaveRequest = async (req, res) => {
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  if (req.user.role === 'staff' && req.user.employeeId && String(request.employeeId) !== String(req.user.employeeId)) {
+    return returnFunction(res, 403, false, 'You can only view your own leave requests.');
+  }
+  const emp = await findOne('employees', { _id: request.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } });
+  let approver = null;
+  if (request.approvedBy) approver = await findOne('users', { _id: new ObjectId(request.approvedBy) }, { projection: { name: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, { ...request, employee: emp, approverName: approver?.name });
+};
+
+// ── Export CSV ────────────────────────────────────────────────────────────────
+
+const exportLeaveRequests = async (req, res) => {
+  const filter = {};
+  if (req.query.status)     filter.status     = req.query.status;
+  if (req.query.leaveType)  filter.leaveType  = req.query.leaveType;
+  if (req.query.from && req.query.to) filter.startDate = { $gte: req.query.from, $lte: req.query.to };
+
+  const records = await findMany('leave_requests', filter, { sort: { createdAt: -1 }, limit: 5000 });
+  const expEmpIds = [...new Set(records.map(r => r.employeeId))];
+  const expEmps = await findMany('employees', { _id: { $in: expEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const expEmpMap = Object.fromEntries(expEmps.map(e => [String(e._id), e]));
+  const enriched = records.map(r => ({ ...r, employee: expEmpMap[String(r.employeeId)] ?? null }));
+
+  const header = 'Employee,Staff No,Department,Leave Type,From,To,Days,Status,Submitted On\n';
+  const rows = enriched.map(r =>
+    [r.employee?.fullName, r.employee?.staffNumber, r.employee?.department,
+     r.leaveType, r.startDate, r.endDate,
+     r.numberOfDays ?? r.totalDays, r.status,
+     new Date(r.createdAt).toLocaleDateString('en-KE')].join(',')
+  ).join('\n');
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="leave-requests.csv"');
+  return res.send(header + rows);
+};
+
+// ── Leave balance adjustment (admin) ─────────────────────────────────────────
+
+const adjustLeaveBalance = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['employeeId', 'leaveType', 'adjustment'])) return;
+  const year = parseInt(req.body.year) || new Date().getFullYear();
+  const path = `balances.${req.body.leaveType}`;
+  await global.dbo.collection('leave_balances').updateOne(
+    { employeeId: new ObjectId(req.body.employeeId), year },
+    { $inc: { [`${path}.remaining`]: Number(req.body.adjustment) }, $set: { updatedAt: new Date() } }
+  );
+  return returnFunction(res, 200, true, 'Balance adjusted.');
+};
+
+// ── Policies ──────────────────────────────────────────────────────────────────
+
+const listPolicies = async (req, res) => {
+  const policies = await findMany('leave_policies', {}, { sort: { createdAt: -1 } });
+  return returnFunction(res, 200, true, req.locale.success, policies);
+};
+
+const createPolicy = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name'])) return;
+  const { ObjectId: ObjId } = require('mongodb');
+  const doc = {
+    name:          req.body.name,
+    description:   req.body.description || '',
+    isDefault:     req.body.isDefault || false,
+    countries:     req.body.countries || [],
+    leaveTypes:    (req.body.leaveTypes || []).map(lt => ({ ...lt, _id: new ObjId() })),
+    approvalChain: req.body.approvalChain || { approverType: 'manager', escalateAfterDays: 3 },
+    assignedTo:    req.body.assignedTo || { type: 'all' },
+    createdBy:     new ObjId(req.user._id),
+    createdAt:     new Date(),
+    updatedAt:     new Date(),
+  };
+  if (doc.isDefault) await global.dbo.collection('leave_policies').updateMany({}, { $set: { isDefault: false } });
+  const result = await insertOne('leave_policies', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const getPolicy = async (req, res) => {
+  const policy = await findOne('leave_policies', { _id: new ObjectId(req.params.id) });
+  if (!policy) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.success, policy);
+};
+
+const updatePolicy = async (req, res) => {
+  const update = { ...req.body, updatedAt: new Date() };
+  delete update._id;
+  if (update.isDefault) await global.dbo.collection('leave_policies').updateMany({}, { $set: { isDefault: false } });
+  await updateOne('leave_policies', { _id: new ObjectId(req.params.id) }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deletePolicy = async (req, res) => {
+  await global.dbo.collection('leave_policies').deleteOne({ _id: new ObjectId(req.params.id) });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+const setDefaultPolicy = async (req, res) => {
+  await global.dbo.collection('leave_policies').updateMany({}, { $set: { isDefault: false } });
+  await updateOne('leave_policies', { _id: new ObjectId(req.params.id) }, { $set: { isDefault: true } });
+  return returnFunction(res, 200, true, 'Policy set as default.');
+};
+
+// ── Public holidays ───────────────────────────────────────────────────────────
+
+const listHolidays = async (req, res) => {
+  const year = req.query.year || new Date().getFullYear();
+  const filter = { date: { $gte: `${year}-01-01`, $lte: `${year}-12-31` } };
+  const holidays = await findMany('public_holidays', filter, { sort: { date: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, holidays);
+};
+
+const addHoliday = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'date'])) return;
+  const doc = { name: req.body.name, date: req.body.date, country: req.body.country || 'KE', isRecurring: req.body.isRecurring || false, createdAt: new Date() };
+  const result = await insertOne('public_holidays', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const deleteHoliday = async (req, res) => {
+  await global.dbo.collection('public_holidays').deleteOne({ _id: new ObjectId(req.params.id) });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// ── Analytics ─────────────────────────────────────────────────────────────────
+
+const getLeaveAnalytics = async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const from = `${year}-01-01`;
+  const to   = `${year}-12-31`;
+
+  const [allRequests, employees] = await Promise.all([
+    findMany('leave_requests', { status: 'approved', startDate: { $gte: from }, endDate: { $lte: to } }),
+    findMany('employees', { status: 'active' }, { projection: { _id: 1, fullName: 1, department: 1 } }),
+  ]);
+
+  const totalDays = allRequests.reduce((s, r) => s + (r.numberOfDays || r.totalDays || 0), 0);
+  const avgDays   = employees.length > 0 ? Math.round((totalDays / employees.length) * 10) / 10 : 0;
+
+  // By type
+  const byType = {};
+  for (const r of allRequests) {
+    const t = r.leaveType;
+    byType[t] = (byType[t] || 0) + (r.numberOfDays || r.totalDays || 0);
+  }
+  const mostUsedType = Object.entries(byType).sort((a, b) => b[1] - a[1])[0];
+
+  // By month
+  const byMonth = Array(12).fill(0);
+  for (const r of allRequests) {
+    const m = new Date(r.startDate).getMonth();
+    if (m >= 0 && m < 12) byMonth[m] += (r.numberOfDays || r.totalDays || 0);
+  }
+
+  // By department
+  const byDept = {};
+  for (const r of allRequests) {
+    const emp = employees.find(e => String(e._id) === String(r.employeeId));
+    if (!emp?.department) continue;
+    byDept[emp.department] = (byDept[emp.department] || 0) + (r.numberOfDays || r.totalDays || 0);
+  }
+
+  // Employees with zero days
+  const empIdsWithLeave = new Set(allRequests.map(r => String(r.employeeId)));
+  const zeroCount = employees.filter(e => !empIdsWithLeave.has(String(e._id))).length;
+
+  // Top employees
+  const byEmp = {};
+  for (const r of allRequests) {
+    const k = String(r.employeeId);
+    byEmp[k] = (byEmp[k] || 0) + (r.numberOfDays || r.totalDays || 0);
+  }
+  const topEmp = await Promise.all(
+    Object.entries(byEmp).sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(async ([id, days]) => {
+        const emp = employees.find(e => String(e._id) === id);
+        return { employee: emp, days };
+      })
+  );
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    totalDays, avgDays, mostUsedType: mostUsedType ? { type: mostUsedType[0], days: mostUsedType[1] } : null,
+    zeroCount, byType, byMonth, byDept, topEmployees: topEmp,
+  });
+};
+
+// ── Monthly Leave Accrual ─────────────────────────────────────────────────────
+// Kenya statutory annual leave = 21 days → accrual = 21/12 = 1.75 days/month.
+// Run on the 1st of each month (or via cron). Idempotent: tracks last accrual month.
+
+const runLeaveAccrual = async (req, res) => {
+  const now   = new Date();
+  const year  = now.getFullYear();
+  const month = now.getMonth() + 1; // 1-12
+  const accrualKey = `${year}-${String(month).padStart(2, '0')}`;
+  const ACCRUAL_AMOUNT = parseFloat(process.env.LEAVE_ACCRUAL_DAYS || '1.75');
+
+  const activeEmployees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
+  let processed = 0, skipped = 0;
+
+  for (const emp of activeEmployees) {
+    const balance = await findOne('leave_balances', { employeeId: emp._id, year });
+    if (!balance) { skipped++; continue; }
+
+    // Idempotency: skip if already accrued this month
+    if ((balance.lastAccrualMonth || '') === accrualKey) { skipped++; continue; }
+
+    const current = balance.balances?.annual || { allocated: 0, used: 0, remaining: 0 };
+    const newAllocated = parseFloat(((current.allocated || 0) + ACCRUAL_AMOUNT).toFixed(2));
+    const newRemaining = parseFloat(((current.remaining || 0) + ACCRUAL_AMOUNT).toFixed(2));
+
+    await updateOne('leave_balances', { _id: balance._id }, {
+      $set: {
+        'balances.annual.allocated': newAllocated,
+        'balances.annual.remaining': newRemaining,
+        lastAccrualMonth: accrualKey,
+        updatedAt: new Date(),
+      },
+    });
+    processed++;
+  }
+
+  return returnFunction(res, 200, true, `Accrual complete. Processed: ${processed}, Skipped: ${skipped}.`, {
+    accrualMonth: accrualKey, accrualAmount: ACCRUAL_AMOUNT, processed, skipped,
+  });
+};
+
+module.exports = {
+  // existing
+  getLeaveBalances, listLeaveRequests, createLeaveRequest,
+  approveLeaveRequest, rejectLeaveRequest, deleteLeaveRequest,
+  revokeLeaveRequest, resolveDispute, getLeaveCalendar, getLeaveConflicts,
+  // new
+  getMyBalances, getCalendarEntries, getTodayAbsences, getUpcomingLeaves,
+  cancelLeaveRequest, getLeaveRequest, exportLeaveRequests, adjustLeaveBalance,
+  listPolicies, createPolicy, getPolicy, updatePolicy, deletePolicy, setDefaultPolicy,
+  listHolidays, addHoliday, deleteHoliday, getLeaveAnalytics,
+  runLeaveAccrual,
+};
