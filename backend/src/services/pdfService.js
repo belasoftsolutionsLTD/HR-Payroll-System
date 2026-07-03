@@ -48,15 +48,20 @@ const generatePayslip = (employeeData, payrollData) => {
     doc.moveDown(); line();
 
     const d = payrollData.deductions || {};
-    doc.font('Helvetica-Bold').text('DEDUCTIONS');
+    doc.font('Helvetica-Bold').text('STATUTORY DEDUCTIONS');
     doc.font('Helvetica');
-    doc.text(`${labels.incomeTax}:   ${fmt(d.paye)}`);
-    doc.text(`${labels.health}:    ${fmt(d.sha)}`);
-    doc.text(`${labels.pension}:   ${fmt(d.nssf)}`);
-    (d.otherDeductions || []).forEach((od) => doc.text(`${od.label}:  ${fmt(od.amount)}`));
+    doc.text(`${labels.incomeTax    || 'PAYE'}:                     ${fmt(d.paye)}`);
+    doc.text(`${labels.health       || 'SHA'}:                      ${fmt(d.sha)}`);
+    doc.text(`${labels.pension      || 'NSSF'}:                     ${fmt(d.nssf)}`);
+    doc.text(`${labels.housingLevy  || 'Affordable Housing Levy'}:  ${fmt(d.ahl)}`);
+    if ((d.otherDeductions || []).length > 0) {
+      doc.moveDown(0.3).font('Helvetica-Bold').text('OTHER DEDUCTIONS');
+      doc.font('Helvetica');
+      (d.otherDeductions || []).forEach((od) => doc.text(`${od.label || od.name}:  ${fmt(od.amount)}`));
+    }
     doc.moveDown(); line();
 
-    const totalDed = (d.paye || 0) + (d.sha || 0) + (d.nssf || 0) +
+    const totalDed = (d.paye || 0) + (d.sha || 0) + (d.nssf || 0) + (d.ahl || 0) +
       (d.otherDeductions || []).reduce((s, x) => s + (x.amount || 0), 0);
     doc.font('Helvetica-Bold').fontSize(11)
       .text(`Total Deductions:  ${fmt(totalDed)}`, { align: 'right' });

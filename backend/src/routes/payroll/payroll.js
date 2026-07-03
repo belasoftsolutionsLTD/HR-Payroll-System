@@ -4,10 +4,10 @@ const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
 
-const { listPayroll, getEmployeePayroll, createPayroll, downloadPayslip, bulkGeneratePayroll, disbursePayroll } = require('./payrollFunctions');
+const { listPayroll, getEmployeePayroll, createPayroll, downloadPayslip, bulkGeneratePayroll, disbursePayroll, downloadP9Form } = require('./payrollFunctions');
 const { listConcepts, createConcept, updateConcept, deleteConcept, getConcept } = require('./payrollConceptsFunctions');
 const { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation } = require('./payrollCompensationsFunctions');
-const { listCycles, getCycle, createCycle, advanceCycleStatus, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult } = require('./payrollCyclesFunctions');
+const { listCycles, getCycle, createCycle, advanceCycleStatus, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult, emailPayslips } = require('./payrollCyclesFunctions');
 const { getMyPayslips, downloadPayslipPDF, getPayslip, getEmployeePayslips } = require('./payrollPayslipsFunctions');
 
 const hrOnly   = allowRoles(HR_ROLES);
@@ -40,6 +40,7 @@ router.post('/cycles/:id/lock',                     hrOnly, AsyncHandler(lockCyc
 router.post('/cycles/:id/close',                    hrOnly, AsyncHandler(closeCycle));
 router.get('/cycles/:id/export',                    hrOnly, AsyncHandler(exportCycleCSV));
 router.get('/cycles/:id/bank-file',                 hrOnly, AsyncHandler(exportBankFile));
+router.post('/cycles/:id/email-payslips',           hrOnly, AsyncHandler(emailPayslips));
 
 // ── Payroll Results ───────────────────────────────────────────────────────────
 router.get('/results/:cycleId/:employeeId',         hrOnly, AsyncHandler(getEmployeeResult));
@@ -49,6 +50,9 @@ router.get('/payslips',                             allRoles, AsyncHandler(getMy
 router.get('/payslips/:id',                         allRoles, AsyncHandler(getPayslip));
 router.get('/payslips/:id/pdf',                     allRoles, AsyncHandler(downloadPayslipPDF));
 router.get('/employee-payslips/:employeeId',        hrOnly,   AsyncHandler(getEmployeePayslips));
+
+// ── P9A Form ──────────────────────────────────────────────────────────────────
+router.get('/p9/:employeeId',                       hrOnly, AsyncHandler(downloadP9Form));
 
 // ── Legacy Payroll (preserved) ────────────────────────────────────────────────
 router.get('/',                                     hrOnly, AsyncHandler(listPayroll));

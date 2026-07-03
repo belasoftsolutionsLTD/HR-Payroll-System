@@ -245,7 +245,7 @@ const disputeClaim = async (req, res) => {
 const approveClaim = async (req, res) => {
   const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
-  if (claim.status !== 'submitted') return returnFunction(res, 400, false, 'Claim is not pending approval.');
+  if (!['submitted', 'disputed'].includes(claim.status)) return returnFunction(res, 400, false, 'Claim is not pending approval.');
   if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'You cannot approve your own expense claim.');
   }
@@ -268,7 +268,7 @@ const rejectClaim = async (req, res) => {
   if (!validateRequiredFields(req, res, ['reason'])) return;
   const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
-  if (!['submitted'].includes(claim.status)) return returnFunction(res, 400, false, 'Claim is not pending approval.');
+  if (!['submitted', 'disputed'].includes(claim.status)) return returnFunction(res, 400, false, 'Claim is not pending approval.');
   if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'You cannot reject your own expense claim.');
   }

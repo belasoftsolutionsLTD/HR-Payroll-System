@@ -3,6 +3,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { generatePayslip } = require('../../services/pdfService');
+const { generateP9Form }  = require('../../services/p9Service');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
 const { buildCalculator, loadTaxConfig } = require('../../functions/taxCalculator');
 
@@ -36,9 +37,10 @@ const listPayroll = async (req, res) => {
         paye:     acc.paye     + (r.deductions?.paye  || 0),
         nssf:     acc.nssf     + (r.deductions?.nssf  || 0),
         sha:      acc.sha      + (r.deductions?.sha   || 0),
+        ahl:      acc.ahl      + (r.deductions?.ahl   || 0),
         count:    acc.count    + 1,
       }),
-      { grossPay: 0, netPay: 0, paye: 0, nssf: 0, sha: 0, count: 0 },
+      { grossPay: 0, netPay: 0, paye: 0, nssf: 0, sha: 0, ahl: 0, count: 0 },
     );
   }
 
@@ -78,6 +80,7 @@ const buildPayrollDoc = async (emp, month, year, generatedBy, otherDeductions = 
   const paye = tax.calcIncomeTax(totalEarnings);
   const nssf = tax.calcPension(totalEarnings);
   const sha  = tax.calcHealth(totalEarnings);
+  const ahl  = tax.calcHousingLevy(totalEarnings);
 
   // Auto-apply configured deduction types matching the employee's job group
   const allDeductionTypes = await findMany('deduction_types', { isEnabled: true });
@@ -95,7 +98,7 @@ const buildPayrollDoc = async (emp, month, year, generatedBy, otherDeductions = 
 
   const allOtherDeductions = [...autoDeductions, ...otherDeductions];
   const extraDeductions     = allOtherDeductions.reduce((s, d) => s + (parseFloat(d.amount) || 0), 0);
-  const netPay = Math.round((totalEarnings - paye - nssf - sha - extraDeductions) * 100) / 100;
+  const netPay = Math.round((totalEarnings - paye - nssf - sha - ahl - extraDeductions) * 100) / 100;
 
   return {
     employeeId: emp._id,
@@ -106,14 +109,13 @@ const buildPayrollDoc = async (emp, month, year, generatedBy, otherDeductions = 
     otherAllowances,
     allowancesTotal,
     totalEarnings,
-    // Keep paye/nssf/sha field names for backward compat with existing records & PDF service
-    deductions: { paye, nssf, sha, otherDeductions: allOtherDeductions },
-    // Store labels and currency so payslips display the correct names for any country
+    deductions: { paye, nssf, sha, ahl, otherDeductions: allOtherDeductions },
     taxLabels: {
-      incomeTax: tax.incomeTaxName,
-      pension:   tax.pensionName,
-      health:    tax.healthName,
-      currency:  tax.currency,
+      incomeTax:   tax.incomeTaxName,
+      pension:     tax.pensionName,
+      health:      tax.healthName,
+      housingLevy: tax.housingLevyName,
+      currency:    tax.currency,
     },
     currency: tax.currency,
     netPay,
@@ -295,4 +297,67 @@ const disbursePayroll = async (req, res) => {
   return returnFunction(res, 200, true, 'Payment disbursed successfully.', { disbursementId: result.insertedId });
 };
 
-module.exports = { listPayroll, getEmployeePayroll, createPayroll, downloadPayslip, bulkGeneratePayroll, disbursePayroll };
+// ── P9A Form (Kenya KRA Annual PAYE Deduction Card) ───────────────────────────
+// GET /api/payroll/p9/:employeeId?year=2025
+const downloadP9Form = async (req, res) => {
+  const { employeeId } = req.params;
+  const year = parseInt(req.query.year) || new Date().getFullYear() - 1;
+
+  const employee = await findOne('employees', { _id: new ObjectId(employeeId) });
+  if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
+
+  // Pull from both payroll systems for the requested year
+  const [legacyRecords, cycleResults] = await Promise.all([
+    findMany('payroll_summaries', { employeeId: new ObjectId(employeeId), year }),
+    findMany('payroll_results',   { employeeId: new ObjectId(employeeId) }, {}),
+  ]);
+
+  // Filter cycle results by year (via joining payroll_cycles)
+  const cycleIds = [...new Set(cycleResults.map(r => String(r.cycleId)))];
+  const cycles   = cycleIds.length
+    ? await findMany('payroll_cycles', { _id: { $in: cycleIds.map(id => new ObjectId(id)) } })
+    : [];
+  const cycleMap = Object.fromEntries(cycles.map(c => [String(c._id), c]));
+
+  // Build month → data map (cycle results take precedence over legacy for same month)
+  const monthMap = {};
+
+  for (const r of legacyRecords) {
+    const m = r.month;
+    const d = r.deductions || {};
+    monthMap[m] = {
+      month:    m,
+      grossPay: r.totalEarnings || r.grossPay || 0,
+      paye:     d.paye  || 0,
+      nssf:     d.nssf  || 0,
+      sha:      d.sha   || 0,
+      ahl:      d.ahl   || 0,
+      netPay:   r.netPay || 0,
+    };
+  }
+
+  for (const r of cycleResults) {
+    const cycle = cycleMap[String(r.cycleId)];
+    if (!cycle || cycle.period?.year !== year) continue;
+    const m  = cycle.period.month;
+    const sd = r.statutoryDeductions || {};
+    monthMap[m] = {
+      month:    m,
+      grossPay: r.grossPay || 0,
+      paye:     sd.paye || 0,
+      nssf:     sd.nssf || 0,
+      sha:      sd.sha  || 0,
+      ahl:      sd.ahl  || 0,
+      netPay:   r.netPay || 0,
+    };
+  }
+
+  const monthlyData = Object.values(monthMap).sort((a, b) => a.month - b.month);
+
+  const buffer = await generateP9Form(employee, year, monthlyData);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="P9A-${employee.staffNumber || employeeId}-${year}.pdf"`);
+  res.send(buffer);
+};
+
+module.exports = { listPayroll, getEmployeePayroll, createPayroll, downloadPayslip, bulkGeneratePayroll, disbursePayroll, downloadP9Form };

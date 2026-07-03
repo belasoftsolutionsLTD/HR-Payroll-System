@@ -221,4 +221,52 @@ const getOrgChart = async (req, res) => {
   return returnFunction(res, 200, true, 'Org chart fetched', roots);
 };
 
-module.exports = { listEmployees, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart };
+// ── Payroll Readiness Check ───────────────────────────────────────────────────
+// GET /api/employees/payroll-readiness
+// Returns all active/on-leave employees that are missing fields required for
+// payroll to run correctly. Designed to be called before creating a cycle.
+
+const READINESS_CHECKS = [
+  { key: 'grossPay',       label: 'Gross Pay',       critical: true,  test: e => e.grossPay && e.grossPay > 0 },
+  { key: 'jobGroup',       label: 'Job Group',        critical: true,  test: e => !!e.jobGroupId },
+  { key: 'taxId',          label: 'Tax ID / PIN',     critical: false, test: e => !!e.kraPin },
+  { key: 'paymentMethod',  label: 'Payment Method',   critical: false, test: e => !!(e.bankAccountNumber || e.mpesaNumber) },
+  { key: 'department',     label: 'Department',       critical: false, test: e => !!e.department },
+  { key: 'staffNumber',    label: 'Staff Number',     critical: false, test: e => !!e.staffNumber },
+];
+
+const getPayrollReadiness = async (req, res) => {
+  const employees = await findMany(
+    'employees',
+    { status: { $in: ['active', 'on_leave'] } },
+    { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, grossPay: 1, jobGroupId: 1, kraPin: 1, bankAccountNumber: 1, mpesaNumber: 1 } },
+  );
+
+  const incomplete = employees
+    .map(emp => {
+      const missing         = READINESS_CHECKS.filter(c => !c.test(emp));
+      const missingLabels   = missing.map(c => c.label);
+      const hasCritical     = missing.some(c => c.critical);
+      if (!missing.length) return null;
+      return {
+        _id:          emp._id,
+        fullName:     emp.fullName,
+        staffNumber:  emp.staffNumber ?? '—',
+        department:   emp.department  ?? '—',
+        designation:  emp.designation ?? '—',
+        missing:      missingLabels,
+        hasCritical,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (b.hasCritical ? 1 : 0) - (a.hasCritical ? 1 : 0));
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    total:           employees.length,
+    incompleteCount: incomplete.length,
+    criticalCount:   incomplete.filter(e => e.hasCritical).length,
+    employees:       incomplete,
+  });
+};
+
+module.exports = { listEmployees, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness };

@@ -4,10 +4,26 @@ const { validateRequiredFields } = require('../../functions/Route Fns/routeFns')
 const { findMany, insertOne } = require('../../functions/Database/commonDBFunctions');
 
 const getStaffNotes = async (req, res) => {
-  const notes = await findMany('staff_notes',
-    { employeeId: new ObjectId(req.params.employeeId) },
-    { sort: { createdAt: -1 } }
-  );
+  const notes = await global.dbo.collection('staff_notes').aggregate([
+    { $match: { employeeId: new ObjectId(req.params.employeeId) } },
+    { $sort: { createdAt: -1 } },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'createdBy',
+        foreignField: '_id',
+        as: '_creator',
+      },
+    },
+    {
+      $addFields: {
+        createdByName: { $arrayElemAt: ['$_creator.name', 0] },
+        createdByRole: { $arrayElemAt: ['$_creator.role', 0] },
+      },
+    },
+    { $project: { _creator: 0 } },
+  ]).toArray();
+
   return returnFunction(res, 200, true, req.locale.success, notes);
 };
 

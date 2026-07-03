@@ -94,9 +94,15 @@ const listGoals = async (req, res) => {
   const role = req.user.role;
 
   if (role === 'staff') {
-    const emp = await findOne('employees', { userId: new ObjectId(req.user._id) }, { projection: { _id: 1 } });
-    if (emp) filter.employeeId = emp._id;
-    // Staff always see only their own goals, no visibility filter needed
+    const emp = await findOne('employees', { userId: new ObjectId(req.user._id) }, { projection: { _id: 1, department: 1 } });
+    // Staff see goals set explicitly for them OR goals visible to their team/company
+    if (emp) {
+      filter.$or = [
+        { employeeId: emp._id },
+        { visibility: { $in: ['team', 'company'] }, department: emp.department },
+        { visibility: 'company' },
+      ];
+    }
   } else if (role === 'department_head') {
     if (req.query.employeeId) {
       filter.employeeId = new ObjectId(req.query.employeeId);

@@ -1,10 +1,13 @@
 const { ObjectId } = require('mongodb');
 const PDFDocument = require('pdfkit');
+const fs   = require('fs');
+const path = require('path');
 const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyUser } = require('../../functions/HR/notifyUser');
 
-// Generate a training completion certificate and return base64 PDF
+// ── Certificate ───────────────────────────────────────────────────────────────
+
 const generateCertificate = (employeeName, courseTitle, completedAt, companyName = 'The Organisation') => {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 60 });
@@ -14,7 +17,6 @@ const generateCertificate = (employeeName, courseTitle, completedAt, companyName
     doc.on('error', reject);
 
     const W = doc.page.width, H = doc.page.height;
-    // Border
     doc.rect(20, 20, W - 40, H - 40).lineWidth(3).strokeColor('#0A1931').stroke();
     doc.rect(28, 28, W - 56, H - 56).lineWidth(1).strokeColor('#C9A84C').stroke();
 
@@ -41,7 +43,6 @@ const generateCertificate = (employeeName, courseTitle, completedAt, companyName
     doc.moveTo(W / 2 - 100, doc.y).lineTo(W / 2 + 100, doc.y).strokeColor('#0A1931').lineWidth(1).stroke();
     doc.moveDown(0.3);
     doc.fontSize(11).fillColor('#333').text(companyName, { align: 'center' });
-
     doc.end();
   });
 };
@@ -55,13 +56,12 @@ const listCourses = async (req, res) => {
   if (req.user.role === 'staff') query.status = 'published';
   else if (status !== 'all') query.status = status;
 
-  if (category)  query.category = category;
-  if (level)     query.level = level;
-  if (search)    query.title = { $regex: search, $options: 'i' };
+  if (category) query.category = category;
+  if (level)    query.level = level;
+  if (search)   query.title = { $regex: search, $options: 'i' };
 
   const courses = await findMany('training_courses', query, { sort: { createdAt: -1 } });
 
-  // Annotate each course with the current user's enrollment status
   const courseIds = courses.map(c => c._id);
   const myEnrollments = courseIds.length
     ? await findMany('training_enrollments', { userId: req.user._id, courseId: { $in: courseIds } }, {
@@ -83,20 +83,36 @@ const createCourse = async (req, res) => {
     title, description, category = 'Other', level = 'beginner',
     duration = 0, instructor = '', isMandatory = false, loginUrl = '',
     trainingType = 'self_paced', objectives = [],
-    startTime = null, endTime = null, venue = null, trainingMode = 'in_person',
+    startTime = null, endTime = null, trainingMode = 'in_person',
+    link = null,
+    location = null,
+    isRecurring = false,
+    recurringFrequency = null,
   } = req.body;
 
   if (!title) return returnFunction(res, 400, false, 'Title is required');
 
+  // Normalise location object
+  const locationData = location && typeof location === 'object'
+    ? { address: (location.address || '').trim(), venue: (location.venue || '').trim() }
+    : null;
+
+  // Rename legacy one_time → recurring_event
+  const normalizedType = trainingType === 'one_time' ? 'recurring_event' : trainingType;
+
   const doc = {
     title, description, category, level, duration,
     instructor, isMandatory, loginUrl,
-    trainingType,
+    trainingType: normalizedType,
     objectives: Array.isArray(objectives) ? objectives.filter(Boolean) : [],
     startTime: startTime || null,
-    endTime: endTime || null,
-    venue: venue || null,
+    endTime:   endTime   || null,
     trainingMode,
+    link: link || null,
+    location: locationData,
+    isRecurring: Boolean(isRecurring),
+    recurringFrequency: isRecurring ? (recurringFrequency || null) : null,
+    materials: [],
     status: 'published',
     rating: 0,
     enrolledCount: 0,
@@ -132,12 +148,25 @@ const updateCourse = async (req, res) => {
   if (instructor  !== undefined) updates.instructor = instructor;
   if (isMandatory !== undefined) updates.isMandatory = isMandatory;
   if (status      !== undefined) updates.status = status;
-  if (req.body.trainingType !== undefined) updates.trainingType = req.body.trainingType;
+  if (req.body.trainingType !== undefined) {
+    const t = req.body.trainingType;
+    updates.trainingType = t === 'one_time' ? 'recurring_event' : t;
+  }
   if (req.body.startTime    !== undefined) updates.startTime = req.body.startTime || null;
-  if (req.body.endTime      !== undefined) updates.endTime = req.body.endTime || null;
-  if (req.body.venue        !== undefined) updates.venue = req.body.venue || null;
+  if (req.body.endTime      !== undefined) updates.endTime   = req.body.endTime   || null;
   if (req.body.trainingMode !== undefined) updates.trainingMode = req.body.trainingMode || 'in_person';
-  if (req.body.objectives   !== undefined) updates.objectives = Array.isArray(req.body.objectives) ? req.body.objectives.filter(Boolean) : [];
+  if (req.body.link         !== undefined) updates.link = req.body.link || null;
+  if (req.body.location !== undefined) {
+    const loc = req.body.location;
+    updates.location = loc && typeof loc === 'object'
+      ? { address: (loc.address || '').trim(), venue: (loc.venue || '').trim() }
+      : null;
+  }
+  if (req.body.isRecurring        !== undefined) updates.isRecurring = Boolean(req.body.isRecurring);
+  if (req.body.recurringFrequency !== undefined) updates.recurringFrequency = req.body.recurringFrequency || null;
+  if (req.body.objectives !== undefined) {
+    updates.objectives = Array.isArray(req.body.objectives) ? req.body.objectives.filter(Boolean) : [];
+  }
   updates.updatedAt = new Date();
 
   await updateOne('training_courses', { _id: new ObjectId(id) }, { $set: updates });
@@ -151,10 +180,96 @@ const deleteCourse = async (req, res) => {
   return returnFunction(res, 200, true, 'Course deleted');
 };
 
+// ── Materials ─────────────────────────────────────────────────────────────────
+
+const addMaterial = async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+
+  const course = await findOne('training_courses', { _id: new ObjectId(id) });
+  if (!course) return returnFunction(res, 404, false, 'Course not found');
+  if (!req.file) return returnFunction(res, 400, false, 'No file uploaded');
+
+  const { wordCount, title: materialTitle } = req.body;
+  const isVideo = req.file.mimetype.startsWith('video/');
+  const isPDF   = req.file.mimetype === 'application/pdf';
+
+  const parsedWordCount = wordCount ? Number(wordCount) : null;
+  // 200 words per minute → convert to seconds
+  const minReadTimeSeconds = parsedWordCount ? Math.ceil((parsedWordCount / 200) * 60) : null;
+
+  const material = {
+    _id: new ObjectId(),
+    title:        materialTitle || req.file.originalname,
+    type:         isVideo ? 'video' : isPDF ? 'pdf' : 'other',
+    filename:     req.file.filename,
+    originalName: req.file.originalname,
+    mimetype:     req.file.mimetype,
+    size:         req.file.size,
+    wordCount:    parsedWordCount,
+    minReadTimeSeconds,
+    uploadedAt:   new Date(),
+  };
+
+  await global.dbo.collection('training_courses').updateOne(
+    { _id: new ObjectId(id) },
+    { $push: { materials: material }, $set: { updatedAt: new Date() } }
+  );
+
+  return returnFunction(res, 201, true, 'Material uploaded', material);
+};
+
+const removeMaterial = async (req, res) => {
+  const { id, materialId } = req.params;
+  if (!ObjectId.isValid(id) || !ObjectId.isValid(materialId)) {
+    return returnFunction(res, 400, false, 'Invalid ID');
+  }
+
+  await global.dbo.collection('training_courses').updateOne(
+    { _id: new ObjectId(id) },
+    { $pull: { materials: { _id: new ObjectId(materialId) } }, $set: { updatedAt: new Date() } }
+  );
+
+  return returnFunction(res, 200, true, 'Material removed');
+};
+
+const saveMaterialProgress = async (req, res) => {
+  const { id } = req.params; // enrollmentId
+  const { materialId, videoPositionSeconds, timeSpentSeconds, completed } = req.body;
+
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+  if (!materialId) return returnFunction(res, 400, false, 'materialId required');
+
+  const enrollment = await findOne('training_enrollments', { _id: new ObjectId(id), userId: req.user._id });
+  if (!enrollment) return returnFunction(res, 404, false, 'Enrollment not found');
+
+  const existing = enrollment.materialProgress?.[materialId] || {};
+  const updates = { updatedAt: new Date() };
+
+  if (videoPositionSeconds !== undefined) {
+    updates[`materialProgress.${materialId}.videoPositionSeconds`] = Number(videoPositionSeconds);
+  }
+  if (timeSpentSeconds !== undefined) {
+    // Only advance, never go backwards (guards against duplicate saves)
+    const prev = existing.timeSpentSeconds || 0;
+    updates[`materialProgress.${materialId}.timeSpentSeconds`] = Math.max(prev, Number(timeSpentSeconds));
+  }
+  if (completed !== undefined) {
+    updates[`materialProgress.${materialId}.completed`] = Boolean(completed);
+  }
+
+  await updateOne('training_enrollments', { _id: new ObjectId(id) }, { $set: updates });
+
+  const updated = await findOne('training_enrollments', { _id: new ObjectId(id) });
+  return returnFunction(res, 200, true, 'Progress saved', {
+    materialProgress: updated?.materialProgress || {},
+  });
+};
+
 // ── Enrollments ───────────────────────────────────────────────────────────────
 
 const enrollInCourse = async (req, res) => {
-  const { id } = req.params; // courseId
+  const { id } = req.params;
   if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
 
   const course = await findOne('training_courses', { _id: new ObjectId(id) });
@@ -177,8 +292,10 @@ const enrollInCourse = async (req, res) => {
     progress:    0,
     startedAt:   null,
     completedAt: null,
+    minutesPresent: null,
     dueDate:     null,
     certificateUrl: null,
+    materialProgress: {},
     enrolledAt:  new Date(),
     updatedAt:   new Date(),
   };
@@ -190,11 +307,25 @@ const enrollInCourse = async (req, res) => {
 };
 
 const startCourse = async (req, res) => {
-  const { id } = req.params; // courseId
+  const { id } = req.params;
   if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+
+  const course = await findOne('training_courses', { _id: new ObjectId(id) });
+  if (!course) return returnFunction(res, 404, false, 'Course not found');
+
+  // Enforce start time only when stored as full ISO datetime (contains 'T')
+  if (course.startTime && String(course.startTime).includes('T')) {
+    const startDate = new Date(course.startTime);
+    if (!isNaN(startDate.getTime()) && new Date() < startDate) {
+      const label = startDate.toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' });
+      return returnFunction(res, 403, false, `Training hasn't started yet — it begins at ${label}.`);
+    }
+  }
+
   const enrollment = await findOne('training_enrollments', { courseId: new ObjectId(id), userId: req.user._id });
   if (!enrollment) return returnFunction(res, 404, false, 'Not enrolled in this course');
   if (enrollment.status !== 'not_started') return returnFunction(res, 400, false, 'Course already started');
+
   await updateOne('training_enrollments', { _id: enrollment._id }, {
     $set: { status: 'in_progress', startedAt: new Date(), updatedAt: new Date() },
   });
@@ -218,7 +349,6 @@ const toggleObjective = async (req, res) => {
 
   const alreadyDone = (enrollment.completedObjectives || []).includes(idx);
 
-  // Atomic toggle — no read-modify-write race
   await global.dbo.collection('training_enrollments').updateOne(
     { _id: new ObjectId(id) },
     alreadyDone
@@ -226,7 +356,6 @@ const toggleObjective = async (req, res) => {
       : { $addToSet: { completedObjectives: idx }, $set: { updatedAt: new Date() } }
   );
 
-  // Re-fetch to get accurate completed list after atomic update
   const updated = await findOne('training_enrollments', { _id: new ObjectId(id) });
   const newCompleted = updated?.completedObjectives ?? [];
   const progress = total > 0 ? Math.min(100, Math.round((newCompleted.length / total) * 100)) : 0;
@@ -246,15 +375,18 @@ const getMyTraining = async (req, res) => {
   const summary = {
     assigned:   enrollments.filter(e => e.status === 'not_started').length,
     inProgress: enrollments.filter(e => e.status === 'in_progress').length,
-    completed:  enrollments.filter(e => e.status === 'completed').length,
-    overdue:    enrollments.filter(e => e.dueDate && new Date(e.dueDate) < new Date() && e.status !== 'completed').length,
+    completed:  enrollments.filter(e => e.status === 'completed' || e.status === 'auto_completed').length,
+    overdue:    enrollments.filter(e =>
+      e.dueDate && new Date(e.dueDate) < new Date() &&
+      e.status !== 'completed' && e.status !== 'auto_completed'
+    ).length,
   };
 
   return returnFunction(res, 200, true, 'Training fetched', { enrollments, summary });
 };
 
 const updateProgress = async (req, res) => {
-  const { id } = req.params; // enrollmentId
+  const { id } = req.params;
   const { progress } = req.body;
   if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
 
@@ -269,7 +401,6 @@ const updateProgress = async (req, res) => {
     updates.startedAt = new Date();
   }
   if (pct >= 100) {
-    // For self_paced: only complete if all objectives done
     if (enrollment.trainingType === 'self_paced') {
       const totalObj = (enrollment.objectives || []).length;
       const doneObj  = (enrollment.completedObjectives || []).length;
@@ -277,13 +408,16 @@ const updateProgress = async (req, res) => {
         return returnFunction(res, 400, false, 'Complete all objectives before marking this course as done.');
       }
     }
+    const completedAt = new Date();
     updates.status      = 'completed';
-    updates.completedAt = new Date();
+    updates.completedAt = completedAt;
+    if (enrollment.startedAt) {
+      updates.minutesPresent = Math.max(1, Math.round((completedAt - new Date(enrollment.startedAt)) / 60000));
+    }
   }
 
   await updateOne('training_enrollments', { _id: new ObjectId(id) }, { $set: updates });
 
-  // Generate certificate when newly completed
   if (updates.status === 'completed') {
     try {
       const settings = await findOne('company_settings', {});
@@ -296,7 +430,6 @@ const updateProgress = async (req, res) => {
         $set: { certificateData: certBase64, updatedAt: new Date() },
       });
     } catch (certErr) {
-      // Certificate failure should not block completion
       console.error('Certificate generation failed:', certErr.message);
     }
   }
@@ -305,8 +438,6 @@ const updateProgress = async (req, res) => {
 };
 
 const getTeamTraining = async (req, res) => {
-  const { departmentId } = req.query;
-
   let employeeQuery = {};
   if (req.user.role === 'department_head' && req.user.department) {
     employeeQuery.department = req.user.department;
@@ -320,7 +451,7 @@ const getTeamTraining = async (req, res) => {
       { $match: { userId: { $in: employeeIds.map(id => new ObjectId(String(id))) } } },
       { $group: {
         _id: '$userId',
-        completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+        completed:  { $sum: { $cond: [{ $in: ['$status', ['completed', 'auto_completed']] }, 1, 0] } },
         inProgress: { $sum: { $cond: [{ $eq: ['$status', 'in_progress'] }, 1, 0] } },
         total: { $sum: 1 },
       }},
@@ -329,10 +460,10 @@ const getTeamTraining = async (req, res) => {
   return returnFunction(res, 200, true, 'Team training fetched', enrollments);
 };
 
-// ── HR: assign course to one or more employees ────────────────────────────────
+// ── HR: assign course to employees ────────────────────────────────────────────
 
 const assignCourseToEmployees = async (req, res) => {
-  const { id } = req.params; // courseId
+  const { id } = req.params;
   if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid course ID');
 
   const { employeeIds, dueDate } = req.body;
@@ -342,7 +473,6 @@ const assignCourseToEmployees = async (req, res) => {
   const course = await findOne('training_courses', { _id: new ObjectId(id) });
   if (!course) return returnFunction(res, 404, false, 'Course not found');
 
-  // Fetch user accounts for each employee so we know their userId
   const employees = await global.dbo.collection('users')
     .find({ employeeId: { $in: employeeIds.map(eid => new ObjectId(String(eid))) } })
     .toArray();
@@ -351,10 +481,7 @@ const assignCourseToEmployees = async (req, res) => {
   let skipped  = 0;
 
   for (const user of employees) {
-    const existing = await findOne('training_enrollments', {
-      courseId: new ObjectId(id),
-      userId: user._id,
-    });
+    const existing = await findOne('training_enrollments', { courseId: new ObjectId(id), userId: user._id });
     if (existing) { skipped++; continue; }
 
     await insertOne('training_enrollments', {
@@ -370,8 +497,10 @@ const assignCourseToEmployees = async (req, res) => {
       progress:    0,
       startedAt:   null,
       completedAt: null,
+      minutesPresent: null,
       dueDate:     dueDate || null,
       certificateUrl: null,
+      materialProgress: {},
       enrolledAt:  new Date(),
       updatedAt:   new Date(),
     });
@@ -395,13 +524,16 @@ const downloadCertificate = async (req, res) => {
   if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
   const enrollment = await findOne('training_enrollments', { _id: new ObjectId(id), userId: req.user._id });
   if (!enrollment) return returnFunction(res, 404, false, 'Enrollment not found');
-  if (enrollment.status !== 'completed') return returnFunction(res, 400, false, 'Course not yet completed');
+  if (!['completed', 'auto_completed'].includes(enrollment.status)) {
+    return returnFunction(res, 400, false, 'Course not yet completed');
+  }
 
-  // Return existing cert or regenerate
   let certBase64 = enrollment.certificateData;
   if (!certBase64) {
     const settings = await findOne('company_settings', {});
-    const emp = req.user.employeeId ? await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } }) : null;
+    const emp = req.user.employeeId
+      ? await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } })
+      : null;
     const name = emp?.fullName || req.user.name || 'Participant';
     const pdfBuf = await generateCertificate(name, enrollment.courseTitle, enrollment.completedAt, settings?.companyName);
     certBase64 = pdfBuf.toString('base64');
@@ -418,4 +550,5 @@ module.exports = {
   listCourses, getCourse, createCourse, updateCourse, deleteCourse,
   enrollInCourse, assignCourseToEmployees, getMyTraining, updateProgress, getTeamTraining,
   startCourse, toggleObjective, downloadCertificate,
+  addMaterial, removeMaterial, saveMaterialProgress,
 };

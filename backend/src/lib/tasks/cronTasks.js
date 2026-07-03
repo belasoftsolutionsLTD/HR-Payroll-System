@@ -1,4 +1,5 @@
 const cron = require('node-cron');
+const { ObjectId } = require('mongodb');
 const { triggerTasksFromTemplate } = require('./triggerTasksFromTemplate');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
 
@@ -235,6 +236,102 @@ async function autoMarkAbsent() {
   console.log(`[CRON] Auto-marked ${absentIds.length} employee(s) as absent for ${todayStr}`);
 }
 
+// ── Auto-complete training sessions whose end time has passed ─────────────────
+
+async function autoCompleteTraining() {
+  if (!global.dbo) return;
+
+  const now = new Date();
+
+  // Find in_progress enrollments
+  const inProgress = await global.dbo.collection('training_enrollments')
+    .find({ status: 'in_progress' }, { projection: { _id: 1, courseId: 1, startedAt: 1 } })
+    .toArray();
+
+  if (!inProgress.length) return;
+
+  const courseIds = [...new Set(inProgress.map(e => String(e.courseId)))];
+
+  // Find courses whose endTime has passed and is a full ISO datetime
+  const courses = await global.dbo.collection('training_courses').find({
+    _id: { $in: courseIds.map(id => new ObjectId(id)) },
+    endTime: { $ne: null },
+  }, { projection: { _id: 1, endTime: 1, isRecurring: 1, recurringFrequency: 1, startTime: 1 } }).toArray();
+
+  let count = 0;
+  for (const course of courses) {
+    if (!course.endTime || !String(course.endTime).includes('T')) continue;
+    const endDate = new Date(course.endTime);
+    if (isNaN(endDate.getTime()) || endDate > now) continue;
+
+    // Mark matching enrollments as auto_completed
+    const matching = inProgress.filter(e => String(e.courseId) === String(course._id));
+    for (const enr of matching) {
+      const minutesPresent = enr.startedAt
+        ? Math.max(1, Math.round((endDate - new Date(enr.startedAt)) / 60000))
+        : null;
+
+      await global.dbo.collection('training_enrollments').updateOne(
+        { _id: enr._id },
+        { $set: {
+          status: 'auto_completed',
+          completedAt: endDate,
+          progress: 100,
+          ...(minutesPresent !== null ? { minutesPresent } : {}),
+          updatedAt: now,
+        }}
+      );
+      count++;
+    }
+
+    // Auto-create next occurrence for recurring courses (once, using a flag)
+    if (course.isRecurring && course.recurringFrequency && !course.nextOccurrenceCreated) {
+      const freq = {
+        daily:     { days: 1 },
+        weekly:    { days: 7 },
+        monthly:   { months: 1 },
+        quarterly: { months: 3 },
+        annually:  { years: 1 },
+      }[course.recurringFrequency];
+
+      if (freq) {
+        const addToDate = (d) => {
+          const nd = new Date(d);
+          if (freq.days)   nd.setDate(nd.getDate() + freq.days);
+          if (freq.months) nd.setMonth(nd.getMonth() + freq.months);
+          if (freq.years)  nd.setFullYear(nd.getFullYear() + freq.years);
+          return nd;
+        };
+
+        const fullCourse = await global.dbo.collection('training_courses').findOne({ _id: course._id });
+        if (fullCourse) {
+          const { _id, createdAt, updatedAt, enrolledCount, nextOccurrenceCreated, ...rest } = fullCourse;
+          await global.dbo.collection('training_courses').insertOne({
+            ...rest,
+            startTime: fullCourse.startTime ? addToDate(fullCourse.startTime).toISOString() : null,
+            endTime:   fullCourse.endTime   ? addToDate(fullCourse.endTime).toISOString()   : null,
+            enrolledCount: 0,
+            status: 'published',
+            nextOccurrenceCreated: false,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+      }
+
+      // Mark this course so we don't create another occurrence next run
+      await global.dbo.collection('training_courses').updateOne(
+        { _id: course._id },
+        { $set: { nextOccurrenceCreated: true, updatedAt: now } }
+      );
+    }
+  }
+
+  if (count > 0) {
+    console.log(`[CRON] Auto-completed ${count} training enrollment(s)`);
+  }
+}
+
 function startCronJobs() {
   // Daily at midnight (UTC) — task overdue, onboarding triggers, reminders
   cron.schedule('0 0 * * *', async () => {
@@ -266,7 +363,13 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Clock-out detection error:', err); }
   });
 
+  // Every 15 minutes: auto-complete training sessions whose end time has passed
+  cron.schedule('*/15 * * * *', async () => {
+    try { await autoCompleteTraining(); }
+    catch (err) { console.error('[CRON] Training auto-complete error:', err); }
+  });
+
   console.log('[CRON] All cron jobs scheduled');
 }
 
-module.exports = { startCronJobs, dailyTaskJobs };
+module.exports = { startCronJobs, dailyTaskJobs, autoCompleteTraining };

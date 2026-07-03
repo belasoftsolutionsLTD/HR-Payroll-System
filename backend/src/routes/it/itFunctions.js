@@ -61,13 +61,22 @@ const getDevice = async (req, res) => {
 
 const createDevice = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'type', 'serialNumber', 'condition'])) return;
+
+  // Auto-generate system asset tag if none provided: IT-YYYY-NNN
+  let assetTag = req.body.assetTag || null;
+  if (!assetTag) {
+    const year  = new Date().getFullYear();
+    const count = await countDocuments('devices', {});
+    assetTag = `IT-${year}-${String(count + 1).padStart(3, '0')}`;
+  }
+
   const doc = {
     name:           req.body.name,
     type:           req.body.type,
     brand:          req.body.brand || null,
     model:          req.body.model || null,
     serialNumber:   req.body.serialNumber,
-    assetTag:       req.body.assetTag || null,
+    assetTag,
     purchaseDate:   req.body.purchaseDate ? new Date(req.body.purchaseDate) : null,
     purchasePrice:  req.body.purchasePrice ? Number(req.body.purchasePrice) : null,
     currency:       req.body.currency || 'KES',

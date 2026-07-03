@@ -18,7 +18,7 @@ const getMyProfile = async (req, res) => {
 
 const updateMyProfile = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
-  const ALLOWED = ['phone', 'email', 'nextOfKin', 'bankName', 'bankAccountNumber', 'mpesaNumber'];
+  const ALLOWED = ['phone', 'email', 'nextOfKin', 'kraPin', 'bankName', 'bankAccountNumber', 'mpesaNumber', 'paymentMethod', 'paypalEmail', 'cryptoWalletAddress', 'cryptoNetwork'];
   const patch = {};
   for (const key of ALLOWED) {
     if (req.body[key] !== undefined) patch[key] = req.body[key];
