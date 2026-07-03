@@ -6,7 +6,7 @@ const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   listEmployees, getEmployee, createEmployee, updateEmployee,
-  patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart,
+  patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness,
 } = require('./employeesFunctions');
 
 const SUPER_ADMIN  = 'super_admin';
@@ -22,8 +22,9 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB max for employee documents
 });
 
-router.get('/org-chart', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getOrgChart));
-router.get('/', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(listEmployees));
+router.get('/org-chart',          allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getOrgChart));
+router.get('/payroll-readiness',  allowRoles([SUPER_ADMIN, HR_MANAGER]),            AsyncHandler(getPayrollReadiness));
+router.get('/',                   allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(listEmployees));
 router.get('/:id', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getEmployee));
 router.post('/', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(createEmployee));
 router.put('/:id', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(updateEmployee));

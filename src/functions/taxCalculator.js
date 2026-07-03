@@ -37,6 +37,14 @@ const KENYA_DEFAULT = {
       rate: 2.75,
       cap: null,
     },
+    {
+      key: 'housing_levy',
+      name: 'Affordable Housing Levy',
+      enabled: true,
+      type: 'flat_rate',
+      rate: 1.5,
+      cap: null,
+    },
   ],
 };
 
@@ -74,11 +82,15 @@ const calcStatutory = (gross, cfg) => {
 const buildCalculator = (config) => {
   const cfg = config || KENYA_DEFAULT;
 
-  const pensionCfg = (cfg.statutoryDeductions || []).find(d => d.key === 'pension');
-  const healthCfg  = (cfg.statutoryDeductions || []).find(d => d.key === 'health');
+  const pensionCfg     = (cfg.statutoryDeductions || []).find(d => d.key === 'pension');
+  const healthCfg      = (cfg.statutoryDeductions || []).find(d => d.key === 'health');
+  const housingLevyCfg = (cfg.statutoryDeductions || []).find(d => d.key === 'housing_levy')
+    // Always default to 1.5% — statutory requirement in Kenya (Affordable Housing Act)
+    ?? { key: 'housing_levy', name: 'Affordable Housing Levy', enabled: true, type: 'flat_rate', rate: 1.5, cap: null };
 
-  const calcPension = (gross) => calcStatutory(gross, pensionCfg);
-  const calcHealth  = (gross) => calcStatutory(gross, healthCfg);
+  const calcPension     = (gross) => calcStatutory(gross, pensionCfg);
+  const calcHealth      = (gross) => calcStatutory(gross, healthCfg);
+  const calcHousingLevy = (gross) => calcStatutory(gross, housingLevyCfg);
 
   const calcIncomeTax = (gross) => {
     const itCfg = cfg.incomeTax;
@@ -106,22 +118,24 @@ const buildCalculator = (config) => {
     return Math.round(Math.max(0, tax - (itCfg.personalRelief || 0)) * 100) / 100;
   };
 
-  // Any additional statutory deductions beyond pension & health
+  // Additional statutory deductions beyond the three named ones
   const calcExtraStatutory = (gross) =>
     (cfg.statutoryDeductions || [])
-      .filter(d => d.key !== 'pension' && d.key !== 'health')
+      .filter(d => !['pension', 'health', 'housing_levy'].includes(d.key))
       .map(d => ({ key: d.key, name: d.name, amount: calcStatutory(gross, d) }));
 
   return {
     calcPension,
     calcHealth,
+    calcHousingLevy,
     calcIncomeTax,
     calcExtraStatutory,
-    currency: cfg.currency || 'KES',
-    currencySymbol: cfg.currencySymbol || 'KES',
-    incomeTaxName: cfg.incomeTax?.name || 'PAYE',
-    pensionName:   pensionCfg?.name || 'NSSF',
-    healthName:    healthCfg?.name  || 'SHA',
+    currency:         cfg.currency || 'KES',
+    currencySymbol:   cfg.currencySymbol || 'KES',
+    incomeTaxName:    cfg.incomeTax?.name || 'PAYE',
+    pensionName:      pensionCfg?.name     || 'NSSF',
+    healthName:       healthCfg?.name      || 'SHA',
+    housingLevyName:  housingLevyCfg.name  || 'Affordable Housing Levy',
   };
 };
 
