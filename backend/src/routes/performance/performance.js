@@ -22,12 +22,12 @@ const HR    = [SUPER_ADMIN, HR_MANAGER];
 // Analytics
 router.get('/analytics',  allowRoles(MGMT), AsyncHandler(getAnalytics));
 
-// Goals
+// Goals — create/edit/delete restricted to HR + dept head; staff can only view and check in
 router.get('/goals',              allowRoles(ALL),  AsyncHandler(listGoals));
-router.post('/goals',             allowRoles(ALL),  AsyncHandler(createGoal));
+router.post('/goals',             allowRoles(MGMT), AsyncHandler(createGoal));
 router.get('/goals/:id',          allowRoles(ALL),  AsyncHandler(getGoal));
-router.put('/goals/:id',          allowRoles(ALL),  AsyncHandler(updateGoal));
-router.delete('/goals/:id',       allowRoles(ALL),  AsyncHandler(deleteGoal));
+router.put('/goals/:id',          allowRoles(MGMT), AsyncHandler(updateGoal));
+router.delete('/goals/:id',       allowRoles(MGMT), AsyncHandler(deleteGoal));
 router.post('/goals/:id/checkin', allowRoles(ALL),  AsyncHandler(addCheckin));
 router.post('/goals/:id/comment', allowRoles(ALL),  AsyncHandler(addGoalComment));
 

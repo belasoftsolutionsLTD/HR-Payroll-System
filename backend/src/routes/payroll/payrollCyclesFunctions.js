@@ -3,6 +3,10 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { generatePayslipFromResult } = require('../../services/payslipService');
+const { buildCalculator, loadTaxConfig } = require('../../functions/taxCalculator');
+const { sendEmail } = require('../../services/emailService');
+
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 // ── List Cycles ───────────────────────────────────────────────────────────────
 
@@ -135,6 +139,10 @@ async function lockCycleInternal(req, res, cycle) {
 
   let totalGross = 0, totalDeductions = 0, totalNet = 0, totalEmployerCost = 0, exceptionCount = 0;
 
+  // Load tax config once for all employees (avoids N+1 DB calls)
+  const taxConfig = await loadTaxConfig();
+  const taxCalc   = buildCalculator(taxConfig);
+
   // Get all required alert concepts
   const alertConcepts = await findMany('payroll_concepts', { alertIfUndefined: true, isActive: true }, {});
 
@@ -193,11 +201,10 @@ async function lockCycleInternal(req, res, cycle) {
         $lte: cycle.period.endDate.toISOString().slice(0, 10),
       },
     }).toArray();
-    const overtimeHours = attendanceRecs.reduce((sum, r) => sum + (r.overtimeHours || 0), 0);
-    const overtimeRate  = emp.grossPay ? (emp.grossPay / 22 / 8) * 1.5 : 0;
+    const overtimeHours  = attendanceRecs.reduce((sum, r) => sum + (r.overtimeHours || 0), 0);
+    const overtimeRate   = emp.grossPay ? (emp.grossPay / 22 / 8) * 1.5 : 0;
     const overtimeAmount = Math.round(overtimeHours * overtimeRate);
-    const adjustedGross = grossPay + overtimeAmount;
-    const adjustedNet   = adjustedGross - totalDeds;
+    const adjustedGross  = grossPay + overtimeAmount;
 
     // Pull approved expense reimbursements for this cycle period
     const expenseDocs = await global.dbo.collection('expense_claims').find({
@@ -215,6 +222,18 @@ async function lockCycleInternal(req, res, cycle) {
       );
     }
 
+    // Statutory deductions — computed from gross using the tax engine
+    const statPAYE = taxCalc.calcIncomeTax(adjustedGross);
+    const statNSSF = taxCalc.calcPension(adjustedGross);
+    const statSHA  = taxCalc.calcHealth(adjustedGross);
+    const statAHL  = taxCalc.calcHousingLevy(adjustedGross);
+    const totalStatutory = Math.round((statPAYE + statNSSF + statSHA + statAHL) * 100) / 100;
+
+    // Net pay = gross − statutory deductions − voluntary deductions + expense reimbursements
+    const adjustedNet = Math.round(
+      (adjustedGross - totalStatutory - totalDeds + expenseReimbursements) * 100
+    ) / 100;
+
     const resultDoc = {
       cycleId:      cycle._id,
       employeeId:   emp._id,
@@ -222,7 +241,21 @@ async function lockCycleInternal(req, res, cycle) {
       deductions:   deductions.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, conceptCode: c.conceptCode, subCategory: c.subCategory, amount: c.amount })),
       benefits:     benefits.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, amount: c.amount })),
       employerContributions: employerContributions.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, amount: c.amount })),
-      grossPay: adjustedGross, totalDeductions: totalDeds, netPay: adjustedNet, totalEmployerCost: totalEmpCost + overtimeAmount,
+      // Statutory deductions stored separately so the payslip PDF can render them as their own section
+      statutoryDeductions: {
+        paye: statPAYE, nssf: statNSSF, sha: statSHA, ahl: statAHL,
+        total: totalStatutory,
+        labels: {
+          paye: taxCalc.incomeTaxName,
+          nssf: taxCalc.pensionName,
+          sha:  taxCalc.healthName,
+          ahl:  taxCalc.housingLevyName,
+        },
+      },
+      grossPay:          adjustedGross,
+      totalDeductions:   totalDeds + totalStatutory,
+      netPay:            adjustedNet,
+      totalEmployerCost: totalEmpCost + overtimeAmount,
       isProRata, proRataReason: isProRata ? 'new_hire' : null, proRataDays: null, workingDaysInCycle: 22,
       overtimeHours, overtimeAmount, expenseReimbursements,
       hasException:  exceptions.length > 0,
@@ -234,10 +267,10 @@ async function lockCycleInternal(req, res, cycle) {
     };
     await insertOne('payroll_results', resultDoc);
 
-    totalGross         += adjustedGross;
-    totalDeductions    += totalDeds;
-    totalNet           += adjustedNet;
-    totalEmployerCost  += (totalEmpCost + overtimeAmount);
+    totalGross        += adjustedGross;
+    totalDeductions   += totalDeds + totalStatutory;
+    totalNet          += adjustedNet;
+    totalEmployerCost += (totalEmpCost + overtimeAmount);
     if (exceptions.length > 0) exceptionCount++;
   }
 
@@ -382,8 +415,83 @@ const getEmployeeResult = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, { ...result, employee: emp ?? null });
 };
 
+// ── Email Payslips ────────────────────────────────────────────────────────────
+// POST /api/payroll/cycles/:id/email-payslips
+// Emails each employee their payslip PDF for this closed cycle.
+
+const emailPayslips = async (req, res) => {
+  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
+  if (cycle.status !== 'closed') {
+    return returnFunction(res, 400, false, 'Cycle must be closed before emailing payslips.');
+  }
+
+  const results = await findMany('payroll_results', { cycleId: cycle._id, status: 'paid' }, {});
+  if (!results.length) {
+    return returnFunction(res, 400, false, 'No paid payroll results found in this cycle.');
+  }
+
+  let sent = 0, skipped = 0, failed = 0;
+  const period = `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}`;
+
+  for (const result of results) {
+    try {
+      const [emp, user] = await Promise.all([
+        findOne('employees', { _id: result.employeeId }, {
+          projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccount: 1 },
+        }),
+        findOne('users', { employeeId: result.employeeId }, { projection: { email: 1 } }),
+      ]);
+
+      if (!user?.email) { skipped++; continue; }
+
+      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle);
+      const cur       = cycle.currency || 'KES';
+      const netFmt    = `${cur} ${(result.netPay || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`;
+
+      await sendEmail({
+        to: user.email,
+        subject: `Your Payslip — ${period}`,
+        html: `
+          <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:8px">
+            <h2 style="color:#1e293b;margin-top:0">Payslip for ${period}</h2>
+            <p style="color:#475569">Dear <strong>${emp?.fullName ?? 'Employee'}</strong>,</p>
+            <p style="color:#475569">Your payslip for <strong>${period}</strong> is attached to this email.</p>
+            <div style="background:#6366f1;color:#fff;border-radius:6px;padding:12px 16px;margin:16px 0;display:inline-block">
+              <span style="font-size:13px;opacity:0.85">Net Pay</span><br>
+              <span style="font-size:20px;font-weight:bold">${netFmt}</span>
+            </div>
+            <p style="color:#64748b;font-size:13px">
+              If you have any questions about your payslip, please contact the HR department.
+            </p>
+          </div>
+        `,
+        attachments: [{
+          filename: `payslip-${emp?.staffNumber ?? 'emp'}-${cycle.period.year}-${String(cycle.period.month).padStart(2, '0')}.pdf`,
+          content:     pdfBuffer,
+          contentType: 'application/pdf',
+        }],
+      });
+
+      await updateOne('payroll_results', { _id: result._id }, {
+        $set: { payslipSentAt: new Date(), updatedAt: new Date() },
+      });
+      sent++;
+    } catch (err) {
+      console.error(`Payslip email failed for employee ${result.employeeId}:`, err.message);
+      failed++;
+    }
+  }
+
+  return returnFunction(res, 200, true,
+    `Payslips emailed: ${sent} sent, ${skipped} skipped (no user email), ${failed} failed.`,
+    { sent, skipped, failed, total: results.length },
+  );
+};
+
 module.exports = {
   listCycles, getCycle, createCycle, advanceCycleStatus,
   getCycleResults, getCycleExceptions, approveEmployees,
   lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult,
+  emailPayslips,
 };
