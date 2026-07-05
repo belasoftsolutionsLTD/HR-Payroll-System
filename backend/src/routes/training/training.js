@@ -10,6 +10,8 @@ const {
   enrollInCourse, assignCourseToEmployees, getMyTraining, updateProgress, getTeamTraining,
   startCourse, toggleObjective, downloadCertificate,
   addMaterial, removeMaterial, saveMaterialProgress,
+  createQuiz, getQuiz, deleteQuiz, submitQuiz,
+  listPaths, createPath, updatePath, deletePath, enrollInPath,
 } = require('./trainingFunctions');
 
 const ALL  = ['super_admin', 'hr_manager', 'department_head', 'staff'];
@@ -75,5 +77,20 @@ router.delete(
   allowRoles(HR),
   AsyncHandler(removeMaterial)
 );
+
+// ── Quiz routes ───────────────────────────────────────────────────────────────
+
+router.get('/courses/:id/quiz',          allowRoles(ALL), AsyncHandler(getQuiz));
+router.put('/courses/:id/quiz',          allowRoles(HR),  AsyncHandler(createQuiz));
+router.delete('/courses/:id/quiz',       allowRoles(HR),  AsyncHandler(deleteQuiz));
+router.post('/courses/:id/quiz/submit',  allowRoles(ALL), AsyncHandler(submitQuiz));
+
+// ── Learning path routes ──────────────────────────────────────────────────────
+
+router.get('/paths',            allowRoles(ALL),  AsyncHandler(listPaths));
+router.post('/paths',           allowRoles(HR),   AsyncHandler(createPath));
+router.put('/paths/:id',        allowRoles(HR),   AsyncHandler(updatePath));
+router.delete('/paths/:id',     allowRoles(HR),   AsyncHandler(deletePath));
+router.post('/paths/:id/enroll', allowRoles(ALL), AsyncHandler(enrollInPath));
 
 module.exports = router;
