@@ -5,7 +5,10 @@ const { ObjectId } = require('mongodb');
 const router = express.Router();
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne } = require('../../functions/Database/commonDBFunctions');
+const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
+
+const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const AsyncHandler = require('../../middleware/AsyncHandler');
@@ -13,11 +16,11 @@ const { serveCompanyLogo } = require('../config/companySettingsFunctions');
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-  filename: (req, file, cb) => cb(null, `cv-${Date.now()}-${file.originalname}`),
+  filename: (req, file, cb) => cb(null, `resume-${Date.now()}-${file.originalname}`),
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max for public CV uploads
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max for public resume uploads
   fileFilter: (req, file, cb) => {
     const allowed = ['application/pdf', 'application/msword',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
@@ -68,75 +71,124 @@ router.get('/company-info', async (req, res) => {
   }
 });
 
-// GET /api/public/positions — open positions (no auth)
-router.get('/positions', async (req, res) => {
+// GET /api/public/jobs — open requisitions for the careers site (no auth)
+router.get('/jobs', async (req, res) => {
   try {
-    const positions = await findMany('job_positions', { status: 'open' }, { sort: { createdAt: -1 } });
-    return returnFunction(res, 200, true, 'OK', positions);
+    const filter = { status: 'open' };
+    if (req.query.department) filter.department = req.query.department;
+    if (req.query.location) filter.location = req.query.location;
+    const jobs = await findMany('jobRequisitions', filter, { sort: { createdAt: -1 } });
+    return returnFunction(res, 200, true, 'OK', jobs);
   } catch (e) {
     return returnFunction(res, 500, false, 'Server error');
   }
 });
 
-// GET /api/public/positions/:id — single position detail (no auth)
-router.get('/positions/:id', async (req, res) => {
+// GET /api/public/jobs/:id — job detail (no auth)
+router.get('/jobs/:id', async (req, res) => {
   try {
-    const position = await findOne('job_positions', { _id: new ObjectId(req.params.id), status: 'open' });
-    if (!position) return returnFunction(res, 404, false, 'Position not found or closed');
-    return returnFunction(res, 200, true, 'OK', position);
+    const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open' });
+    if (!job) return returnFunction(res, 404, false, 'Job not found or closed');
+    return returnFunction(res, 200, true, 'OK', job);
   } catch (e) {
     return returnFunction(res, 500, false, 'Server error');
   }
 });
 
-// POST /api/public/apply — submit application (no auth, CV upload optional)
-router.post('/apply', upload.single('cv'), async (req, res) => {
+// Multipart form submissions send arrays/objects as JSON strings.
+const parseAnswers = (raw) => {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
+  }
+  return [];
+};
+
+// POST /api/public/jobs/:id/apply — submit application (no auth, resume upload optional)
+router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
   try {
-    if (!validateRequiredFields(req, res, ['fullName', 'email', 'positionId'])) return;
+    if (!validateRequiredFields(req, res, ['firstName', 'lastName', 'email'])) return;
 
-    const position = await findOne('job_positions', { _id: new ObjectId(req.body.positionId), status: 'open' });
-    if (!position) return returnFunction(res, 404, false, 'Position not found or closed');
+    const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open' });
+    if (!requisition) return returnFunction(res, 404, false, 'Job not found or closed');
+    if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'This job is not currently accepting applications.');
 
-    // Check for duplicate application
-    const existing = await findOne('applicants', {
-      email: req.body.email.toLowerCase().trim(),
-      positionId: new ObjectId(req.body.positionId),
-    });
-    if (existing) return returnFunction(res, 409, false, 'You have already applied for this position.');
+    const email = req.body.email.toLowerCase().trim();
+    let candidate = await findOne('candidates', { email });
+    if (!candidate) {
+      const candDoc = {
+        firstName: req.body.firstName.trim(),
+        lastName: req.body.lastName.trim(),
+        email,
+        phone: req.body.phone || null,
+        location: req.body.location || null,
+        resumeUrl: req.file ? req.file.path : null,
+        linkedInUrl: req.body.linkedInUrl || null,
+        source: 'careerSite',
+        referredBy: null,
+        tags: [],
+        isPassiveTalent: false,
+        consentGivenAt: new Date(),
+        consentVersion: req.body.consentVersion || '1.0',
+        notes: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const candResult = await insertOne('candidates', candDoc);
+      candidate = { _id: candResult.insertedId, ...candDoc };
+    } else if (req.file) {
+      await updateOne('candidates', { _id: candidate._id }, { $set: { resumeUrl: req.file.path, updatedAt: new Date() } });
+    }
 
-    const doc = {
-      positionId: new ObjectId(req.body.positionId),
-      positionTitle: position.jobTitle,
-      fullName: req.body.fullName.trim(),
-      email: req.body.email.toLowerCase().trim(),
-      phone: req.body.phone || null,
+    const priorApplicationCount = await countDocuments('applications', { candidateId: candidate._id, requisitionId: requisition._id });
+    if (priorApplicationCount >= MAX_APPLICATIONS_PER_REQUISITION) {
+      return returnFunction(res, 409, false, `You have already applied for this position the maximum number of times (${MAX_APPLICATIONS_PER_REQUISITION}).`);
+    }
+
+    const firstStage = requisition.pipelineStages[0];
+    const now = new Date();
+    const appDoc = {
+      candidateId: candidate._id,
+      requisitionId: requisition._id,
+      currentStageId: firstStage.id,
+      stageHistory: [{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: null }],
+      status: 'active',
+      rejectionReason: null,
+      offerDetails: null,
       coverLetter: req.body.coverLetter || null,
-      cvPath: req.file ? req.file.path : null,
-      cvFilename: req.file ? req.file.originalname : null,
-      stage: 'applied',
-      approvalStatus: 'pending',
-      approvedBy: null,
-      offerLetterSentAt: null,
-      source: 'public_portal',
-      appliedAt: new Date(),
-      createdAt: new Date(),
+      answers: parseAnswers(req.body.answers),
+      scorecards: [],
+      overallScore: null,
+      createdAt: now,
+      updatedAt: now,
     };
+    const result = await insertOne('applications', appDoc);
 
-    const result = await insertOne('applicants', doc);
+    const fullName = `${candidate.firstName} ${candidate.lastName}`;
 
-    // Notify HR managers
-    const hrManagers = await findMany('users', { role: 'hr_manager' }, { projection: { _id: 1 } });
+    if (candidate.email) {
+      const tokens = { candidateName: fullName, jobTitle: requisition.title, companyName: process.env.COMPANY_NAME || 'Bella ERP' };
+      sendTemplatedEmail({
+        trigger: 'applicationReceived',
+        to: candidate.email,
+        tokens,
+        fallbackSubject: `We received your application for ${tokens.jobTitle}`,
+        fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>Thank you for applying to ${tokens.jobTitle} at ${tokens.companyName}. Our team will review your application and be in touch soon.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+      }).catch(() => {});
+    }
+
+    const hrManagers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] } }, { projection: { _id: 1 } });
     if (hrManagers.length) {
       notifyHR({
         type: 'recruitment', subType: 'new_application',
         title: 'New Application Received',
-        subtitle: `${doc.fullName} applied for ${position.jobTitle} via the public portal.`,
-        referenceId: result.insertedId, referenceModel: 'applicants',
+        subtitle: `${fullName} applied for ${requisition.title} via the careers site.`,
+        referenceId: result.insertedId, referenceModel: 'applications',
         requiresAction: true, triggeredBy: null,
       }).catch(() => {});
       notifyByRoles(['super_admin', 'hr_manager'], {
         title: 'New Application Received',
-        body: `${doc.fullName} applied for ${position.jobTitle} via the public portal.`,
+        body: `${fullName} applied for ${requisition.title} via the careers site.`,
         type: 'recruitment',
       }).catch(() => {});
     }
@@ -147,14 +199,14 @@ router.post('/apply', upload.single('cv'), async (req, res) => {
   }
 });
 
-// GET /api/public/positions/:id/pdf — downloadable job flyer (no auth)
-router.get('/positions/:id/pdf', async (req, res) => {
+// GET /api/public/jobs/:id/pdf — downloadable job flyer (no auth)
+router.get('/jobs/:id/pdf', async (req, res) => {
   try {
-    const position = await findOne('job_positions', { _id: new ObjectId(req.params.id) });
-    if (!position) return returnFunction(res, 404, false, 'Position not found');
+    const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+    if (!job) return returnFunction(res, 404, false, 'Job not found');
 
     const settings = await findOne('company_settings', {});
-    const companyName = settings?.companyName || 'School ERP';
+    const companyName = settings?.companyName || 'Bella ERP';
     const primaryHex  = settings?.primaryColor || '#0A1931';
 
     // parse hex to r,g,b for pdfkit fill
@@ -170,7 +222,7 @@ router.get('/positions/:id/pdf', async (req, res) => {
 
     const doc = new PDFDocument({ margin: 50, size: 'A4' });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${position.jobTitle.replace(/\s+/g, '_')}_Job_Post.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${job.title.replace(/\s+/g, '_')}_Job_Post.pdf"`);
     doc.pipe(res);
 
     // Header bar
@@ -182,9 +234,9 @@ router.get('/positions/:id/pdf', async (req, res) => {
 
     // Title block
     doc.fontSize(18).font('Helvetica-Bold').fillColor([pr, pg, pb])
-       .text(position.jobTitle, { align: 'center' });
+       .text(job.title, { align: 'center' });
     doc.fontSize(12).font('Helvetica').fillColor('#555555')
-       .text(position.department, { align: 'center' });
+       .text(job.department, { align: 'center' });
     doc.moveDown();
 
     // Divider
@@ -202,34 +254,25 @@ router.get('/positions/:id/pdf', async (req, res) => {
     // Details
     section('Position Details');
     const details = [
-      ['Openings', position.numberOfOpenings],
-      ['Employment Type', position.employmentType || 'Full-time'],
-      ['Status', position.status],
+      ['Openings', job.headcount],
+      ['Location', job.location],
+      ['Employment Type', job.employmentType || 'fullTime'],
     ];
-    if (position.salaryBandMin) {
-      details.push(['Salary Band', `KES ${position.salaryBandMin.toLocaleString()} – ${(position.salaryBandMax || 0).toLocaleString()}`]);
-    }
-    if (position.yearsOfExperience) {
-      details.push(['Experience Required', `${position.yearsOfExperience} year(s)`]);
+    if (job.salaryRange?.min) {
+      details.push(['Salary Band', `${job.salaryRange.currency || 'KES'} ${job.salaryRange.min.toLocaleString()} – ${(job.salaryRange.max || 0).toLocaleString()}`]);
     }
     details.forEach(([k, v]) => doc.text(`${k}:  ${v}`));
     doc.moveDown();
 
-    if (position.jobDescription) {
+    if (job.description) {
       section('Job Description');
-      doc.text(position.jobDescription, { lineGap: 3 });
-      doc.moveDown();
-    }
-
-    if (Array.isArray(position.requiredQualifications) && position.requiredQualifications.length > 0) {
-      section('Required Qualifications');
-      position.requiredQualifications.forEach((q) => doc.text(`• ${q}`, { indent: 10 }));
+      doc.text(job.description, { lineGap: 3 });
       doc.moveDown();
     }
 
     // How to apply
     section('How to Apply');
-    const applyUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/apply?position=${position._id}`;
+    const applyUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/careers/${job._id}`;
     doc.text('Apply online at:');
     doc.fillColor([pr, pg, pb]).text(applyUrl, { underline: true });
     doc.fillColor('#333333').moveDown();

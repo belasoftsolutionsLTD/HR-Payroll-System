@@ -12,6 +12,9 @@ const {
   listPolicies, createPolicy, getPolicy, updatePolicy, deletePolicy, setDefaultPolicy,
   listHolidays, addHoliday, deleteHoliday, getLeaveAnalytics,
   runLeaveAccrual,
+  listBlackouts, addBlackout, deleteBlackout,
+  getLeaveConfig, updateLeaveConfig,
+  runYearEndCarryForward,
 } = require('./leaveFunctions');
 
 const ALL  = ['super_admin', 'hr_manager', 'department_head', 'staff'];
@@ -67,5 +70,17 @@ router.get('/analytics',                 allowRoles(MGMT), AsyncHandler(getLeave
 
 // Monthly accrual (HR-only, safe to call multiple times — idempotent per month)
 router.post('/accrual/run',              allowRoles(HR),   AsyncHandler(runLeaveAccrual));
+
+// Blackout periods
+router.get('/blackouts',                 allowRoles(ALL),  AsyncHandler(listBlackouts));
+router.post('/blackouts',                allowRoles(HR),   AsyncHandler(addBlackout));
+router.delete('/blackouts/:id',          allowRoles(HR),   AsyncHandler(deleteBlackout));
+
+// Leave config (min notice days per leave type, etc.)
+router.get('/config',                    allowRoles(ALL),  AsyncHandler(getLeaveConfig));
+router.patch('/config',                  allowRoles(HR),   AsyncHandler(updateLeaveConfig));
+
+// Year-end carry-forward
+router.post('/year-end/carry-forward',   allowRoles(HR),   AsyncHandler(runYearEndCarryForward));
 
 module.exports = router;
