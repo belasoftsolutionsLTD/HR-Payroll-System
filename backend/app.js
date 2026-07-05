@@ -99,7 +99,7 @@ app.use('/api/public', publicRoutes);
 
 // ── HR Module routes (all require auth) ──────────────────────────────────────
 app.use('/api/hr',          decodeToken, getUserData, hrRoutes);
-app.use('/api/hr',          decodeToken, getUserData, recruitmentRoutes);
+app.use('/api/recruitment', decodeToken, getUserData, recruitmentRoutes);
 app.use('/api/hr',          decodeToken, getUserData, onboardingRoutes);
 app.use('/api/employees',   decodeToken, getUserData, employeesRoutes);
 app.use('/api/leave',       decodeToken, getUserData, leaveRoutes);

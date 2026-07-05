@@ -106,15 +106,33 @@ async function initIndexes() {
     idx('payroll_cycles', { status: 1 }),
     idx('payroll_cycles', { month: 1, year: 1 }),
 
-    // ── recruitment_applications ─────────────────────────────────────────────
-    idx('recruitment_applications', { positionId: 1 }),
-    idx('recruitment_applications', { stage: 1 }),
-    idx('recruitment_applications', { email: 1 }),
-    idx('recruitment_applications', { positionId: 1, stage: 1 }),
+    // ── jobRequisitions ───────────────────────────────────────────────────────
+    idx('jobRequisitions', { status: 1 }),
+    idx('jobRequisitions', { department: 1 }),
+    idx('jobRequisitions', { hiringManagerId: 1 }),
 
-    // ── recruitment_positions ────────────────────────────────────────────────
-    idx('recruitment_positions', { status: 1 }),
-    idx('recruitment_positions', { department: 1 }),
+    // ── applications ─────────────────────────────────────────────────────────
+    idx('applications', { requisitionId: 1 }),
+    idx('applications', { candidateId: 1 }),
+    idx('applications', { requisitionId: 1, currentStageId: 1 }),
+    idx('applications', { status: 1 }),
+
+    // ── scorecards ───────────────────────────────────────────────────────────
+    idx('scorecards', { applicationId: 1 }),
+    idx('scorecards', { applicationId: 1, stageId: 1, interviewerId: 1 }, { unique: true }),
+
+    // ── candidates ───────────────────────────────────────────────────────────
+    idx('candidates', { email: 1 }, { unique: true }),
+    idx('candidates', { tags: 1 }),
+    idx('candidates', { isPassiveTalent: 1 }),
+    idx('candidates', { source: 1 }),
+
+    // ── nurtureCampaigns ─────────────────────────────────────────────────────
+    idx('nurtureCampaigns', { status: 1 }),
+    idx('nurtureCampaigns', { targetTags: 1 }),
+
+    // ── emailTemplates ───────────────────────────────────────────────────────
+    idx('emailTemplates', { trigger: 1 }),
 
     // ── expenses ─────────────────────────────────────────────────────────────
     idx('expenses', { submittedBy: 1 }),

@@ -71,6 +71,28 @@ const createLeaveRequest = async (req, res) => {
   });
   if (overlap) return returnFunction(res, 400, false, 'A leave request already exists for overlapping dates.');
 
+  // Check blackout periods
+  const blackout = await global.dbo.collection('leave_blackouts').findOne({
+    startDate: { $lte: req.body.endDate },
+    endDate:   { $gte: req.body.startDate },
+    $or: [{ leaveTypes: { $size: 0 } }, { leaveTypes: req.body.leaveType }],
+  });
+  if (blackout) {
+    return returnFunction(res, 400, false, `Leave cannot be requested during the "${blackout.name}" blackout period (${blackout.startDate} – ${blackout.endDate}).`);
+  }
+
+  // Check minimum notice period
+  const leaveConfig = await findOne('leave_config', { _id: 'global' });
+  const minNotice = leaveConfig?.minNoticeDays?.[req.body.leaveType] ?? 0;
+  if (minNotice > 0) {
+    const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
+    const startD = new Date(req.body.startDate);
+    const daysNotice = Math.ceil((startD - todayDate) / (1000 * 60 * 60 * 24));
+    if (daysNotice < minNotice) {
+      return returnFunction(res, 400, false, `${req.body.leaveType} leave requires at least ${minNotice} day${minNotice !== 1 ? 's' : ''} advance notice (${daysNotice} day${daysNotice !== 1 ? 's' : ''} given).`);
+    }
+  }
+
   const doc = {
     employeeId: new ObjectId(req.body.employeeId),
     leaveType: req.body.leaveType,
@@ -666,20 +688,151 @@ const runLeaveAccrual = async (req, res) => {
     processed++;
   }
 
-  return returnFunction(res, 200, true, `Accrual complete. Processed: ${processed}, Skipped: ${skipped}.`, {
-    accrualMonth: accrualKey, accrualAmount: ACCRUAL_AMOUNT, processed, skipped,
-  });
+  const result = { accrualMonth: accrualKey, accrualAmount: ACCRUAL_AMOUNT, processed, skipped };
+  if (!res) return result; // called from cron — no HTTP response
+  return returnFunction(res, 200, true, `Accrual complete. Processed: ${processed}, Skipped: ${skipped}.`, result);
+};
+
+// ── Blackout periods ──────────────────────────────────────────────────────────
+
+const listBlackouts = async (req, res) => {
+  const year = req.query.year || new Date().getFullYear();
+  const blackouts = await findMany('leave_blackouts', {
+    $or: [
+      { startDate: { $gte: `${year}-01-01`, $lte: `${year}-12-31` } },
+      { endDate:   { $gte: `${year}-01-01`, $lte: `${year}-12-31` } },
+    ],
+  }, { sort: { startDate: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, blackouts);
+};
+
+const addBlackout = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'startDate', 'endDate'])) return;
+  if (req.body.endDate < req.body.startDate) {
+    return returnFunction(res, 400, false, 'End date must be on or after start date.');
+  }
+  const doc = {
+    name:       req.body.name,
+    startDate:  req.body.startDate,
+    endDate:    req.body.endDate,
+    leaveTypes: req.body.leaveTypes || [],        // [] = all leave types blocked
+    reason:     req.body.reason || '',
+    createdBy:  new ObjectId(req.user._id),
+    createdAt:  new Date(),
+  };
+  const result = await insertOne('leave_blackouts', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const deleteBlackout = async (req, res) => {
+  await global.dbo.collection('leave_blackouts').deleteOne({ _id: new ObjectId(req.params.id) });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// ── Leave configuration (min notice days, etc.) ───────────────────────────────
+
+const getLeaveConfig = async (req, res) => {
+  const config = await findOne('leave_config', { _id: 'global' }) ?? { _id: 'global', minNoticeDays: {} };
+  return returnFunction(res, 200, true, req.locale.success, config);
+};
+
+const updateLeaveConfig = async (req, res) => {
+  const update = { ...req.body, updatedAt: new Date() };
+  delete update._id;
+  await global.dbo.collection('leave_config').updateOne(
+    { _id: 'global' },
+    { $set: update },
+    { upsert: true },
+  );
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+// ── Year-end carry-forward ────────────────────────────────────────────────────
+// Reads carryover settings from the default policy and carries remaining
+// annual/other leave days into the next year's balance. Idempotent.
+
+const runYearEndCarryForward = async (req, res) => {
+  const now      = new Date();
+  const fromYear = parseInt(req.body?.year) || now.getFullYear() - 1;
+  const toYear   = fromYear + 1;
+
+  // Resolve carryover settings from the default policy
+  const policy = await findOne('leave_policies', { isDefault: true });
+  const KNOWN_KEYS = {
+    'annual leave': 'annual', 'sick leave': 'sick', 'maternity leave': 'maternity',
+    'paternity leave': 'paternity', 'unpaid leave': 'unpaid',
+    'compassionate leave': 'compassionate', 'study leave': 'study', 'emergency leave': 'emergency',
+  };
+  const carrySettings = {};
+  for (const pt of policy?.leaveTypes ?? []) {
+    const key = KNOWN_KEYS[pt.name.toLowerCase()];
+    if (key) carrySettings[key] = { type: pt.carryoverType, max: pt.carryoverMax ?? 0 };
+  }
+  const getCarryAmount = (type, remaining) => {
+    const s = carrySettings[type];
+    if (!s || s.type === 'none' || !remaining) return 0;
+    if (s.type === 'unlimited') return Math.max(0, remaining);
+    if (s.type === 'limited')   return Math.min(Math.max(0, remaining), s.max);
+    return 0;
+  };
+
+  const defaultBalances = {
+    annual:        { allocated: 21,   used: 0, remaining: 21 },
+    sick:          { allocated: 30,   used: 0, remaining: 30 },
+    maternity:     { allocated: 90,   used: 0, remaining: 90 },
+    paternity:     { allocated: 14,   used: 0, remaining: 14 },
+    unpaid:        { allocated: null, used: 0, remaining: null },
+    compassionate: { allocated: 3,    used: 0, remaining: 3 },
+    study:         { allocated: 5,    used: 0, remaining: 5 },
+    emergency:     { allocated: 3,    used: 0, remaining: 3 },
+  };
+
+  const employees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
+  let processed = 0, carried = 0;
+
+  for (const emp of employees) {
+    const fromBalance = await findOne('leave_balances', { employeeId: emp._id, year: fromYear });
+    if (!fromBalance) continue;
+
+    // Ensure next-year balance exists
+    let toBalance = await findOne('leave_balances', { employeeId: emp._id, year: toYear });
+    if (!toBalance) {
+      await insertOne('leave_balances', { employeeId: emp._id, year: toYear, balances: defaultBalances });
+      toBalance = await findOne('leave_balances', { employeeId: emp._id, year: toYear });
+    }
+
+    // Apply carry-forward increments
+    const $inc = {};
+    for (const [type, b] of Object.entries(fromBalance.balances || {})) {
+      const carry = getCarryAmount(type, b.remaining);
+      if (carry > 0 && toBalance.balances?.[type]) {
+        $inc[`balances.${type}.allocated`] = carry;
+        $inc[`balances.${type}.remaining`] = carry;
+        carried += carry;
+      }
+    }
+    if (Object.keys($inc).length > 0) {
+      await updateOne('leave_balances', { employeeId: emp._id, year: toYear }, { $inc, $set: { updatedAt: new Date() } });
+    }
+    processed++;
+  }
+
+  const result = { fromYear, toYear, processed, totalDaysCarried: parseFloat(carried.toFixed(2)) };
+  if (!res) { console.log(`[CRON] Year-end carry-forward ${fromYear}→${toYear}: ${processed} employees, ${carried} days carried`); return result; }
+  return returnFunction(res, 200, true, `Carry-forward complete: ${processed} employee${processed !== 1 ? 's' : ''} processed, ${carried} day${carried !== 1 ? 's' : ''} carried to ${toYear}.`, result);
 };
 
 module.exports = {
-  // existing
   getLeaveBalances, listLeaveRequests, createLeaveRequest,
   approveLeaveRequest, rejectLeaveRequest, deleteLeaveRequest,
   revokeLeaveRequest, resolveDispute, getLeaveCalendar, getLeaveConflicts,
-  // new
   getMyBalances, getCalendarEntries, getTodayAbsences, getUpcomingLeaves,
   cancelLeaveRequest, getLeaveRequest, exportLeaveRequests, adjustLeaveBalance,
   listPolicies, createPolicy, getPolicy, updatePolicy, deletePolicy, setDefaultPolicy,
   listHolidays, addHoliday, deleteHoliday, getLeaveAnalytics,
   runLeaveAccrual,
+  // leave governance
+  listBlackouts, addBlackout, deleteBlackout,
+  getLeaveConfig, updateLeaveConfig,
+  runYearEndCarryForward,
 };

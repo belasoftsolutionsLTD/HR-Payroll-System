@@ -3,7 +3,10 @@ const path = require('path');
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, updateOne, insertOne } = require('../../functions/Database/commonDBFunctions');
+const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
+
+const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
@@ -497,6 +500,128 @@ const getMyTasks = async (req, res) => {
   return returnFunction(res, 200, true, 'OK', tasks);
 };
 
+// ── Internal job board ─────────────────────────────────────────────────────────
+// Backed by the recruitment module's jobRequisitions/candidates/applications collections
+// (see backend/src/routes/recruitment/recruitmentFunctions.js) rather than the legacy
+// job_positions/applicants collections.
+const getOpenPositions = async (req, res) => {
+  const positions = await findMany('jobRequisitions', { status: 'open' }, { sort: { createdAt: -1 } });
+  return returnFunction(res, 200, true, 'OK', positions);
+};
+
+const applyInternal = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  const employee = await findOne('employees', { _id: req.user.employeeId });
+  if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
+
+  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.positionId), status: 'open' });
+  if (!requisition) return returnFunction(res, 404, false, 'Position not found or no longer open.');
+  if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'This position is not currently accepting applications.');
+
+  const email = employee.email.toLowerCase().trim();
+  let candidate = await findOne('candidates', { email });
+  if (!candidate) {
+    const [firstName, ...rest] = (employee.fullName || '').split(' ');
+    const candDoc = {
+      firstName: firstName || employee.fullName || 'Employee',
+      lastName: rest.join(' '),
+      email,
+      phone: employee.phone || null,
+      location: null,
+      resumeUrl: null,
+      linkedInUrl: null,
+      source: 'inbound',
+      referredBy: null,
+      tags: ['internal'],
+      isPassiveTalent: false,
+      consentGivenAt: new Date(),
+      consentVersion: '1.0',
+      notes: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const candResult = await insertOne('candidates', candDoc);
+    candidate = { _id: candResult.insertedId, ...candDoc };
+  }
+
+  const priorApplicationCount = await countDocuments('applications', { candidateId: candidate._id, requisitionId: requisition._id });
+  if (priorApplicationCount >= MAX_APPLICATIONS_PER_REQUISITION) {
+    return returnFunction(res, 409, false, `You have already applied for this position the maximum number of times (${MAX_APPLICATIONS_PER_REQUISITION}).`);
+  }
+
+  const firstStage = requisition.pipelineStages[0];
+  const now = new Date();
+  await insertOne('applications', {
+    candidateId: candidate._id,
+    requisitionId: requisition._id,
+    currentStageId: firstStage.id,
+    stageHistory: [{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) }],
+    status: 'active',
+    rejectionReason: null,
+    offerDetails: null,
+    coverLetter: null,
+    answers: [],
+    scorecards: [],
+    overallScore: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  if (candidate.email) {
+    const tokens = { candidateName: `${candidate.firstName} ${candidate.lastName}`, jobTitle: requisition.title, companyName: process.env.COMPANY_NAME || 'Bella ERP' };
+    sendTemplatedEmail({
+      trigger: 'applicationReceived',
+      to: candidate.email,
+      tokens,
+      fallbackSubject: `We received your application for ${tokens.jobTitle}`,
+      fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>Thank you for applying to ${tokens.jobTitle}. Our team will review your application and be in touch soon.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+    }).catch(() => {});
+  }
+
+  return returnFunction(res, 201, true, 'Application submitted successfully.');
+};
+
+const getMyApplications = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  const employee = await findOne('employees', { _id: req.user.employeeId });
+  if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
+
+  const candidate = await findOne('candidates', { email: employee.email.toLowerCase().trim() });
+  if (!candidate) return returnFunction(res, 200, true, 'OK', []);
+
+  const applications = await findMany('applications', { candidateId: candidate._id }, { sort: { createdAt: -1 } });
+  const requisitionIds = [...new Set(applications.map((a) => String(a.requisitionId)))].map((id) => new ObjectId(id));
+  const requisitions = requisitionIds.length
+    ? await findMany('jobRequisitions', { _id: { $in: requisitionIds } }, { projection: { title: 1, department: 1, pipelineStages: 1 } })
+    : [];
+  const reqMap = Object.fromEntries(requisitions.map((r) => [String(r._id), r]));
+
+  const enriched = applications.map((a) => {
+    const requisition = reqMap[String(a.requisitionId)];
+    const stage = requisition?.pipelineStages?.find((s) => s.id === a.currentStageId);
+    return {
+      ...a,
+      positionId: a.requisitionId,
+      positionTitle: requisition?.title || 'Unknown Position',
+      stageName: stage?.name || null,
+    };
+  });
+
+  return returnFunction(res, 200, true, 'OK', enriched);
+};
+
+const getMyNotes = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  const notes = await global.dbo.collection('staff_notes').aggregate([
+    { $match: { employeeId: req.user.employeeId } },
+    { $sort: { createdAt: -1 } },
+    { $lookup: { from: 'users', localField: 'createdBy', foreignField: '_id', as: '_creator' } },
+    { $addFields: { createdByName: { $arrayElemAt: ['$_creator.name', 0] } } },
+    { $project: { _creator: 0 } },
+  ]).toArray();
+  return returnFunction(res, 200, true, 'OK', notes);
+};
+
 module.exports = {
   getMyProfile, updateMyProfile, uploadMyProfilePhoto, serveMyProfilePhoto,
   getMyLeaveBalance, getMyLeaveRequests, applyForLeave, disputeLeaveRequest, downloadLeavePdf,
@@ -509,4 +634,6 @@ module.exports = {
   getMyOffboardingTasks, completeMyOffboardingTask,
   getMyTasks,
   getMyProjects,
+  getMyNotes,
+  getOpenPositions, applyInternal, getMyApplications,
 };

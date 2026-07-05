@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const { ObjectId } = require('mongodb');
 const { triggerTasksFromTemplate } = require('./triggerTasksFromTemplate');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { runLeaveAccrual, runYearEndCarryForward } = require('../../routes/leave/leaveFunctions');
 
 async function dailyTaskJobs() {
   if (!global.dbo) return;
@@ -332,6 +333,46 @@ async function autoCompleteTraining() {
   }
 }
 
+async function checkOverdueMandatoryTraining() {
+  if (!global.dbo) return;
+
+  const todayStr = new Date().toISOString().split('T')[0];
+
+  const mandatoryCourses = await global.dbo.collection('training_courses')
+    .find({ isMandatory: true, status: 'published' }, { projection: { _id: 1, title: 1 } })
+    .toArray();
+
+  if (!mandatoryCourses.length) return;
+
+  const mandatoryIds = mandatoryCourses.map(c => c._id);
+  const titleMap = Object.fromEntries(mandatoryCourses.map(c => [String(c._id), c.title]));
+
+  const overdue = await global.dbo.collection('training_enrollments').find({
+    courseId: { $in: mandatoryIds },
+    dueDate: { $lt: todayStr, $ne: null },
+    status: { $nin: ['completed', 'auto_completed'] },
+    overdueNotified: { $ne: todayStr },
+  }).toArray();
+
+  for (const enr of overdue) {
+    notifyEmployee(enr.userId, {
+      title: 'Mandatory training overdue',
+      body: `"${titleMap[String(enr.courseId)] || 'A mandatory course'}" was due ${enr.dueDate} — please complete it now.`,
+      type: 'training_overdue',
+      link: '/training',
+    }).catch(() => {});
+
+    await global.dbo.collection('training_enrollments').updateOne(
+      { _id: enr._id },
+      { $set: { overdueNotified: todayStr } }
+    );
+  }
+
+  if (overdue.length > 0) {
+    console.log(`[CRON] Notified ${overdue.length} employee(s) of overdue mandatory training`);
+  }
+}
+
 function startCronJobs() {
   // Daily at midnight (UTC) — task overdue, onboarding triggers, reminders
   cron.schedule('0 0 * * *', async () => {
@@ -367,6 +408,26 @@ function startCronJobs() {
   cron.schedule('*/15 * * * *', async () => {
     try { await autoCompleteTraining(); }
     catch (err) { console.error('[CRON] Training auto-complete error:', err); }
+  });
+
+  // 1st of each month at 01:00 UTC — monthly leave accrual (idempotent per month)
+  cron.schedule('0 1 1 * *', async () => {
+    try {
+      const r = await runLeaveAccrual({ body: {}, query: {} }, null);
+      console.log(`[CRON] Leave accrual ${r.accrualMonth}: ${r.processed} processed, ${r.skipped} skipped`);
+    } catch (err) { console.error('[CRON] Leave accrual error:', err); }
+  });
+
+  // Jan 1 at 02:00 UTC — year-end carry-forward for the previous year
+  cron.schedule('0 2 1 1 *', async () => {
+    try { await runYearEndCarryForward({ body: {}, query: {} }, null); }
+    catch (err) { console.error('[CRON] Year-end carry-forward error:', err); }
+  });
+
+  // Daily at 08:00 UTC — notify employees with overdue mandatory training
+  cron.schedule('0 8 * * *', async () => {
+    try { await checkOverdueMandatoryTraining(); }
+    catch (err) { console.error('[CRON] Mandatory training overdue check error:', err); }
   });
 
   console.log('[CRON] All cron jobs scheduled');

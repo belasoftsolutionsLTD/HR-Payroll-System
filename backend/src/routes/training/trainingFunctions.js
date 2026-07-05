@@ -408,6 +408,10 @@ const updateProgress = async (req, res) => {
         return returnFunction(res, 400, false, 'Complete all objectives before marking this course as done.');
       }
     }
+    const courseQuiz = await findOne('training_quizzes', { courseId: enrollment.courseId });
+    if (courseQuiz && !enrollment.quizPassed) {
+      return returnFunction(res, 400, false, 'Pass the assessment quiz before marking this course as complete.');
+    }
     const completedAt = new Date();
     updates.status      = 'completed';
     updates.completedAt = completedAt;
@@ -546,9 +550,224 @@ const downloadCertificate = async (req, res) => {
   return res.send(buf);
 };
 
+// ── Quizzes ───────────────────────────────────────────────────────────────────
+
+const createQuiz = async (req, res) => {
+  const { id } = req.params; // courseId
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+
+  const { title, questions, passingScore = 70 } = req.body;
+  if (!title || !Array.isArray(questions) || questions.length === 0) {
+    return returnFunction(res, 400, false, 'title and questions are required');
+  }
+  for (const q of questions) {
+    if (!q.text || !Array.isArray(q.options) || q.options.length < 2 || typeof q.correctIndex !== 'number') {
+      return returnFunction(res, 400, false, 'Each question needs text, at least 2 options, and a correctIndex');
+    }
+  }
+
+  await global.dbo.collection('training_quizzes').updateOne(
+    { courseId: new ObjectId(id) },
+    {
+      $set: { courseId: new ObjectId(id), title, questions, passingScore: Number(passingScore), updatedBy: req.user._id, updatedAt: new Date() },
+      $setOnInsert: { createdBy: req.user._id, createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+  return returnFunction(res, 200, true, 'Quiz saved');
+};
+
+const getQuiz = async (req, res) => {
+  const { id } = req.params; // courseId
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+
+  const quiz = await findOne('training_quizzes', { courseId: new ObjectId(id) });
+  if (!quiz) return returnFunction(res, 404, false, 'No quiz for this course');
+
+  // Strip answers for non-HR roles
+  const isHR = ['super_admin', 'hr_manager'].includes(req.user.role);
+  if (!isHR) {
+    quiz.questions = quiz.questions.map(({ correctIndex, explanation, ...rest }) => ({ ...rest, explanation: explanation || null }));
+  }
+  return returnFunction(res, 200, true, 'Quiz fetched', quiz);
+};
+
+const deleteQuiz = async (req, res) => {
+  const { id } = req.params; // courseId
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+  await global.dbo.collection('training_quizzes').deleteOne({ courseId: new ObjectId(id) });
+  return returnFunction(res, 200, true, 'Quiz deleted');
+};
+
+const submitQuiz = async (req, res) => {
+  const { id } = req.params; // courseId
+  const { answers } = req.body;
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+  if (!Array.isArray(answers)) return returnFunction(res, 400, false, 'answers array required');
+
+  const quiz = await findOne('training_quizzes', { courseId: new ObjectId(id) });
+  if (!quiz) return returnFunction(res, 404, false, 'No quiz for this course');
+
+  const enrollment = await findOne('training_enrollments', { courseId: new ObjectId(id), userId: req.user._id });
+  if (!enrollment) return returnFunction(res, 404, false, 'Not enrolled in this course');
+
+  let correct = 0;
+  const results = quiz.questions.map((q, i) => {
+    const chosen = answers[i] ?? -1;
+    const isCorrect = chosen === q.correctIndex;
+    if (isCorrect) correct++;
+    return { chosen, correct: isCorrect, correctIndex: q.correctIndex, explanation: q.explanation || null };
+  });
+
+  const score = quiz.questions.length > 0 ? Math.round((correct / quiz.questions.length) * 100) : 0;
+  const passed = score >= (quiz.passingScore ?? 70);
+
+  await global.dbo.collection('training_enrollments').updateOne(
+    { _id: enrollment._id },
+    {
+      $push: { quizAttempts: { score, passed, answers, results, attemptedAt: new Date() } },
+      $set: { quizPassed: passed || (enrollment.quizPassed === true), updatedAt: new Date() },
+    }
+  );
+
+  return returnFunction(res, 200, true, passed ? 'Quiz passed!' : 'Not quite — try again', {
+    score, passed, correct, total: quiz.questions.length, passingScore: quiz.passingScore ?? 70, results,
+  });
+};
+
+// ── Learning Paths ────────────────────────────────────────────────────────────
+
+const listPaths = async (req, res) => {
+  const paths = await findMany('learning_paths', {}, { sort: { createdAt: -1 } });
+  const userId = req.user._id;
+
+  const annotated = await Promise.all(paths.map(async p => {
+    const entries = (p.courseIds || []).sort((a, b) => a.order - b.order);
+    const courseIds = entries.map(c => new ObjectId(String(c.courseId)));
+
+    if (!courseIds.length) {
+      return { ...p, courses: [], myProgress: { enrolled: 0, completed: 0, total: 0, pct: 0 } };
+    }
+
+    const courses = await findMany('training_courses', { _id: { $in: courseIds } }, {
+      projection: { _id: 1, title: 1, category: 1, duration: 1, isMandatory: 1 },
+    });
+    const courseMap = Object.fromEntries(courses.map(c => [String(c._id), c]));
+
+    const annotatedCourses = entries.map(entry => ({
+      courseId: String(entry.courseId),
+      order: entry.order,
+      ...courseMap[String(entry.courseId)] || {},
+    }));
+
+    const myEnrollments = await findMany('training_enrollments', { userId, courseId: { $in: courseIds } });
+    const completedCount = myEnrollments.filter(e => e.status === 'completed' || e.status === 'auto_completed').length;
+
+    return {
+      ...p,
+      courses: annotatedCourses,
+      myProgress: {
+        enrolled: myEnrollments.length,
+        completed: completedCount,
+        total: courseIds.length,
+        pct: courseIds.length > 0 ? Math.round((completedCount / courseIds.length) * 100) : 0,
+      },
+    };
+  }));
+
+  return returnFunction(res, 200, true, 'Paths fetched', annotated);
+};
+
+const createPath = async (req, res) => {
+  const { name, description = '', courseIds = [] } = req.body;
+  if (!name) return returnFunction(res, 400, false, 'name is required');
+
+  const doc = {
+    name, description,
+    courseIds: courseIds.map((c, i) => ({
+      courseId: new ObjectId(String(c.courseId || c)),
+      order: c.order ?? i,
+    })),
+    createdBy: req.user._id,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  const result = await insertOne('learning_paths', doc);
+  return returnFunction(res, 201, true, 'Learning path created', { _id: result.insertedId, ...doc });
+};
+
+const updatePath = async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+
+  const updates = { updatedAt: new Date() };
+  if (req.body.name        !== undefined) updates.name = req.body.name;
+  if (req.body.description !== undefined) updates.description = req.body.description;
+  if (req.body.courseIds   !== undefined) {
+    updates.courseIds = req.body.courseIds.map((c, i) => ({
+      courseId: new ObjectId(String(c.courseId || c)),
+      order: c.order ?? i,
+    }));
+  }
+
+  await updateOne('learning_paths', { _id: new ObjectId(id) }, { $set: updates });
+  return returnFunction(res, 200, true, 'Path updated');
+};
+
+const deletePath = async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+  await global.dbo.collection('learning_paths').deleteOne({ _id: new ObjectId(id) });
+  return returnFunction(res, 200, true, 'Path deleted');
+};
+
+const enrollInPath = async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+
+  const pathDoc = await findOne('learning_paths', { _id: new ObjectId(id) });
+  if (!pathDoc) return returnFunction(res, 404, false, 'Path not found');
+
+  const userId = req.user._id;
+  const sorted = [...(pathDoc.courseIds || [])].sort((a, b) => a.order - b.order);
+  let enrolled = 0, alreadyIn = 0;
+
+  for (const entry of sorted) {
+    const courseId = new ObjectId(String(entry.courseId));
+    const course = await findOne('training_courses', { _id: courseId });
+    if (!course) continue;
+
+    const existing = await findOne('training_enrollments', { courseId, userId });
+    if (existing) { alreadyIn++; continue; }
+
+    await insertOne('training_enrollments', {
+      courseId, userId,
+      employeeId:  req.user.employeeId || null,
+      courseTitle: course.title,
+      category:    course.category,
+      trainingType: course.trainingType || 'self_paced',
+      objectives:  course.objectives || [],
+      completedObjectives: [],
+      status:      'not_started',
+      progress:    0,
+      startedAt:   null, completedAt: null, minutesPresent: null,
+      dueDate:     null, certificateUrl: null, materialProgress: {},
+      pathId:      new ObjectId(id),
+      enrolledAt:  new Date(), updatedAt: new Date(),
+    });
+    await updateOne('training_courses', { _id: courseId }, { $inc: { enrolledCount: 1 } });
+    enrolled++;
+  }
+
+  return returnFunction(res, 200, true, `Enrolled in ${enrolled} course(s). ${alreadyIn} already enrolled.`, { enrolled, alreadyIn });
+};
+
 module.exports = {
   listCourses, getCourse, createCourse, updateCourse, deleteCourse,
   enrollInCourse, assignCourseToEmployees, getMyTraining, updateProgress, getTeamTraining,
   startCourse, toggleObjective, downloadCertificate,
   addMaterial, removeMaterial, saveMaterialProgress,
+  createQuiz, getQuiz, deleteQuiz, submitQuiz,
+  listPaths, createPath, updatePath, deletePath, enrollInPath,
 };

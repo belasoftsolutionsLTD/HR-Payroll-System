@@ -17,6 +17,8 @@ const {
   getMyOffboardingTasks, completeMyOffboardingTask,
   getMyTasks,
   getMyProjects,
+  getMyNotes,
+  getOpenPositions, applyInternal, getMyApplications,
 } = require('./meFunctions');
 const { getMyAnnouncements, markAnnouncementRead } = require('../announcements/announcementFunctions');
 
@@ -73,8 +75,16 @@ router.get('/tasks', auth, AsyncHandler(getMyTasks));
 // Projects I'm a member of
 router.get('/projects', auth, AsyncHandler(getMyProjects));
 
+// My HR notes (staff can read their own notes)
+router.get('/notes', auth, AsyncHandler(getMyNotes));
+
 // Offboarding (self-view for staff)
 router.get('/offboarding',                          auth, AsyncHandler(getMyOffboardingTasks));
 router.patch('/offboarding/tasks/:taskId/complete', auth, AsyncHandler(completeMyOffboardingTask));
+
+// Internal job board
+router.get('/jobs',                           auth, AsyncHandler(getOpenPositions));
+router.get('/jobs/applications',              auth, AsyncHandler(getMyApplications));
+router.post('/jobs/:positionId/apply',        auth, AsyncHandler(applyInternal));
 
 module.exports = router;
