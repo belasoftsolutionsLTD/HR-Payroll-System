@@ -10,6 +10,7 @@ const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
+const { getEmployeePayslipRecords } = require('../payroll/payrollPayslipsFunctions');
 
 // ── Profile ────────────────────────────────────────────────────────────────────
 const getMyProfile = async (req, res) => {
@@ -129,10 +130,13 @@ const disputeLeaveRequest = async (req, res) => {
 };
 
 // ── Payslips ───────────────────────────────────────────────────────────────────
+// Delegates to the single shared implementation in payrollPayslipsFunctions.js —
+// this route intentionally returns a flat array (unpaginated) to match the Staff
+// Portal's existing consumption of it; /api/payroll/payslips returns the paginated form.
 const getMyPayslips = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const records = await findMany('payroll_summaries', { employeeId: req.user.employeeId }, { sort: { year: -1, month: -1 } });
-  return returnFunction(res, 200, true, 'OK', records);
+  const { data } = await getEmployeePayslipRecords(req.user.employeeId, {});
+  return returnFunction(res, 200, true, 'OK', data);
 };
 
 // ── Attendance ─────────────────────────────────────────────────────────────────

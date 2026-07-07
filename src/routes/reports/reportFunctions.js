@@ -19,7 +19,7 @@ const getOverviewReport = async (req, res) => {
     monthAttendance, allAppraisals,
     openPositions, totalApplicants,
     pendingLeave, onboardingTasks,
-    monthPayroll,
+    monthCycles,
   ] = await Promise.all([
     global.dbo.collection('employees').countDocuments({}),
     global.dbo.collection('employees').countDocuments({ status: { $in: ['active', 'on_leave'] } }),
@@ -29,8 +29,13 @@ const getOverviewReport = async (req, res) => {
     global.dbo.collection('applicants').countDocuments({}),
     global.dbo.collection('leave_requests').countDocuments({ status: 'pending' }),
     global.dbo.collection('onboarding_tasks').find({}).toArray(),
-    global.dbo.collection('payroll_summaries').find({ month, year }).toArray(),
+    // Multiple cycles can share a month now (weekly/biweekly frequencies, off-cycle runs)
+    global.dbo.collection('payroll_cycles').find({ 'period.month': month, 'period.year': year }).toArray(),
   ]);
+  const cycleIds = monthCycles.map((c) => c._id);
+  const monthPayroll = cycleIds.length
+    ? await global.dbo.collection('payroll_results').find({ cycleId: { $in: cycleIds } }).toArray()
+    : [];
 
   const presentCount   = monthAttendance.filter(r => ['present','remote','late'].includes(r.status)).length;
   const attendanceRate = monthAttendance.length > 0 ? Math.round((presentCount / monthAttendance.length) * 100) : 0;
@@ -105,9 +110,11 @@ const getPayrollReport = async (req, res) => {
   const month = parseInt(req.query.month) || (now.getMonth() + 1);
   const year  = parseInt(req.query.year)  || now.getFullYear();
 
-  const summaries = await global.dbo.collection('payroll_summaries').find({ month, year }).toArray();
+  const cycles  = await global.dbo.collection('payroll_cycles').find({ 'period.month': month, 'period.year': year }).toArray();
+  const cycleIds = cycles.map((c) => c._id);
+  const results = cycleIds.length ? await global.dbo.collection('payroll_results').find({ cycleId: { $in: cycleIds } }).toArray() : [];
 
-  const employees = await Promise.all(summaries.map(async (s) => {
+  const employees = await Promise.all(results.map(async (s) => {
     const emp = await findOne('employees', { _id: s.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
     return {
       employeeName: emp?.fullName || 'Unknown',
@@ -115,11 +122,11 @@ const getPayrollReport = async (req, res) => {
       department:   emp?.department  || '—',
       grossPay:     s.grossPay  || 0,
       netPay:       s.netPay    || 0,
-      paye:         s.deductions?.paye      || 0,
-      sha:          s.deductions?.sha       || 0,
-      nssf:         s.deductions?.nssf      || 0,
-      paymentStatus: s.paymentStatus || 'pending',
-      paidAt:       s.paidAt || null,
+      paye:         s.statutoryDeductions?.paye || 0,
+      sha:          s.statutoryDeductions?.sha  || 0,
+      nssf:         s.statutoryDeductions?.nssf || 0,
+      paymentStatus: s.status === 'paid' ? 'paid' : 'pending',
+      paidAt:       s.status === 'paid' ? s.updatedAt : null,
     };
   }));
 
