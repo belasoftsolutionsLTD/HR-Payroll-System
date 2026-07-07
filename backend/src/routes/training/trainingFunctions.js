@@ -1,773 +1,1028 @@
 const { ObjectId } = require('mongodb');
-const PDFDocument = require('pdfkit');
-const fs   = require('fs');
-const path = require('path');
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { notifyUser } = require('../../functions/HR/notifyUser');
+const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
+const {
+  findOne, findMany, insertOne, updateOne, deleteOne, countDocuments, aggregate,
+} = require('../../functions/Database/commonDBFunctions');
+const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR } = require('../inbox/inboxFunctions');
+const { generateCertificatePDF } = require('../../lib/training/generateCertificate');
+const {
+  recomputeProgress, createSingleCourseEnrollment, createLearningPathEnrollment, maybeAdvanceLearningPath,
+} = require('../../lib/training/enrollmentHelpers');
+const { runRule } = require('../../lib/training/autoEnrollment');
 
-// ── Certificate ───────────────────────────────────────────────────────────────
+const COURSE_CATEGORIES = ['Compliance', 'Onboarding', 'Leadership', 'Technical', 'Soft Skills'];
+const COURSE_STATUSES = ['draft', 'published', 'archived'];
+const MODULE_TYPES = ['video', 'document', 'text', 'quiz', 'scorm', 'link'];
+const ENROLLMENT_STATUSES = ['notStarted', 'inProgress', 'completed', 'overdue', 'waived'];
 
-const generateCertificate = (employeeName, courseTitle, completedAt, companyName = 'The Organisation') => {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 60 });
-    const buffers = [];
-    doc.on('data', b => buffers.push(b));
-    doc.on('end', () => resolve(Buffer.concat(buffers)));
-    doc.on('error', reject);
-
-    const W = doc.page.width, H = doc.page.height;
-    doc.rect(20, 20, W - 40, H - 40).lineWidth(3).strokeColor('#0A1931').stroke();
-    doc.rect(28, 28, W - 56, H - 56).lineWidth(1).strokeColor('#C9A84C').stroke();
-
-    doc.moveDown(2);
-    doc.fontSize(36).font('Helvetica-Bold').fillColor('#0A1931')
-       .text('CERTIFICATE OF COMPLETION', { align: 'center' });
-    doc.moveDown(0.5);
-    doc.fontSize(13).font('Helvetica').fillColor('#555')
-       .text('This is to certify that', { align: 'center' });
-    doc.moveDown(0.5);
-    doc.fontSize(28).font('Helvetica-Bold').fillColor('#C9A84C')
-       .text(employeeName, { align: 'center' });
-    doc.moveDown(0.5);
-    doc.fontSize(13).font('Helvetica').fillColor('#333')
-       .text('has successfully completed the course', { align: 'center' });
-    doc.moveDown(0.5);
-    doc.fontSize(20).font('Helvetica-Bold').fillColor('#0A1931')
-       .text(courseTitle, { align: 'center' });
-    doc.moveDown(1);
-    const dateStr = new Date(completedAt).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' });
-    doc.fontSize(12).font('Helvetica').fillColor('#555')
-       .text(`Completed on ${dateStr}`, { align: 'center' });
-    doc.moveDown(2);
-    doc.moveTo(W / 2 - 100, doc.y).lineTo(W / 2 + 100, doc.y).strokeColor('#0A1931').lineWidth(1).stroke();
-    doc.moveDown(0.3);
-    doc.fontSize(11).fillColor('#333').text(companyName, { align: 'center' });
-    doc.end();
-  });
-};
-
-// ── Courses ───────────────────────────────────────────────────────────────────
-
-const listCourses = async (req, res) => {
-  const { search, category, level, status = 'published' } = req.query;
-
-  const query = {};
-  if (req.user.role === 'staff') query.status = 'published';
-  else if (status !== 'all') query.status = status;
-
-  if (category) query.category = category;
-  if (level)    query.level = level;
-  if (search)   query.title = { $regex: search, $options: 'i' };
-
-  const courses = await findMany('training_courses', query, { sort: { createdAt: -1 } });
-
-  const courseIds = courses.map(c => c._id);
-  const myEnrollments = courseIds.length
-    ? await findMany('training_enrollments', { userId: req.user._id, courseId: { $in: courseIds } }, {
-        projection: { courseId: 1, status: 1, progress: 1, completedObjectives: 1, objectives: 1, trainingType: 1 },
-      })
-    : [];
-  const enrollmentMap = Object.fromEntries(myEnrollments.map(e => [String(e.courseId), e]));
-
-  const annotated = courses.map(c => ({
-    ...c,
-    myEnrollment: enrollmentMap[String(c._id)] || null,
-  }));
-
-  return returnFunction(res, 200, true, 'Courses fetched', annotated);
-};
+// ── Courses (HR admin) ────────────────────────────────────────────────────────
 
 const createCourse = async (req, res) => {
-  const {
-    title, description, category = 'Other', level = 'beginner',
-    duration = 0, instructor = '', isMandatory = false, loginUrl = '',
-    trainingType = 'self_paced', objectives = [],
-    startTime = null, endTime = null, trainingMode = 'in_person',
-    link = null,
-    location = null,
-    isRecurring = false,
-    recurringFrequency = null,
-  } = req.body;
-
-  if (!title) return returnFunction(res, 400, false, 'Title is required');
-
-  // Normalise location object
-  const locationData = location && typeof location === 'object'
-    ? { address: (location.address || '').trim(), venue: (location.venue || '').trim() }
-    : null;
-
-  // Rename legacy one_time → recurring_event
-  const normalizedType = trainingType === 'one_time' ? 'recurring_event' : trainingType;
+  if (!validateRequiredFields(req, res, ['title', 'description', 'category', 'estimatedDurationMinutes', 'difficultyLevel'])) return;
+  if (!COURSE_CATEGORIES.includes(req.body.category)) return returnFunction(res, 400, false, `category must be one of: ${COURSE_CATEGORIES.join(', ')}`);
 
   const doc = {
-    title, description, category, level, duration,
-    instructor, isMandatory, loginUrl,
-    trainingType: normalizedType,
-    objectives: Array.isArray(objectives) ? objectives.filter(Boolean) : [],
-    startTime: startTime || null,
-    endTime:   endTime   || null,
-    trainingMode,
-    link: link || null,
-    location: locationData,
-    isRecurring: Boolean(isRecurring),
-    recurringFrequency: isRecurring ? (recurringFrequency || null) : null,
-    materials: [],
-    status: 'published',
-    rating: 0,
-    enrolledCount: 0,
-    thumbnail: null,
-    createdBy: req.user._id,
+    title: req.body.title.trim(),
+    description: req.body.description,
+    coverImageUrl: req.body.coverImageUrl || null,
+    category: req.body.category,
+    tags: Array.isArray(req.body.tags) ? req.body.tags : [],
+    skillsTaught: Array.isArray(req.body.skillsTaught) ? req.body.skillsTaught : [],
+    estimatedDurationMinutes: Number(req.body.estimatedDurationMinutes),
+    difficultyLevel: req.body.difficultyLevel,
+    status: 'draft',
+    isMandatory: !!req.body.isMandatory,
+    targetRoles: Array.isArray(req.body.targetRoles) ? req.body.targetRoles : [],
+    targetDepartments: Array.isArray(req.body.targetDepartments) ? req.body.targetDepartments : [],
+    hasCertificate: !!req.body.hasCertificate,
+    certificateValidityDays: req.body.certificateValidityDays ? Number(req.body.certificateValidityDays) : null,
+    createdBy: new ObjectId(req.user._id),
+    authors: [new ObjectId(req.user._id)],
+    publishedAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
+  const result = await insertOne('courses', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
 
-  const result = await insertOne('training_courses', doc);
-  return returnFunction(res, 201, true, 'Course created', { _id: result.insertedId, ...doc });
+const listCourses = async (req, res) => {
+  const filter = {};
+  if (req.query.category) filter.category = req.query.category;
+  if (req.query.status) filter.status = req.query.status;
+  if (req.query.isMandatory !== undefined) filter.isMandatory = req.query.isMandatory === 'true';
+  if (req.query.author) filter.authors = new ObjectId(req.query.author);
+
+  const { page, limit, skip } = getPagination(req.query);
+  const [total, data] = await Promise.all([
+    countDocuments('courses', filter),
+    findMany('courses', filter, { skip, limit, sort: { createdAt: -1 } }),
+  ]);
+
+  const ids = data.map((c) => c._id);
+  const [enrollCounts, completedCounts] = ids.length ? await Promise.all([
+    aggregate('enrollments', [{ $match: { courseId: { $in: ids } } }, { $group: { _id: '$courseId', count: { $sum: 1 } } }]),
+    aggregate('enrollments', [{ $match: { courseId: { $in: ids }, status: 'completed' } }, { $group: { _id: '$courseId', count: { $sum: 1 } } }]),
+  ]) : [[], []];
+  const enrollMap = Object.fromEntries(enrollCounts.map((c) => [String(c._id), c.count]));
+  const completeMap = Object.fromEntries(completedCounts.map((c) => [String(c._id), c.count]));
+
+  const enriched = data.map((c) => {
+    const enrolledCount = enrollMap[String(c._id)] || 0;
+    const completedCount = completeMap[String(c._id)] || 0;
+    return { ...c, enrolledCount, completionRate: enrolledCount > 0 ? Math.round((completedCount / enrolledCount) * 100) : 0 };
+  });
+
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
 const getCourse = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  const course = await findOne('training_courses', { _id: new ObjectId(id) });
-  if (!course) return returnFunction(res, 404, false, 'Course not found');
-  return returnFunction(res, 200, true, 'OK', course);
+  const course = await findOne('courses', { _id: new ObjectId(req.params.id) });
+  if (!course) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const modules = await findMany('courseModules', { courseId: course._id }, { sort: { order: 1 } });
+  const enrolledCount = await countDocuments('enrollments', { courseId: course._id });
+  return returnFunction(res, 200, true, req.locale.success, { ...course, modules, enrolledCount });
 };
 
 const updateCourse = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+  const allowed = [
+    'title', 'description', 'coverImageUrl', 'category', 'tags', 'skillsTaught',
+    'estimatedDurationMinutes', 'difficultyLevel', 'isMandatory', 'targetRoles',
+    'targetDepartments', 'hasCertificate', 'certificateValidityDays',
+  ];
+  const update = { updatedAt: new Date() };
+  allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
 
-  const { title, description, category, level, duration, instructor, isMandatory, status } = req.body;
-  const updates = {};
-  if (title       !== undefined) updates.title = title;
-  if (description !== undefined) updates.description = description;
-  if (category    !== undefined) updates.category = category;
-  if (level       !== undefined) updates.level = level;
-  if (duration    !== undefined) updates.duration = duration;
-  if (instructor  !== undefined) updates.instructor = instructor;
-  if (isMandatory !== undefined) updates.isMandatory = isMandatory;
-  if (status      !== undefined) updates.status = status;
-  if (req.body.trainingType !== undefined) {
-    const t = req.body.trainingType;
-    updates.trainingType = t === 'one_time' ? 'recurring_event' : t;
-  }
-  if (req.body.startTime    !== undefined) updates.startTime = req.body.startTime || null;
-  if (req.body.endTime      !== undefined) updates.endTime   = req.body.endTime   || null;
-  if (req.body.trainingMode !== undefined) updates.trainingMode = req.body.trainingMode || 'in_person';
-  if (req.body.link         !== undefined) updates.link = req.body.link || null;
-  if (req.body.location !== undefined) {
-    const loc = req.body.location;
-    updates.location = loc && typeof loc === 'object'
-      ? { address: (loc.address || '').trim(), venue: (loc.venue || '').trim() }
-      : null;
-  }
-  if (req.body.isRecurring        !== undefined) updates.isRecurring = Boolean(req.body.isRecurring);
-  if (req.body.recurringFrequency !== undefined) updates.recurringFrequency = req.body.recurringFrequency || null;
-  if (req.body.objectives !== undefined) {
-    updates.objectives = Array.isArray(req.body.objectives) ? req.body.objectives.filter(Boolean) : [];
-  }
-  updates.updatedAt = new Date();
-
-  await updateOne('training_courses', { _id: new ObjectId(id) }, { $set: updates });
-  return returnFunction(res, 200, true, 'Course updated');
+  const result = await updateOne('courses', { _id: new ObjectId(req.params.id) }, { $set: update });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
-const deleteCourse = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  await global.dbo.collection('training_courses').deleteOne({ _id: new ObjectId(id) });
-  return returnFunction(res, 200, true, 'Course deleted');
-};
+const publishCourse = async (req, res) => {
+  const course = await findOne('courses', { _id: new ObjectId(req.params.id) });
+  if (!course) return returnFunction(res, 404, false, req.locale.notFound);
 
-// ── Materials ─────────────────────────────────────────────────────────────────
+  const moduleCount = await countDocuments('courseModules', { courseId: course._id });
+  if (!moduleCount) return returnFunction(res, 400, false, 'Add at least one module before publishing.');
 
-const addMaterial = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+  await updateOne('courses', { _id: course._id }, { $set: { status: 'published', publishedAt: new Date(), updatedAt: new Date() } });
 
-  const course = await findOne('training_courses', { _id: new ObjectId(id) });
-  if (!course) return returnFunction(res, 404, false, 'Course not found');
-  if (!req.file) return returnFunction(res, 400, false, 'No file uploaded');
-
-  const { wordCount, title: materialTitle } = req.body;
-  const isVideo = req.file.mimetype.startsWith('video/');
-  const isPDF   = req.file.mimetype === 'application/pdf';
-
-  const parsedWordCount = wordCount ? Number(wordCount) : null;
-  // 200 words per minute → convert to seconds
-  const minReadTimeSeconds = parsedWordCount ? Math.ceil((parsedWordCount / 200) * 60) : null;
-
-  const material = {
-    _id: new ObjectId(),
-    title:        materialTitle || req.file.originalname,
-    type:         isVideo ? 'video' : isPDF ? 'pdf' : 'other',
-    filename:     req.file.filename,
-    originalName: req.file.originalname,
-    mimetype:     req.file.mimetype,
-    size:         req.file.size,
-    wordCount:    parsedWordCount,
-    minReadTimeSeconds,
-    uploadedAt:   new Date(),
-  };
-
-  await global.dbo.collection('training_courses').updateOne(
-    { _id: new ObjectId(id) },
-    { $push: { materials: material }, $set: { updatedAt: new Date() } }
-  );
-
-  return returnFunction(res, 201, true, 'Material uploaded', material);
-};
-
-const removeMaterial = async (req, res) => {
-  const { id, materialId } = req.params;
-  if (!ObjectId.isValid(id) || !ObjectId.isValid(materialId)) {
-    return returnFunction(res, 400, false, 'Invalid ID');
-  }
-
-  await global.dbo.collection('training_courses').updateOne(
-    { _id: new ObjectId(id) },
-    { $pull: { materials: { _id: new ObjectId(materialId) } }, $set: { updatedAt: new Date() } }
-  );
-
-  return returnFunction(res, 200, true, 'Material removed');
-};
-
-const saveMaterialProgress = async (req, res) => {
-  const { id } = req.params; // enrollmentId
-  const { materialId, videoPositionSeconds, timeSpentSeconds, completed } = req.body;
-
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  if (!materialId) return returnFunction(res, 400, false, 'materialId required');
-
-  const enrollment = await findOne('training_enrollments', { _id: new ObjectId(id), userId: req.user._id });
-  if (!enrollment) return returnFunction(res, 404, false, 'Enrollment not found');
-
-  const existing = enrollment.materialProgress?.[materialId] || {};
-  const updates = { updatedAt: new Date() };
-
-  if (videoPositionSeconds !== undefined) {
-    updates[`materialProgress.${materialId}.videoPositionSeconds`] = Number(videoPositionSeconds);
-  }
-  if (timeSpentSeconds !== undefined) {
-    // Only advance, never go backwards (guards against duplicate saves)
-    const prev = existing.timeSpentSeconds || 0;
-    updates[`materialProgress.${materialId}.timeSpentSeconds`] = Math.max(prev, Number(timeSpentSeconds));
-  }
-  if (completed !== undefined) {
-    updates[`materialProgress.${materialId}.completed`] = Boolean(completed);
-  }
-
-  await updateOne('training_enrollments', { _id: new ObjectId(id) }, { $set: updates });
-
-  const updated = await findOne('training_enrollments', { _id: new ObjectId(id) });
-  return returnFunction(res, 200, true, 'Progress saved', {
-    materialProgress: updated?.materialProgress || {},
-  });
-};
-
-// ── Enrollments ───────────────────────────────────────────────────────────────
-
-const enrollInCourse = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-
-  const course = await findOne('training_courses', { _id: new ObjectId(id) });
-  if (!course) return returnFunction(res, 404, false, 'Course not found');
-
-  const userId = req.user._id;
-  const existing = await findOne('training_enrollments', { courseId: new ObjectId(id), userId });
-  if (existing) return returnFunction(res, 400, false, 'Already enrolled');
-
-  const enrollment = {
-    courseId:    new ObjectId(id),
-    userId,
-    employeeId:  req.user.employeeId || null,
-    courseTitle: course.title,
-    category:    course.category,
-    trainingType: course.trainingType || 'self_paced',
-    objectives:  course.objectives || [],
-    completedObjectives: [],
-    status:      'not_started',
-    progress:    0,
-    startedAt:   null,
-    completedAt: null,
-    minutesPresent: null,
-    dueDate:     null,
-    certificateUrl: null,
-    materialProgress: {},
-    enrolledAt:  new Date(),
-    updatedAt:   new Date(),
-  };
-
-  await insertOne('training_enrollments', enrollment);
-  await updateOne('training_courses', { _id: new ObjectId(id) }, { $inc: { enrolledCount: 1 } });
-
-  return returnFunction(res, 201, true, 'Enrolled successfully');
-};
-
-const startCourse = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-
-  const course = await findOne('training_courses', { _id: new ObjectId(id) });
-  if (!course) return returnFunction(res, 404, false, 'Course not found');
-
-  // Enforce start time only when stored as full ISO datetime (contains 'T')
-  if (course.startTime && String(course.startTime).includes('T')) {
-    const startDate = new Date(course.startTime);
-    if (!isNaN(startDate.getTime()) && new Date() < startDate) {
-      const label = startDate.toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' });
-      return returnFunction(res, 403, false, `Training hasn't started yet — it begins at ${label}.`);
-    }
-  }
-
-  const enrollment = await findOne('training_enrollments', { courseId: new ObjectId(id), userId: req.user._id });
-  if (!enrollment) return returnFunction(res, 404, false, 'Not enrolled in this course');
-  if (enrollment.status !== 'not_started') return returnFunction(res, 400, false, 'Course already started');
-
-  await updateOne('training_enrollments', { _id: enrollment._id }, {
-    $set: { status: 'in_progress', startedAt: new Date(), updatedAt: new Date() },
-  });
-  return returnFunction(res, 200, true, 'Course started');
-};
-
-const toggleObjective = async (req, res) => {
-  const { id } = req.params;
-  const { index } = req.body;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-
-  const enrollment = await findOne('training_enrollments', { _id: new ObjectId(id), userId: req.user._id });
-  if (!enrollment) return returnFunction(res, 404, false, 'Enrollment not found');
-  if (enrollment.status !== 'in_progress') return returnFunction(res, 400, false, 'Course not started');
-
-  const idx = Number(index);
-  const total = (enrollment.objectives || []).length;
-  if (!Number.isInteger(idx) || idx < 0 || (total > 0 && idx >= total)) {
-    return returnFunction(res, 400, false, 'Invalid objective index');
-  }
-
-  const alreadyDone = (enrollment.completedObjectives || []).includes(idx);
-
-  await global.dbo.collection('training_enrollments').updateOne(
-    { _id: new ObjectId(id) },
-    alreadyDone
-      ? { $pull: { completedObjectives: idx }, $set: { updatedAt: new Date() } }
-      : { $addToSet: { completedObjectives: idx }, $set: { updatedAt: new Date() } }
-  );
-
-  const updated = await findOne('training_enrollments', { _id: new ObjectId(id) });
-  const newCompleted = updated?.completedObjectives ?? [];
-  const progress = total > 0 ? Math.min(100, Math.round((newCompleted.length / total) * 100)) : 0;
-
-  await updateOne('training_enrollments', { _id: new ObjectId(id) }, {
-    $set: { progress, updatedAt: new Date() },
-  });
-
-  return returnFunction(res, 200, true, 'Objective updated', { completedObjectives: newCompleted, progress });
-};
-
-const getMyTraining = async (req, res) => {
-  const userId = req.user._id;
-
-  const enrollments = await findMany('training_enrollments', { userId }, { sort: { enrolledAt: -1 } });
-
-  const summary = {
-    assigned:   enrollments.filter(e => e.status === 'not_started').length,
-    inProgress: enrollments.filter(e => e.status === 'in_progress').length,
-    completed:  enrollments.filter(e => e.status === 'completed' || e.status === 'auto_completed').length,
-    overdue:    enrollments.filter(e =>
-      e.dueDate && new Date(e.dueDate) < new Date() &&
-      e.status !== 'completed' && e.status !== 'auto_completed'
-    ).length,
-  };
-
-  return returnFunction(res, 200, true, 'Training fetched', { enrollments, summary });
-};
-
-const updateProgress = async (req, res) => {
-  const { id } = req.params;
-  const { progress } = req.body;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-
-  const enrollment = await findOne('training_enrollments', { _id: new ObjectId(id), userId: req.user._id });
-  if (!enrollment) return returnFunction(res, 404, false, 'Enrollment not found');
-
-  const pct = Math.min(100, Math.max(0, Number(progress) || 0));
-  const updates = { progress: pct, updatedAt: new Date() };
-
-  if (pct > 0 && enrollment.status === 'not_started') {
-    updates.status    = 'in_progress';
-    updates.startedAt = new Date();
-  }
-  if (pct >= 100) {
-    if (enrollment.trainingType === 'self_paced') {
-      const totalObj = (enrollment.objectives || []).length;
-      const doneObj  = (enrollment.completedObjectives || []).length;
-      if (totalObj > 0 && doneObj < totalObj) {
-        return returnFunction(res, 400, false, 'Complete all objectives before marking this course as done.');
-      }
-    }
-    const courseQuiz = await findOne('training_quizzes', { courseId: enrollment.courseId });
-    if (courseQuiz && !enrollment.quizPassed) {
-      return returnFunction(res, 400, false, 'Pass the assessment quiz before marking this course as complete.');
-    }
-    const completedAt = new Date();
-    updates.status      = 'completed';
-    updates.completedAt = completedAt;
-    if (enrollment.startedAt) {
-      updates.minutesPresent = Math.max(1, Math.round((completedAt - new Date(enrollment.startedAt)) / 60000));
-    }
-  }
-
-  await updateOne('training_enrollments', { _id: new ObjectId(id) }, { $set: updates });
-
-  if (updates.status === 'completed') {
-    try {
-      const settings = await findOne('company_settings', {});
-      const user = await findOne('users', { _id: enrollment.userId });
-      const emp  = user?.employeeId ? await findOne('employees', { _id: user.employeeId }, { projection: { fullName: 1 } }) : null;
-      const name = emp?.fullName || user?.name || 'Participant';
-      const pdfBuf = await generateCertificate(name, enrollment.courseTitle, updates.completedAt, settings?.companyName);
-      const certBase64 = pdfBuf.toString('base64');
-      await updateOne('training_enrollments', { _id: new ObjectId(id) }, {
-        $set: { certificateData: certBase64, updatedAt: new Date() },
-      });
-    } catch (certErr) {
-      console.error('Certificate generation failed:', certErr.message);
-    }
-  }
-
-  return returnFunction(res, 200, true, 'Progress updated', { certificateGenerated: updates.status === 'completed' });
-};
-
-const getTeamTraining = async (req, res) => {
-  let employeeQuery = {};
-  if (req.user.role === 'department_head' && req.user.department) {
-    employeeQuery.department = req.user.department;
-  }
-
-  const employees = await findMany('employees', employeeQuery, { projection: { _id: 1, fullName: 1 } });
-  const employeeIds = employees.map(e => e._id);
-
-  const enrollments = await global.dbo.collection('training_enrollments')
-    .aggregate([
-      { $match: { userId: { $in: employeeIds.map(id => new ObjectId(String(id))) } } },
-      { $group: {
-        _id: '$userId',
-        completed:  { $sum: { $cond: [{ $in: ['$status', ['completed', 'auto_completed']] }, 1, 0] } },
-        inProgress: { $sum: { $cond: [{ $eq: ['$status', 'in_progress'] }, 1, 0] } },
-        total: { $sum: 1 },
-      }},
-    ]).toArray();
-
-  return returnFunction(res, 200, true, 'Team training fetched', enrollments);
-};
-
-// ── HR: assign course to employees ────────────────────────────────────────────
-
-const assignCourseToEmployees = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid course ID');
-
-  const { employeeIds, dueDate } = req.body;
-  if (!Array.isArray(employeeIds) || employeeIds.length === 0)
-    return returnFunction(res, 400, false, 'employeeIds must be a non-empty array');
-
-  const course = await findOne('training_courses', { _id: new ObjectId(id) });
-  if (!course) return returnFunction(res, 404, false, 'Course not found');
-
-  const employees = await global.dbo.collection('users')
-    .find({ employeeId: { $in: employeeIds.map(eid => new ObjectId(String(eid))) } })
-    .toArray();
-
-  let enrolled = 0;
-  let skipped  = 0;
-
-  for (const user of employees) {
-    const existing = await findOne('training_enrollments', { courseId: new ObjectId(id), userId: user._id });
-    if (existing) { skipped++; continue; }
-
-    await insertOne('training_enrollments', {
-      courseId:    new ObjectId(id),
-      userId:      user._id,
-      employeeId:  user.employeeId || null,
-      courseTitle: course.title,
-      category:    course.category,
-      trainingType: course.trainingType || 'self_paced',
-      objectives:  course.objectives || [],
-      completedObjectives: [],
-      status:      'not_started',
-      progress:    0,
-      startedAt:   null,
-      completedAt: null,
-      minutesPresent: null,
-      dueDate:     dueDate || null,
-      certificateUrl: null,
-      materialProgress: {},
-      enrolledAt:  new Date(),
-      updatedAt:   new Date(),
-    });
-    notifyUser(user._id, {
-      title: 'You have been enrolled in a training course',
-      body: `You've been assigned to "${course.title}"${dueDate ? ` — due ${dueDate}` : ''}.`,
+  if (course.isMandatory) {
+    notifyByRoles(['super_admin', 'hr_manager'], {
+      title: 'Mandatory Course Published',
+      body: `"${course.title}" is now published and marked mandatory — assign it to the relevant audience.`,
       type: 'training',
     }).catch(() => {});
-    enrolled++;
   }
 
-  if (enrolled > 0) {
-    await updateOne('training_courses', { _id: new ObjectId(id) }, { $inc: { enrolledCount: enrolled } });
-  }
-
-  return returnFunction(res, 200, true, `Assigned to ${enrolled} employee(s). ${skipped} already enrolled.`, { enrolled, skipped });
+  return returnFunction(res, 200, true, 'Course published.');
 };
 
-const downloadCertificate = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  const enrollment = await findOne('training_enrollments', { _id: new ObjectId(id), userId: req.user._id });
-  if (!enrollment) return returnFunction(res, 404, false, 'Enrollment not found');
-  if (!['completed', 'auto_completed'].includes(enrollment.status)) {
-    return returnFunction(res, 400, false, 'Course not yet completed');
-  }
-
-  let certBase64 = enrollment.certificateData;
-  if (!certBase64) {
-    const settings = await findOne('company_settings', {});
-    const emp = req.user.employeeId
-      ? await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } })
-      : null;
-    const name = emp?.fullName || req.user.name || 'Participant';
-    const pdfBuf = await generateCertificate(name, enrollment.courseTitle, enrollment.completedAt, settings?.companyName);
-    certBase64 = pdfBuf.toString('base64');
-    await updateOne('training_enrollments', { _id: new ObjectId(id) }, { $set: { certificateData: certBase64 } });
-  }
-
-  const buf = Buffer.from(certBase64, 'base64');
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="certificate-${id}.pdf"`);
-  return res.send(buf);
+const archiveCourse = async (req, res) => {
+  const result = await updateOne('courses', { _id: new ObjectId(req.params.id) }, { $set: { status: 'archived', updatedAt: new Date() } });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
-// ── Quizzes ───────────────────────────────────────────────────────────────────
-
-const createQuiz = async (req, res) => {
-  const { id } = req.params; // courseId
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-
-  const { title, questions, passingScore = 70 } = req.body;
-  if (!title || !Array.isArray(questions) || questions.length === 0) {
-    return returnFunction(res, 400, false, 'title and questions are required');
-  }
-  for (const q of questions) {
-    if (!q.text || !Array.isArray(q.options) || q.options.length < 2 || typeof q.correctIndex !== 'number') {
-      return returnFunction(res, 400, false, 'Each question needs text, at least 2 options, and a correctIndex');
-    }
-  }
-
-  await global.dbo.collection('training_quizzes').updateOne(
-    { courseId: new ObjectId(id) },
-    {
-      $set: { courseId: new ObjectId(id), title, questions, passingScore: Number(passingScore), updatedBy: req.user._id, updatedAt: new Date() },
-      $setOnInsert: { createdBy: req.user._id, createdAt: new Date() },
-    },
-    { upsert: true }
-  );
-  return returnFunction(res, 200, true, 'Quiz saved');
-};
-
-const getQuiz = async (req, res) => {
-  const { id } = req.params; // courseId
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-
-  const quiz = await findOne('training_quizzes', { courseId: new ObjectId(id) });
-  if (!quiz) return returnFunction(res, 404, false, 'No quiz for this course');
-
-  // Strip answers for non-HR roles
-  const isHR = ['super_admin', 'hr_manager'].includes(req.user.role);
-  if (!isHR) {
-    quiz.questions = quiz.questions.map(({ correctIndex, explanation, ...rest }) => ({ ...rest, explanation: explanation || null }));
-  }
-  return returnFunction(res, 200, true, 'Quiz fetched', quiz);
-};
-
-const deleteQuiz = async (req, res) => {
-  const { id } = req.params; // courseId
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  await global.dbo.collection('training_quizzes').deleteOne({ courseId: new ObjectId(id) });
-  return returnFunction(res, 200, true, 'Quiz deleted');
-};
-
-const submitQuiz = async (req, res) => {
-  const { id } = req.params; // courseId
-  const { answers } = req.body;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  if (!Array.isArray(answers)) return returnFunction(res, 400, false, 'answers array required');
-
-  const quiz = await findOne('training_quizzes', { courseId: new ObjectId(id) });
-  if (!quiz) return returnFunction(res, 404, false, 'No quiz for this course');
-
-  const enrollment = await findOne('training_enrollments', { courseId: new ObjectId(id), userId: req.user._id });
-  if (!enrollment) return returnFunction(res, 404, false, 'Not enrolled in this course');
-
-  let correct = 0;
-  const results = quiz.questions.map((q, i) => {
-    const chosen = answers[i] ?? -1;
-    const isCorrect = chosen === q.correctIndex;
-    if (isCorrect) correct++;
-    return { chosen, correct: isCorrect, correctIndex: q.correctIndex, explanation: q.explanation || null };
+const addCourseAuthor = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['authorId'])) return;
+  const result = await updateOne('courses', { _id: new ObjectId(req.params.id) }, {
+    $addToSet: { authors: new ObjectId(req.body.authorId) },
+    $set: { updatedAt: new Date() },
   });
-
-  const score = quiz.questions.length > 0 ? Math.round((correct / quiz.questions.length) * 100) : 0;
-  const passed = score >= (quiz.passingScore ?? 70);
-
-  await global.dbo.collection('training_enrollments').updateOne(
-    { _id: enrollment._id },
-    {
-      $push: { quizAttempts: { score, passed, answers, results, attemptedAt: new Date() } },
-      $set: { quizPassed: passed || (enrollment.quizPassed === true), updatedAt: new Date() },
-    }
-  );
-
-  return returnFunction(res, 200, true, passed ? 'Quiz passed!' : 'Not quite — try again', {
-    score, passed, correct, total: quiz.questions.length, passingScore: quiz.passingScore ?? 70, results,
-  });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, 'Co-author added.');
 };
 
-// ── Learning Paths ────────────────────────────────────────────────────────────
+// ── Catalog (employee — published courses only) ──────────────────────────────
 
-const listPaths = async (req, res) => {
-  const paths = await findMany('learning_paths', {}, { sort: { createdAt: -1 } });
-  const userId = req.user._id;
+const listCatalog = async (req, res) => {
+  const filter = { status: 'published' };
+  if (req.query.category) filter.category = req.query.category;
+  if (req.query.difficultyLevel) filter.difficultyLevel = req.query.difficultyLevel;
+  if (req.query.skill) filter.skillsTaught = req.query.skill;
 
-  const annotated = await Promise.all(paths.map(async p => {
-    const entries = (p.courseIds || []).sort((a, b) => a.order - b.order);
-    const courseIds = entries.map(c => new ObjectId(String(c.courseId)));
+  const courses = await findMany('courses', filter, { sort: { publishedAt: -1 } });
 
-    if (!courseIds.length) {
-      return { ...p, courses: [], myProgress: { enrolled: 0, completed: 0, total: 0, pct: 0 } };
-    }
+  const ids = courses.map((c) => c._id);
+  const [ratingAgg, myEnrollments] = await Promise.all([
+    ids.length ? aggregate('trainingFeedback', [
+      { $match: { courseId: { $in: ids } } },
+      { $group: { _id: '$courseId', avgRating: { $avg: '$rating' } } },
+    ]) : [],
+    findMany('enrollments', { employeeId: new ObjectId(req.user._id), courseId: { $in: ids } }, { projection: { courseId: 1, status: 1, progressPercentage: 1 } }),
+  ]);
+  const ratingMap = Object.fromEntries(ratingAgg.map((r) => [String(r._id), Math.round(r.avgRating * 10) / 10]));
+  const enrollMap = Object.fromEntries(myEnrollments.map((e) => [String(e.courseId), e]));
 
-    const courses = await findMany('training_courses', { _id: { $in: courseIds } }, {
-      projection: { _id: 1, title: 1, category: 1, duration: 1, isMandatory: 1 },
-    });
-    const courseMap = Object.fromEntries(courses.map(c => [String(c._id), c]));
-
-    const annotatedCourses = entries.map(entry => ({
-      courseId: String(entry.courseId),
-      order: entry.order,
-      ...courseMap[String(entry.courseId)] || {},
-    }));
-
-    const myEnrollments = await findMany('training_enrollments', { userId, courseId: { $in: courseIds } });
-    const completedCount = myEnrollments.filter(e => e.status === 'completed' || e.status === 'auto_completed').length;
-
-    return {
-      ...p,
-      courses: annotatedCourses,
-      myProgress: {
-        enrolled: myEnrollments.length,
-        completed: completedCount,
-        total: courseIds.length,
-        pct: courseIds.length > 0 ? Math.round((completedCount / courseIds.length) * 100) : 0,
-      },
-    };
+  const enriched = courses.map((c) => ({
+    ...c,
+    avgRating: ratingMap[String(c._id)] || null,
+    myEnrollment: enrollMap[String(c._id)] || null,
   }));
 
-  return returnFunction(res, 200, true, 'Paths fetched', annotated);
+  return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-const createPath = async (req, res) => {
-  const { name, description = '', courseIds = [] } = req.body;
-  if (!name) return returnFunction(res, 400, false, 'name is required');
+const getCatalogCourse = async (req, res) => {
+  const course = await findOne('courses', { _id: new ObjectId(req.params.id), status: 'published' });
+  if (!course) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const modules = await findMany('courseModules', { courseId: course._id }, { sort: { order: 1 } });
+  const myEnrollment = await findOne('enrollments', { employeeId: new ObjectId(req.user._id), courseId: course._id });
+
+  return returnFunction(res, 200, true, req.locale.success, { ...course, modules, myEnrollment: myEnrollment || null });
+};
+
+// Learner-facing quiz fetch — correctAnswer/explanation are always stripped, and access is
+// gated on the requester actually being enrolled in the parent course (not just it being published).
+const getModuleQuizForLearner = async (req, res) => {
+  const moduleId = new ObjectId(req.params.moduleId);
+  const module_ = await findOne('courseModules', { _id: moduleId });
+  if (!module_ || module_.type !== 'quiz') return returnFunction(res, 404, false, 'Quiz module not found.');
+
+  const enrollment = await findOne('enrollments', { employeeId: new ObjectId(req.user._id), courseId: module_.courseId });
+  if (!enrollment) return returnFunction(res, 403, false, req.locale.noPermission || 'Permission denied.');
+
+  const quiz = await findOne('quizzes', { moduleId });
+  if (!quiz) return returnFunction(res, 404, false, 'Quiz not configured for this module.');
+
+  const sanitized = {
+    ...quiz,
+    questions: quiz.questions.map(({ correctAnswer, explanation, ...q }) => q),
+  };
+  return returnFunction(res, 200, true, req.locale.success, sanitized);
+};
+
+// ── Modules (HR admin) ────────────────────────────────────────────────────────
+
+const addModule = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['title', 'type'])) return;
+  if (!MODULE_TYPES.includes(req.body.type)) return returnFunction(res, 400, false, `type must be one of: ${MODULE_TYPES.join(', ')}`);
+
+  const courseId = new ObjectId(req.params.id);
+  const course = await findOne('courses', { _id: courseId });
+  if (!course) return returnFunction(res, 404, false, 'Course not found.');
+
+  let order = req.body.order;
+  if (order === undefined) {
+    const last = await findMany('courseModules', { courseId }, { sort: { order: -1 }, limit: 1 });
+    order = last.length ? last[0].order + 1 : 0;
+  }
 
   const doc = {
-    name, description,
-    courseIds: courseIds.map((c, i) => ({
-      courseId: new ObjectId(String(c.courseId || c)),
-      order: c.order ?? i,
-    })),
-    createdBy: req.user._id,
+    courseId,
+    title: req.body.title.trim(),
+    order: Number(order),
+    type: req.body.type,
+    content: typeof req.body.content === 'object' && req.body.content ? req.body.content : {},
+    isRequired: req.body.isRequired !== false,
+    minimumPassScore: req.body.minimumPassScore !== undefined ? Number(req.body.minimumPassScore) : undefined,
     createdAt: new Date(),
-    updatedAt: new Date(),
   };
-
-  const result = await insertOne('learning_paths', doc);
-  return returnFunction(res, 201, true, 'Learning path created', { _id: result.insertedId, ...doc });
+  const result = await insertOne('courseModules', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
-const updatePath = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+const updateModule = async (req, res) => {
+  const allowed = ['title', 'order', 'type', 'content', 'isRequired', 'minimumPassScore'];
+  const update = {};
+  allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
 
-  const updates = { updatedAt: new Date() };
-  if (req.body.name        !== undefined) updates.name = req.body.name;
-  if (req.body.description !== undefined) updates.description = req.body.description;
-  if (req.body.courseIds   !== undefined) {
-    updates.courseIds = req.body.courseIds.map((c, i) => ({
-      courseId: new ObjectId(String(c.courseId || c)),
-      order: c.order ?? i,
+  const result = await updateOne('courseModules', { _id: new ObjectId(req.params.id) }, { $set: update });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteModule = async (req, res) => {
+  const moduleId = new ObjectId(req.params.id);
+  const result = await deleteOne('courseModules', { _id: moduleId });
+  if (!result.deletedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  await deleteOne('quizzes', { moduleId });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// ── Quizzes (HR admin) ────────────────────────────────────────────────────────
+
+const createQuiz = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['questions', 'passingScore'])) return;
+  if (!Array.isArray(req.body.questions) || !req.body.questions.length) {
+    return returnFunction(res, 400, false, 'Add at least one question.');
+  }
+
+  const moduleId = new ObjectId(req.params.id);
+  const module_ = await findOne('courseModules', { _id: moduleId });
+  if (!module_) return returnFunction(res, 404, false, 'Module not found.');
+
+  const existing = await findOne('quizzes', { moduleId });
+  if (existing) return returnFunction(res, 409, false, 'This module already has a quiz. Use PATCH to edit it.');
+
+  const doc = {
+    moduleId,
+    courseId: module_.courseId,
+    questions: req.body.questions,
+    passingScore: Number(req.body.passingScore),
+    maxAttempts: req.body.maxAttempts ? Number(req.body.maxAttempts) : 3,
+    shuffleQuestions: !!req.body.shuffleQuestions,
+    shuffleOptions: !!req.body.shuffleOptions,
+    timeLimitMinutes: req.body.timeLimitMinutes ? Number(req.body.timeLimitMinutes) : undefined,
+  };
+  const result = await insertOne('quizzes', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const updateQuiz = async (req, res) => {
+  const allowed = ['questions', 'passingScore', 'maxAttempts', 'shuffleQuestions', 'shuffleOptions', 'timeLimitMinutes'];
+  const update = {};
+  allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
+
+  const result = await updateOne('quizzes', { _id: new ObjectId(req.params.id) }, { $set: update });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+// ── Learning Paths (HR admin) ─────────────────────────────────────────────────
+
+const createLearningPath = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'description', 'courses', 'enrollmentTrigger'])) return;
+  if (!Array.isArray(req.body.courses) || !req.body.courses.length) {
+    return returnFunction(res, 400, false, 'Add at least one course.');
+  }
+
+  const doc = {
+    name: req.body.name.trim(),
+    description: req.body.description,
+    courses: req.body.courses.map((c) => ({
+      courseId: new ObjectId(c.courseId),
+      order: Number(c.order) || 0,
+      isRequired: c.isRequired !== false,
+      unlockAfterCourseId: c.unlockAfterCourseId ? new ObjectId(c.unlockAfterCourseId) : null,
+    })),
+    targetRoles: Array.isArray(req.body.targetRoles) ? req.body.targetRoles : [],
+    targetDepartments: Array.isArray(req.body.targetDepartments) ? req.body.targetDepartments : [],
+    enrollmentTrigger: req.body.enrollmentTrigger,
+    dueDateOffsetDays: req.body.dueDateOffsetDays ? Number(req.body.dueDateOffsetDays) : null,
+    status: 'active',
+    createdBy: new ObjectId(req.user._id),
+    createdAt: new Date(),
+  };
+  const result = await insertOne('learningPaths', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const listLearningPaths = async (req, res) => {
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+  const paths = await findMany('learningPaths', filter, { sort: { createdAt: -1 } });
+
+  const ids = paths.map((p) => p._id);
+  const counts = ids.length ? await aggregate('enrollments', [
+    { $match: { learningPathId: { $in: ids } } },
+    { $group: { _id: '$learningPathId', count: { $sum: 1 } } },
+  ]) : [];
+  const countMap = Object.fromEntries(counts.map((c) => [String(c._id), c.count]));
+
+  return returnFunction(res, 200, true, req.locale.success, paths.map((p) => ({ ...p, enrolledCount: countMap[String(p._id)] || 0 })));
+};
+
+const getLearningPath = async (req, res) => {
+  const path_ = await findOne('learningPaths', { _id: new ObjectId(req.params.id) });
+  if (!path_) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const courseIds = path_.courses.map((c) => c.courseId);
+  const courses = courseIds.length ? await findMany('courses', { _id: { $in: courseIds } }, { projection: { title: 1, category: 1, estimatedDurationMinutes: 1 } }) : [];
+  const courseMap = Object.fromEntries(courses.map((c) => [String(c._id), c]));
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    ...path_,
+    courses: path_.courses.map((c) => ({ ...c, course: courseMap[String(c.courseId)] || null })),
+  });
+};
+
+const updateLearningPath = async (req, res) => {
+  const allowed = ['name', 'description', 'targetRoles', 'targetDepartments', 'enrollmentTrigger', 'dueDateOffsetDays'];
+  const update = {};
+  allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
+  if (req.body.courses !== undefined) {
+    update.courses = req.body.courses.map((c) => ({
+      courseId: new ObjectId(c.courseId),
+      order: Number(c.order) || 0,
+      isRequired: c.isRequired !== false,
+      unlockAfterCourseId: c.unlockAfterCourseId ? new ObjectId(c.unlockAfterCourseId) : null,
     }));
   }
 
-  await updateOne('learning_paths', { _id: new ObjectId(id) }, { $set: updates });
-  return returnFunction(res, 200, true, 'Path updated');
+  const result = await updateOne('learningPaths', { _id: new ObjectId(req.params.id) }, { $set: update });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
-const deletePath = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
-  await global.dbo.collection('learning_paths').deleteOne({ _id: new ObjectId(id) });
-  return returnFunction(res, 200, true, 'Path deleted');
+const archiveLearningPath = async (req, res) => {
+  const result = await updateOne('learningPaths', { _id: new ObjectId(req.params.id) }, { $set: { status: 'archived' } });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
-const enrollInPath = async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id)) return returnFunction(res, 400, false, 'Invalid ID');
+// ── Enrollments ────────────────────────────────────────────────────────────────
+// `employeeId` on an enrollment is the learner's `users._id` (i.e. the JWT's userId) —
+// this is what every employee-facing route scopes against, matching the security
+// requirement that an employee can only ever see rows where employeeId === req.user._id.
+// createSingleCourseEnrollment/createLearningPathEnrollment/recomputeProgress/
+// maybeAdvanceLearningPath live in lib/training/enrollmentHelpers.js (shared with the
+// autoEnrollment rule engine, which would otherwise circularly require this file).
 
-  const pathDoc = await findOne('learning_paths', { _id: new ObjectId(id) });
-  if (!pathDoc) return returnFunction(res, 404, false, 'Path not found');
+const assignTraining = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['employeeIds'])) return;
+  if (!Array.isArray(req.body.employeeIds) || !req.body.employeeIds.length) return returnFunction(res, 400, false, 'Select at least one employee.');
+  if (!req.body.courseId && !req.body.learningPathId) return returnFunction(res, 400, false, 'Select a course or a learning path.');
 
-  const userId = req.user._id;
-  const sorted = [...(pathDoc.courseIds || [])].sort((a, b) => a.order - b.order);
-  let enrolled = 0, alreadyIn = 0;
+  const courseId = req.body.courseId ? new ObjectId(req.body.courseId) : null;
+  const learningPathId = req.body.learningPathId ? new ObjectId(req.body.learningPathId) : null;
+  const dueDate = req.body.dueDate ? new Date(req.body.dueDate) : null;
+  const enrolledBy = new ObjectId(req.user._id);
 
-  for (const entry of sorted) {
-    const courseId = new ObjectId(String(entry.courseId));
-    const course = await findOne('training_courses', { _id: courseId });
-    if (!course) continue;
-
-    const existing = await findOne('training_enrollments', { courseId, userId });
-    if (existing) { alreadyIn++; continue; }
-
-    await insertOne('training_enrollments', {
-      courseId, userId,
-      employeeId:  req.user.employeeId || null,
-      courseTitle: course.title,
-      category:    course.category,
-      trainingType: course.trainingType || 'self_paced',
-      objectives:  course.objectives || [],
-      completedObjectives: [],
-      status:      'not_started',
-      progress:    0,
-      startedAt:   null, completedAt: null, minutesPresent: null,
-      dueDate:     null, certificateUrl: null, materialProgress: {},
-      pathId:      new ObjectId(id),
-      enrolledAt:  new Date(), updatedAt: new Date(),
-    });
-    await updateOne('training_courses', { _id: courseId }, { $inc: { enrolledCount: 1 } });
-    enrolled++;
+  let createdCount = 0;
+  for (const empId of req.body.employeeIds) {
+    const employeeId = new ObjectId(empId);
+    const result = courseId
+      ? await createSingleCourseEnrollment({ employeeId, courseId, enrolledBy, enrollmentTrigger: 'manual', dueDate })
+      : await createLearningPathEnrollment({ employeeId, learningPathId, enrolledBy, enrollmentTrigger: 'manual', dueDate });
+    if (result.created) createdCount += 1;
   }
 
-  return returnFunction(res, 200, true, `Enrolled in ${enrolled} course(s). ${alreadyIn} already enrolled.`, { enrolled, alreadyIn });
+  return returnFunction(res, 201, true, `${createdCount} enrollment(s) created.`, {
+    created: createdCount, skipped: req.body.employeeIds.length - createdCount,
+  });
+};
+
+const listEnrollments = async (req, res) => {
+  const filter = {};
+  if (req.query.courseId) filter.courseId = new ObjectId(req.query.courseId);
+  if (req.query.learningPathId) filter.learningPathId = new ObjectId(req.query.learningPathId);
+  if (req.query.employeeId) filter.employeeId = new ObjectId(req.query.employeeId);
+  if (req.query.status) filter.status = req.query.status;
+
+  const { page, limit, skip } = getPagination(req.query);
+  const [total, data] = await Promise.all([
+    countDocuments('enrollments', filter),
+    findMany('enrollments', filter, { skip, limit, sort: { createdAt: -1 } }),
+  ]);
+
+  const employeeIds = [...new Set(data.map((e) => String(e.employeeId)))].map((id) => new ObjectId(id));
+  const courseIds = [...new Set(data.filter((e) => e.courseId).map((e) => String(e.courseId)))].map((id) => new ObjectId(id));
+  const [users, courses] = await Promise.all([
+    employeeIds.length ? findMany('users', { _id: { $in: employeeIds } }, { projection: { name: 1, department: 1, email: 1 } }) : [],
+    courseIds.length ? findMany('courses', { _id: { $in: courseIds } }, { projection: { title: 1, category: 1, isMandatory: 1, hasCertificate: 1 } }) : [],
+  ]);
+  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
+  const courseMap = Object.fromEntries(courses.map((c) => [String(c._id), c]));
+
+  const enriched = data.map((e) => ({
+    ...e,
+    employee: userMap[String(e.employeeId)] ? { _id: e.employeeId, fullName: userMap[String(e.employeeId)].name, department: userMap[String(e.employeeId)].department } : null,
+    course: e.courseId ? courseMap[String(e.courseId)] || null : null,
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+};
+
+const waiveEnrollment = async (req, res) => {
+  const result = await updateOne('enrollments', { _id: new ObjectId(req.params.id) }, {
+    $set: { status: 'waived', completedAt: new Date(), updatedAt: new Date() },
+  });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, 'Enrollment waived.');
+};
+
+// ── Employee — own enrollments only (scoped to req.user._id) ─────────────────
+
+const getMyEnrollments = async (req, res) => {
+  const filter = { employeeId: new ObjectId(req.user._id) };
+  if (req.query.status) filter.status = req.query.status;
+  const enrollments = await findMany('enrollments', filter, { sort: { createdAt: -1 } });
+
+  const courseIds = [...new Set(enrollments.filter((e) => e.courseId).map((e) => String(e.courseId)))].map((id) => new ObjectId(id));
+  const courses = courseIds.length ? await findMany('courses', { _id: { $in: courseIds } }) : [];
+  const courseMap = Object.fromEntries(courses.map((c) => [String(c._id), c]));
+
+  const enriched = enrollments.map((e) => ({
+    ...e,
+    course: e.courseId ? courseMap[String(e.courseId)] || null : null,
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+const updateMyProgress = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['moduleId', 'status'])) return;
+  if (!['notStarted', 'inProgress', 'completed'].includes(req.body.status)) return returnFunction(res, 400, false, 'Invalid status.');
+
+  const enrollment = await findOne('enrollments', { _id: new ObjectId(req.params.id) });
+  if (!enrollment) return returnFunction(res, 404, false, req.locale.notFound);
+  if (String(enrollment.employeeId) !== String(req.user._id)) return returnFunction(res, 403, false, req.locale.noPermission || 'Permission denied.');
+  if (!enrollment.courseId) return returnFunction(res, 400, false, 'This enrollment has no individual course to track progress on.');
+
+  const module_ = await findOne('courseModules', { _id: new ObjectId(req.body.moduleId), courseId: enrollment.courseId });
+  if (!module_) return returnFunction(res, 404, false, 'Module not found on this course.');
+  if (module_.type === 'quiz') return returnFunction(res, 400, false, 'Submit a quiz attempt instead of marking a quiz module complete directly.');
+
+  const now = new Date();
+  const moduleProgress = [...enrollment.moduleProgress];
+  const idx = moduleProgress.findIndex((m) => String(m.moduleId) === String(module_._id));
+  const existingEntry = idx >= 0 ? moduleProgress[idx] : null;
+  const entry = {
+    moduleId: module_._id,
+    status: req.body.status,
+    startedAt: existingEntry?.startedAt || now,
+    completedAt: req.body.status === 'completed' ? now : existingEntry?.completedAt,
+    attempts: existingEntry?.attempts || 0,
+    lastScore: existingEntry?.lastScore,
+  };
+  if (idx >= 0) moduleProgress[idx] = entry; else moduleProgress.push(entry);
+
+  const requiredModules = await findMany('courseModules', { courseId: enrollment.courseId, isRequired: true }, { projection: { _id: 1 } });
+  const { progressPercentage, status } = recomputeProgress(moduleProgress, requiredModules.map((m) => m._id));
+
+  const update = { moduleProgress, progressPercentage, status, updatedAt: now };
+  if (status === 'completed' && enrollment.status !== 'completed') update.completedAt = now;
+
+  await updateOne('enrollments', { _id: enrollment._id }, { $set: update });
+
+  if (status === 'completed' && enrollment.status !== 'completed') {
+    await maybeGenerateCertificate(enrollment._id);
+    await maybeAdvanceLearningPath(enrollment);
+  }
+
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully, { progressPercentage, status });
+};
+
+const submitCourseFeedback = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['rating'])) return;
+  const rating = Number(req.body.rating);
+  if (![1, 2, 3, 4, 5].includes(rating)) return returnFunction(res, 400, false, 'rating must be between 1 and 5.');
+
+  const enrollment = await findOne('enrollments', { _id: new ObjectId(req.params.id) });
+  if (!enrollment) return returnFunction(res, 404, false, req.locale.notFound);
+  if (String(enrollment.employeeId) !== String(req.user._id)) return returnFunction(res, 403, false, req.locale.noPermission || 'Permission denied.');
+  if (!['completed', 'waived'].includes(enrollment.status)) return returnFunction(res, 400, false, 'Complete the course before leaving feedback.');
+
+  const existing = await findOne('trainingFeedback', { enrollmentId: enrollment._id });
+  if (existing) return returnFunction(res, 409, false, 'You have already submitted feedback for this course.');
+
+  const doc = {
+    enrollmentId: enrollment._id,
+    courseId: enrollment.courseId,
+    employeeId: new ObjectId(req.user._id),
+    rating,
+    review: req.body.review || null,
+    submittedAt: new Date(),
+  };
+  const result = await insertOne('trainingFeedback', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+// ── Quiz scoring ───────────────────────────────────────────────────────────────
+
+const answersMatch = (given, correct) => {
+  const norm = (v) => (Array.isArray(v) ? v.map((x) => String(x).trim().toLowerCase()).sort() : String(v ?? '').trim().toLowerCase());
+  const g = norm(given);
+  const c = norm(correct);
+  return Array.isArray(g) || Array.isArray(c) ? JSON.stringify(g) === JSON.stringify(c) : g === c;
+};
+
+const submitQuizAttempt = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['moduleId', 'answers'])) return;
+  if (!Array.isArray(req.body.answers)) return returnFunction(res, 400, false, 'answers must be an array.');
+
+  const enrollment = await findOne('enrollments', { _id: new ObjectId(req.params.id) });
+  if (!enrollment) return returnFunction(res, 404, false, req.locale.notFound);
+  if (String(enrollment.employeeId) !== String(req.user._id)) return returnFunction(res, 403, false, req.locale.noPermission || 'Permission denied.');
+  if (!enrollment.courseId) return returnFunction(res, 400, false, 'This enrollment has no individual course to track progress on.');
+
+  const moduleId = new ObjectId(req.body.moduleId);
+  const module_ = await findOne('courseModules', { _id: moduleId, courseId: enrollment.courseId });
+  if (!module_ || module_.type !== 'quiz') return returnFunction(res, 404, false, 'Quiz module not found on this course.');
+
+  const quiz = await findOne('quizzes', { moduleId });
+  if (!quiz) return returnFunction(res, 404, false, 'Quiz not configured for this module.');
+
+  const existingEntry = enrollment.moduleProgress.find((m) => String(m.moduleId) === String(moduleId));
+  const attemptsUsed = existingEntry?.attempts || 0;
+  if (attemptsUsed >= quiz.maxAttempts) return returnFunction(res, 400, false, 'No attempts remaining for this quiz.');
+
+  const answerMap = Object.fromEntries(req.body.answers.map((a) => [a.questionId, a.answer]));
+  let earned = 0;
+  let total = 0;
+  const results = quiz.questions.map((q) => {
+    total += q.points;
+    const given = answerMap[q.id];
+    const correct = answersMatch(given, q.correctAnswer);
+    if (correct) earned += q.points;
+    return {
+      questionId: q.id,
+      correct,
+      pointsEarned: correct ? q.points : 0,
+      yourAnswer: given ?? null,
+      correctAnswer: q.correctAnswer,
+      explanation: q.explanation || null,
+    };
+  });
+
+  const score = total > 0 ? Math.round((earned / total) * 100) : 0;
+  const passed = score >= quiz.passingScore;
+  const attemptsRemaining = Math.max(0, quiz.maxAttempts - (attemptsUsed + 1));
+
+  const now = new Date();
+  const moduleProgress = [...enrollment.moduleProgress];
+  const idx = moduleProgress.findIndex((m) => String(m.moduleId) === String(moduleId));
+  const entry = {
+    moduleId,
+    status: passed ? 'completed' : 'inProgress',
+    startedAt: existingEntry?.startedAt || now,
+    completedAt: passed ? now : existingEntry?.completedAt,
+    attempts: attemptsUsed + 1,
+    lastScore: score,
+  };
+  if (idx >= 0) moduleProgress[idx] = entry; else moduleProgress.push(entry);
+
+  const requiredModules = await findMany('courseModules', { courseId: enrollment.courseId, isRequired: true }, { projection: { _id: 1 } });
+  const { progressPercentage, status } = recomputeProgress(moduleProgress, requiredModules.map((m) => m._id));
+
+  const update = { moduleProgress, progressPercentage, status, updatedAt: now };
+  if (status === 'completed' && enrollment.status !== 'completed') update.completedAt = now;
+  await updateOne('enrollments', { _id: enrollment._id }, { $set: update });
+
+  if (status === 'completed' && enrollment.status !== 'completed') {
+    await maybeGenerateCertificate(enrollment._id);
+    await maybeAdvanceLearningPath(enrollment);
+  }
+
+  return returnFunction(res, 200, true, passed ? 'Quiz passed.' : 'Quiz not passed.', { score, passed, attemptsRemaining, results });
+};
+
+// ── Certificates ───────────────────────────────────────────────────────────────
+
+const generateCertificateNumber = async (year) => {
+  const counterName = `certificate_number_${year}`;
+  const result = await global.dbo.collection('counters').findOneAndUpdate(
+    { _id: counterName },
+    { $inc: { seq: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  return `CERT-${year}-${String(result.seq).padStart(5, '0')}`;
+};
+
+// Idempotent — safe to call every time an enrollment completes; no-ops if the course
+// doesn't offer a certificate or one has already been issued for this enrollment.
+const maybeGenerateCertificate = async (enrollmentId) => {
+  try {
+    const enrollment = await findOne('enrollments', { _id: enrollmentId });
+    if (!enrollment || !enrollment.courseId) return null;
+
+    const course = await findOne('courses', { _id: enrollment.courseId });
+    if (!course?.hasCertificate) return null;
+
+    const existing = await findOne('certificates', { enrollmentId });
+    if (existing) return existing;
+
+    const user = await findOne('users', { _id: enrollment.employeeId });
+    const now = new Date();
+    const year = now.getFullYear();
+    const certificateNumber = await generateCertificateNumber(year);
+    const expiresAt = course.certificateValidityDays ? new Date(now.getTime() + course.certificateValidityDays * 86400000) : null;
+
+    const pdfUrl = await generateCertificatePDF({
+      employeeName: user?.name || 'Employee',
+      courseTitle: course.title,
+      completedAt: enrollment.completedAt || now,
+      certificateNumber,
+    });
+
+    const doc = {
+      employeeId: enrollment.employeeId,
+      courseId: enrollment.courseId,
+      enrollmentId,
+      certificateNumber,
+      issuedAt: now,
+      expiresAt,
+      pdfUrl,
+    };
+    const result = await insertOne('certificates', doc);
+
+    notifyUser(enrollment.employeeId, {
+      title: 'Certificate Earned',
+      body: `You've earned a certificate for completing "${course.title}".`,
+      type: 'training',
+    }).catch(() => {});
+
+    return { ...doc, _id: result.insertedId };
+  } catch {
+    return null; // Non-critical — never let certificate generation block progress updates
+  }
+};
+
+const generateMyCertificate = async (req, res) => {
+  const enrollment = await findOne('enrollments', { _id: new ObjectId(req.params.enrollmentId) });
+  if (!enrollment) return returnFunction(res, 404, false, req.locale.notFound);
+  if (String(enrollment.employeeId) !== String(req.user._id)) return returnFunction(res, 403, false, req.locale.noPermission || 'Permission denied.');
+  if (enrollment.status !== 'completed') return returnFunction(res, 400, false, 'Complete the course before generating a certificate.');
+
+  const cert = await maybeGenerateCertificate(enrollment._id);
+  if (!cert) return returnFunction(res, 400, false, 'This course does not offer a certificate.');
+  return returnFunction(res, 200, true, 'Certificate ready.', cert);
+};
+
+const getMyCertificates = async (req, res) => {
+  const certs = await findMany('certificates', { employeeId: new ObjectId(req.user._id) }, { sort: { issuedAt: -1 } });
+  const courseIds = certs.map((c) => c.courseId);
+  const courses = courseIds.length ? await findMany('courses', { _id: { $in: courseIds } }, { projection: { title: 1 } }) : [];
+  const courseMap = Object.fromEntries(courses.map((c) => [String(c._id), c]));
+  return returnFunction(res, 200, true, req.locale.success, certs.map((c) => ({ ...c, course: courseMap[String(c.courseId)] || null })));
+};
+
+const getMyLearningPaths = async (req, res) => {
+  const enrollments = await findMany('enrollments', { employeeId: new ObjectId(req.user._id), learningPathId: { $ne: null }, courseId: null });
+  const pathIds = enrollments.map((e) => e.learningPathId);
+  const paths = pathIds.length ? await findMany('learningPaths', { _id: { $in: pathIds } }) : [];
+  const pathMap = Object.fromEntries(paths.map((p) => [String(p._id), p]));
+
+  const enriched = enrollments.map((e) => ({ ...e, learningPath: pathMap[String(e.learningPathId)] || null }));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+// ── External Certificates ────────────────────────────────────────────────────
+
+const uploadExternalCertificate = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'issuingOrganization', 'issuedDate', 'fileUrl'])) return;
+
+  const doc = {
+    employeeId: new ObjectId(req.user._id),
+    name: req.body.name.trim(),
+    issuingOrganization: req.body.issuingOrganization,
+    issuedDate: new Date(req.body.issuedDate),
+    expiryDate: req.body.expiryDate ? new Date(req.body.expiryDate) : null,
+    fileUrl: req.body.fileUrl,
+    verificationUrl: req.body.verificationUrl || null,
+    status: 'pending',
+    verifiedBy: null,
+    uploadedAt: new Date(),
+  };
+  const result = await insertOne('externalCertificates', doc);
+
+  notifyHR({
+    type: 'training', subType: 'external_cert_uploaded',
+    title: 'External Certificate Submitted',
+    subtitle: `An employee uploaded "${doc.name}" for verification.`,
+    referenceId: result.insertedId, referenceModel: 'externalCertificates',
+    requiresAction: true, triggeredBy: new ObjectId(req.user._id),
+  }).catch(() => {});
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const getMyExternalCertificates = async (req, res) => {
+  const certs = await findMany('externalCertificates', { employeeId: new ObjectId(req.user._id) }, { sort: { uploadedAt: -1 } });
+  return returnFunction(res, 200, true, req.locale.success, certs);
+};
+
+const listExternalCertificates = async (req, res) => {
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+  const certs = await findMany('externalCertificates', filter, { sort: { uploadedAt: -1 } });
+
+  const employeeIds = [...new Set(certs.map((c) => String(c.employeeId)))].map((id) => new ObjectId(id));
+  const users = employeeIds.length ? await findMany('users', { _id: { $in: employeeIds } }, { projection: { name: 1, department: 1 } }) : [];
+  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
+
+  return returnFunction(res, 200, true, req.locale.success, certs.map((c) => ({ ...c, employee: userMap[String(c.employeeId)] || null })));
+};
+
+const verifyExternalCertificate = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['status'])) return;
+  if (!['verified', 'rejected'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be verified or rejected.');
+
+  const cert = await findOne('externalCertificates', { _id: new ObjectId(req.params.id) });
+  if (!cert) return returnFunction(res, 404, false, req.locale.notFound);
+
+  await updateOne('externalCertificates', { _id: cert._id }, {
+    $set: { status: req.body.status, verifiedBy: new ObjectId(req.user._id) },
+  });
+
+  notifyUser(cert.employeeId, {
+    title: `External Certificate ${req.body.status === 'verified' ? 'Verified' : 'Rejected'}`,
+    body: `Your certificate "${cert.name}" was ${req.body.status}.`,
+    type: 'training',
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, `Certificate ${req.body.status}.`);
+};
+
+// ── Assignment Rules (HR admin) ───────────────────────────────────────────────
+
+const RULE_TRIGGERS = ['onHire', 'onRoleChange', 'onDepartmentChange', 'onPerformanceScore', 'onCertExpiry', 'scheduled'];
+
+const createRule = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'trigger', 'action'])) return;
+  if (!RULE_TRIGGERS.includes(req.body.trigger)) return returnFunction(res, 400, false, `trigger must be one of: ${RULE_TRIGGERS.join(', ')}`);
+
+  const doc = {
+    name: req.body.name.trim(),
+    trigger: req.body.trigger,
+    triggerConditions: req.body.triggerConditions || {},
+    action: {
+      enrollInCourseIds: (req.body.action.enrollInCourseIds || []).map((id) => new ObjectId(id)),
+      enrollInLearningPathIds: (req.body.action.enrollInLearningPathIds || []).map((id) => new ObjectId(id)),
+      dueDateOffsetDays: req.body.action.dueDateOffsetDays ?? null,
+      notifyEmployee: req.body.action.notifyEmployee !== false,
+      notifyManager: !!req.body.action.notifyManager,
+    },
+    isActive: req.body.isActive !== false,
+    createdBy: new ObjectId(req.user._id),
+    createdAt: new Date(),
+  };
+  const result = await insertOne('trainingAssignmentRules', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const listRules = async (req, res) => {
+  const rules = await findMany('trainingAssignmentRules', {}, { sort: { createdAt: -1 } });
+  const ids = rules.map((r) => r._id);
+  const lastRuns = ids.length ? await aggregate('ruleExecutionLogs', [
+    { $match: { ruleId: { $in: ids } } },
+    { $sort: { runAt: -1 } },
+    { $group: { _id: '$ruleId', lastRunAt: { $first: '$runAt' }, lastRunMatched: { $first: '$matched' }, lastRunCreated: { $first: '$created' } } },
+  ]) : [];
+  const lastRunMap = Object.fromEntries(lastRuns.map((l) => [String(l._id), l]));
+
+  return returnFunction(res, 200, true, req.locale.success, rules.map((r) => ({ ...r, ...(lastRunMap[String(r._id)] || {}) })));
+};
+
+const updateRule = async (req, res) => {
+  const allowed = ['name', 'trigger', 'triggerConditions', 'isActive'];
+  const update = {};
+  allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
+  if (req.body.action !== undefined) {
+    update.action = {
+      enrollInCourseIds: (req.body.action.enrollInCourseIds || []).map((id) => new ObjectId(id)),
+      enrollInLearningPathIds: (req.body.action.enrollInLearningPathIds || []).map((id) => new ObjectId(id)),
+      dueDateOffsetDays: req.body.action.dueDateOffsetDays ?? null,
+      notifyEmployee: req.body.action.notifyEmployee !== false,
+      notifyManager: !!req.body.action.notifyManager,
+    };
+  }
+
+  const result = await updateOne('trainingAssignmentRules', { _id: new ObjectId(req.params.id) }, { $set: update });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const runRuleNow = async (req, res) => {
+  const rule = await findOne('trainingAssignmentRules', { _id: new ObjectId(req.params.id) });
+  if (!rule) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const result = await runRule(rule);
+  return returnFunction(res, 200, true, `Matched ${result.matched}, created ${result.created} enrollment(s).`, result);
+};
+
+// ── Analytics (HR admin) ──────────────────────────────────────────────────────
+
+const getTrainingOverview = async (req, res) => {
+  const now = new Date();
+  const [publishedCourses, activeEnrollments, overdueCount, expiringCertCount, totalEnrollments, completedEnrollments] = await Promise.all([
+    countDocuments('courses', { status: 'published' }),
+    countDocuments('enrollments', { status: { $in: ['notStarted', 'inProgress'] } }),
+    countDocuments('enrollments', { status: 'overdue' }),
+    countDocuments('certificates', { expiresAt: { $gte: now, $lte: new Date(now.getTime() + 30 * 86400000) } }),
+    countDocuments('enrollments', {}),
+    countDocuments('enrollments', { status: 'completed' }),
+  ]);
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    publishedCourses,
+    activeEnrollments,
+    orgCompletionRate: totalEnrollments > 0 ? Math.round((completedEnrollments / totalEnrollments) * 100) : 0,
+    overdueCount,
+    certsExpiringIn30Days: expiringCertCount,
+  });
+};
+
+const getComplianceReport = async (req, res) => {
+  const mandatoryCourses = await findMany('courses', { isMandatory: true, status: 'published' });
+  const courseIds = mandatoryCourses.map((c) => c._id);
+  const enrollments = courseIds.length ? await findMany('enrollments', { courseId: { $in: courseIds } }) : [];
+
+  const byCourse = mandatoryCourses.map((c) => {
+    const rows = enrollments.filter((e) => String(e.courseId) === String(c._id));
+    const completed = rows.filter((e) => e.status === 'completed').length;
+    const overdue = rows.filter((e) => e.status === 'overdue').length;
+    return {
+      courseId: c._id,
+      title: c.title,
+      targetRoles: c.targetRoles,
+      targetDepartments: c.targetDepartments,
+      enrolled: rows.length,
+      completed,
+      overdue,
+      completionRate: rows.length ? Math.round((completed / rows.length) * 100) : 0,
+    };
+  });
+
+  const now = new Date();
+  const in30 = new Date(now.getTime() + 30 * 86400000);
+  const expiringCerts = await findMany('certificates', { expiresAt: { $gte: now, $lte: in30 } });
+  const employeeIds = [...new Set(expiringCerts.map((c) => String(c.employeeId)))].map((id) => new ObjectId(id));
+  const [users, allCourses] = await Promise.all([
+    employeeIds.length ? findMany('users', { _id: { $in: employeeIds } }, { projection: { name: 1 } }) : [],
+    findMany('courses', {}, { projection: { title: 1 } }),
+  ]);
+  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
+  const courseTitleMap = Object.fromEntries(allCourses.map((c) => [String(c._id), c.title]));
+
+  const certExpiry = expiringCerts.map((c) => ({
+    employeeId: c.employeeId,
+    employeeName: userMap[String(c.employeeId)]?.name || 'Unknown',
+    courseTitle: courseTitleMap[String(c.courseId)] || 'Unknown',
+    certificateNumber: c.certificateNumber,
+    expiresAt: c.expiresAt,
+    daysRemaining: Math.ceil((new Date(c.expiresAt) - now) / 86400000),
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, { mandatoryCourses: byCourse, certExpiry });
+};
+
+const getCourseAnalytics = async (req, res) => {
+  const courseId = new ObjectId(req.params.id);
+  const course = await findOne('courses', { _id: courseId });
+  if (!course) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const modules = await findMany('courseModules', { courseId }, { sort: { order: 1 } });
+  const enrollments = await findMany('enrollments', { courseId });
+
+  const funnel = modules.map((m) => {
+    const completedCount = enrollments.filter((e) => e.moduleProgress.some((mp) => String(mp.moduleId) === String(m._id) && mp.status === 'completed')).length;
+    return {
+      moduleId: m._id,
+      title: m.title,
+      completedCount,
+      dropOffRate: enrollments.length ? Math.round(((enrollments.length - completedCount) / enrollments.length) * 100) : 0,
+    };
+  });
+
+  const quizModuleIds = modules.filter((m) => m.type === 'quiz').map((m) => String(m._id));
+  const quizScores = [];
+  enrollments.forEach((e) => e.moduleProgress.forEach((mp) => {
+    if (quizModuleIds.includes(String(mp.moduleId)) && mp.lastScore != null) quizScores.push(mp.lastScore);
+  }));
+  const avgQuizScore = quizScores.length ? Math.round(quizScores.reduce((a, b) => a + b, 0) / quizScores.length) : null;
+
+  const feedback = await findMany('trainingFeedback', { courseId });
+  const ratingBreakdown = [1, 2, 3, 4, 5].map((r) => ({ rating: r, count: feedback.filter((f) => f.rating === r).length }));
+
+  const completedEnrollments = enrollments.filter((e) => e.status === 'completed' && e.completedAt);
+  const avgTimeToCompleteDays = completedEnrollments.length
+    ? Math.round(completedEnrollments.reduce((sum, e) => sum + (new Date(e.completedAt) - new Date(e.createdAt)) / 86400000, 0) / completedEnrollments.length)
+    : null;
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    totalEnrollments: enrollments.length, funnel, avgQuizScore, ratingBreakdown, avgTimeToCompleteDays,
+  });
+};
+
+const getEmployeeTrainingRecord = async (req, res) => {
+  const employeeId = new ObjectId(req.params.id);
+  const user = await findOne('users', { _id: employeeId }, { projection: { name: 1, department: 1, role: 1 } });
+  if (!user) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const enrollments = await findMany('enrollments', { employeeId });
+  const courseIds = enrollments.filter((e) => e.courseId).map((e) => e.courseId);
+  const courses = courseIds.length ? await findMany('courses', { _id: { $in: courseIds } }, { projection: { title: 1, category: 1, isMandatory: 1 } }) : [];
+  const courseMap = Object.fromEntries(courses.map((c) => [String(c._id), c]));
+
+  const [certificates, externalCertificates] = await Promise.all([
+    findMany('certificates', { employeeId }),
+    findMany('externalCertificates', { employeeId }),
+  ]);
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    employee: { _id: user._id, name: user.name, department: user.department, role: user.role },
+    enrollments: enrollments.map((e) => ({ ...e, course: e.courseId ? courseMap[String(e.courseId)] || null : null })),
+    certificates, externalCertificates,
+  });
+};
+
+const getLeaderboard = async (req, res) => {
+  const completed = await aggregate('enrollments', [
+    { $match: { status: 'completed', courseId: { $ne: null } } },
+    { $group: { _id: '$employeeId', coursesCompleted: { $sum: 1 } } },
+    { $sort: { coursesCompleted: -1 } },
+    { $limit: 20 },
+  ]);
+  const employeeIds = completed.map((c) => c._id);
+  const [users, certCounts] = await Promise.all([
+    employeeIds.length ? findMany('users', { _id: { $in: employeeIds } }, { projection: { name: 1, department: 1 } }) : [],
+    employeeIds.length ? aggregate('certificates', [
+      { $match: { employeeId: { $in: employeeIds } } },
+      { $group: { _id: '$employeeId', certificatesEarned: { $sum: 1 } } },
+    ]) : [],
+  ]);
+  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
+  const certMap = Object.fromEntries(certCounts.map((c) => [String(c._id), c.certificatesEarned]));
+
+  const leaderboard = completed.map((c, i) => ({
+    rank: i + 1,
+    employeeId: c._id,
+    name: userMap[String(c._id)]?.name || 'Unknown',
+    department: userMap[String(c._id)]?.department || null,
+    coursesCompleted: c.coursesCompleted,
+    certificatesEarned: certMap[String(c._id)] || 0,
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, leaderboard);
+};
+
+// Ad-hoc reminder from the Compliance Dashboard — either one employee (about an
+// overdue course or an expiring certificate) or every currently-overdue enrollment.
+const sendComplianceReminder = async (req, res) => {
+  if (req.body.employeeId) {
+    const employeeId = new ObjectId(req.body.employeeId);
+    notifyUser(employeeId, {
+      title: 'Training Reminder',
+      body: req.body.message || 'This is a reminder to complete your assigned training.',
+      type: 'training',
+      link: '/my/training',
+    }).catch(() => {});
+    return returnFunction(res, 200, true, 'Reminder sent.');
+  }
+
+  const overdue = await findMany('enrollments', { status: 'overdue' }, { projection: { employeeId: 1 } });
+  const uniqueIds = [...new Set(overdue.map((e) => String(e.employeeId)))];
+  for (const id of uniqueIds) {
+    notifyUser(new ObjectId(id), {
+      title: 'Training Reminder',
+      body: 'You have overdue training — please complete it as soon as possible.',
+      type: 'training',
+      link: '/my/training',
+    }).catch(() => {});
+  }
+  return returnFunction(res, 200, true, `Reminder sent to ${uniqueIds.length} employee(s).`);
 };
 
 module.exports = {
-  listCourses, getCourse, createCourse, updateCourse, deleteCourse,
-  enrollInCourse, assignCourseToEmployees, getMyTraining, updateProgress, getTeamTraining,
-  startCourse, toggleObjective, downloadCertificate,
-  addMaterial, removeMaterial, saveMaterialProgress,
-  createQuiz, getQuiz, deleteQuiz, submitQuiz,
-  listPaths, createPath, updatePath, deletePath, enrollInPath,
+  COURSE_CATEGORIES, COURSE_STATUSES, MODULE_TYPES, ENROLLMENT_STATUSES, RULE_TRIGGERS,
+  sendComplianceReminder,
+  createCourse, listCourses, getCourse, updateCourse, publishCourse, archiveCourse, addCourseAuthor,
+  listCatalog, getCatalogCourse, getModuleQuizForLearner,
+  addModule, updateModule, deleteModule,
+  createQuiz, updateQuiz,
+  createLearningPath, listLearningPaths, getLearningPath, updateLearningPath, archiveLearningPath,
+  createSingleCourseEnrollment, createLearningPathEnrollment,
+  assignTraining, listEnrollments, waiveEnrollment,
+  getMyEnrollments, updateMyProgress, submitQuizAttempt, submitCourseFeedback, getMyLearningPaths,
+  generateMyCertificate, getMyCertificates,
+  uploadExternalCertificate, getMyExternalCertificates, listExternalCertificates, verifyExternalCertificate,
+  createRule, listRules, updateRule, runRuleNow,
+  getTrainingOverview, getComplianceReport, getCourseAnalytics, getEmployeeTrainingRecord, getLeaderboard,
 };
