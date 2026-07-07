@@ -5,6 +5,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { sendEmail } = require('../../services/emailService');
 const { HR_MANAGER, DEPT_HEAD, STAFF } = require('../../constants/roles');
+const { evaluateRulesForUser } = require('../../lib/training/autoEnrollment');
 
 const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
 
@@ -89,6 +90,10 @@ const createAccount = async (req, res) => {
     `,
   }).catch((e) => console.error('Credentials email failed:', e.message));
 
+  // Training auto-enrollment — a new account is the point at which someone becomes
+  // trainable (has a role/department to target and can log in to take courses).
+  evaluateRulesForUser('onHire', { ...doc, _id: result.insertedId }).catch(() => {});
+
   return returnFunction(res, 201, true, 'Account created. Credentials sent via email.', {
     _id: result.insertedId,
   });
@@ -98,6 +103,8 @@ const createAccount = async (req, res) => {
 const updateAccount = async (req, res) => {
   const { role, department, isActive, employeeId } = req.body;
   const update = { updatedAt: new Date() };
+
+  const before = await findOne('users', { _id: new ObjectId(req.params.id) });
 
   if (role) {
     if (!ALLOWED_CREATE_ROLES.includes(role)) {
@@ -118,6 +125,17 @@ const updateAccount = async (req, res) => {
   }
 
   await updateOne('users', { _id: new ObjectId(req.params.id) }, patch);
+
+  // Training auto-enrollment on role/department change
+  if (before) {
+    const roleChanged = role && role !== before.role;
+    const deptChanged = department !== undefined && department !== before.department;
+    if (roleChanged || deptChanged) {
+      const after = await findOne('users', { _id: new ObjectId(req.params.id) });
+      if (roleChanged) evaluateRulesForUser('onRoleChange', after).catch(() => {});
+      if (deptChanged) evaluateRulesForUser('onDepartmentChange', after).catch(() => {});
+    }
+  }
   return returnFunction(res, 200, true, 'Account updated.');
 };
 

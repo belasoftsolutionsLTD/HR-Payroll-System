@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { ObjectId } = require('mongodb');
 const { triggerTasksFromTemplate } = require('./triggerTasksFromTemplate');
-const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { notifyEmployee, notifyUser } = require('../../functions/HR/notifyUser');
 const { runLeaveAccrual, runYearEndCarryForward } = require('../../routes/leave/leaveFunctions');
 
 async function dailyTaskJobs() {
@@ -237,139 +237,50 @@ async function autoMarkAbsent() {
   console.log(`[CRON] Auto-marked ${absentIds.length} employee(s) as absent for ${todayStr}`);
 }
 
-// ── Auto-complete training sessions whose end time has passed ─────────────────
+// ── Training / LMS: overdue detection + automation rule engine ────────────────
 
-async function autoCompleteTraining() {
+async function checkOverdueTraining() {
   if (!global.dbo) return;
 
   const now = new Date();
-
-  // Find in_progress enrollments
-  const inProgress = await global.dbo.collection('training_enrollments')
-    .find({ status: 'in_progress' }, { projection: { _id: 1, courseId: 1, startedAt: 1 } })
-    .toArray();
-
-  if (!inProgress.length) return;
-
-  const courseIds = [...new Set(inProgress.map(e => String(e.courseId)))];
-
-  // Find courses whose endTime has passed and is a full ISO datetime
-  const courses = await global.dbo.collection('training_courses').find({
-    _id: { $in: courseIds.map(id => new ObjectId(id)) },
-    endTime: { $ne: null },
-  }, { projection: { _id: 1, endTime: 1, isRecurring: 1, recurringFrequency: 1, startTime: 1 } }).toArray();
-
-  let count = 0;
-  for (const course of courses) {
-    if (!course.endTime || !String(course.endTime).includes('T')) continue;
-    const endDate = new Date(course.endTime);
-    if (isNaN(endDate.getTime()) || endDate > now) continue;
-
-    // Mark matching enrollments as auto_completed
-    const matching = inProgress.filter(e => String(e.courseId) === String(course._id));
-    for (const enr of matching) {
-      const minutesPresent = enr.startedAt
-        ? Math.max(1, Math.round((endDate - new Date(enr.startedAt)) / 60000))
-        : null;
-
-      await global.dbo.collection('training_enrollments').updateOne(
-        { _id: enr._id },
-        { $set: {
-          status: 'auto_completed',
-          completedAt: endDate,
-          progress: 100,
-          ...(minutesPresent !== null ? { minutesPresent } : {}),
-          updatedAt: now,
-        }}
-      );
-      count++;
-    }
-
-    // Auto-create next occurrence for recurring courses (once, using a flag)
-    if (course.isRecurring && course.recurringFrequency && !course.nextOccurrenceCreated) {
-      const freq = {
-        daily:     { days: 1 },
-        weekly:    { days: 7 },
-        monthly:   { months: 1 },
-        quarterly: { months: 3 },
-        annually:  { years: 1 },
-      }[course.recurringFrequency];
-
-      if (freq) {
-        const addToDate = (d) => {
-          const nd = new Date(d);
-          if (freq.days)   nd.setDate(nd.getDate() + freq.days);
-          if (freq.months) nd.setMonth(nd.getMonth() + freq.months);
-          if (freq.years)  nd.setFullYear(nd.getFullYear() + freq.years);
-          return nd;
-        };
-
-        const fullCourse = await global.dbo.collection('training_courses').findOne({ _id: course._id });
-        if (fullCourse) {
-          const { _id, createdAt, updatedAt, enrolledCount, nextOccurrenceCreated, ...rest } = fullCourse;
-          await global.dbo.collection('training_courses').insertOne({
-            ...rest,
-            startTime: fullCourse.startTime ? addToDate(fullCourse.startTime).toISOString() : null,
-            endTime:   fullCourse.endTime   ? addToDate(fullCourse.endTime).toISOString()   : null,
-            enrolledCount: 0,
-            status: 'published',
-            nextOccurrenceCreated: false,
-            createdAt: now,
-            updatedAt: now,
-          });
-        }
-      }
-
-      // Mark this course so we don't create another occurrence next run
-      await global.dbo.collection('training_courses').updateOne(
-        { _id: course._id },
-        { $set: { nextOccurrenceCreated: true, updatedAt: now } }
-      );
-    }
-  }
-
-  if (count > 0) {
-    console.log(`[CRON] Auto-completed ${count} training enrollment(s)`);
-  }
-}
-
-async function checkOverdueMandatoryTraining() {
-  if (!global.dbo) return;
-
-  const todayStr = new Date().toISOString().split('T')[0];
-
-  const mandatoryCourses = await global.dbo.collection('training_courses')
-    .find({ isMandatory: true, status: 'published' }, { projection: { _id: 1, title: 1 } })
-    .toArray();
-
-  if (!mandatoryCourses.length) return;
-
-  const mandatoryIds = mandatoryCourses.map(c => c._id);
-  const titleMap = Object.fromEntries(mandatoryCourses.map(c => [String(c._id), c.title]));
-
-  const overdue = await global.dbo.collection('training_enrollments').find({
-    courseId: { $in: mandatoryIds },
-    dueDate: { $lt: todayStr, $ne: null },
-    status: { $nin: ['completed', 'auto_completed'] },
-    overdueNotified: { $ne: todayStr },
+  const overdue = await global.dbo.collection('enrollments').find({
+    dueDate: { $lt: now, $ne: null },
+    status: { $in: ['notStarted', 'inProgress'] },
   }).toArray();
 
-  for (const enr of overdue) {
-    notifyEmployee(enr.userId, {
-      title: 'Mandatory training overdue',
-      body: `"${titleMap[String(enr.courseId)] || 'A mandatory course'}" was due ${enr.dueDate} — please complete it now.`,
-      type: 'training_overdue',
-      link: '/training',
-    }).catch(() => {});
+  if (!overdue.length) return;
 
-    await global.dbo.collection('training_enrollments').updateOne(
+  const courseIds = [...new Set(overdue.filter((e) => e.courseId).map((e) => String(e.courseId)))].map((id) => new ObjectId(id));
+  const courses = courseIds.length
+    ? await global.dbo.collection('courses').find({ _id: { $in: courseIds } }, { projection: { title: 1 } }).toArray()
+    : [];
+  const titleMap = Object.fromEntries(courses.map((c) => [String(c._id), c.title]));
+
+  for (const enr of overdue) {
+    await global.dbo.collection('enrollments').updateOne(
       { _id: enr._id },
-      { $set: { overdueNotified: todayStr } }
+      { $set: { status: 'overdue', updatedAt: now } }
     );
+    // enrollments.employeeId is the learner's users._id directly (not an employees._id),
+    // so this must use notifyUser, not notifyEmployee (which expects an employees._id).
+    notifyUser(enr.employeeId, {
+      title: 'Training Overdue',
+      body: `"${titleMap[String(enr.courseId)] || 'A required course'}" was due and is now overdue — please complete it.`,
+      type: 'training',
+      link: '/my/training',
+    }).catch(() => {});
   }
 
-  if (overdue.length > 0) {
-    console.log(`[CRON] Notified ${overdue.length} employee(s) of overdue mandatory training`);
+  console.log(`[CRON] Marked ${overdue.length} training enrollment(s) overdue`);
+}
+
+async function runTrainingAutomationRules() {
+  if (!global.dbo) return;
+  try {
+    const { runDueScheduledAndExpiryRules } = require('../training/autoEnrollment');
+    await runDueScheduledAndExpiryRules();
+  } catch (err) {
+    console.error('[CRON] Training automation rule error:', err.message);
   }
 }
 
@@ -404,12 +315,6 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Clock-out detection error:', err); }
   });
 
-  // Every 15 minutes: auto-complete training sessions whose end time has passed
-  cron.schedule('*/15 * * * *', async () => {
-    try { await autoCompleteTraining(); }
-    catch (err) { console.error('[CRON] Training auto-complete error:', err); }
-  });
-
   // 1st of each month at 01:00 UTC — monthly leave accrual (idempotent per month)
   cron.schedule('0 1 1 * *', async () => {
     try {
@@ -424,13 +329,19 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Year-end carry-forward error:', err); }
   });
 
-  // Daily at 08:00 UTC — notify employees with overdue mandatory training
+  // Daily at 08:00 UTC — mark overdue training enrollments + notify
   cron.schedule('0 8 * * *', async () => {
-    try { await checkOverdueMandatoryTraining(); }
-    catch (err) { console.error('[CRON] Mandatory training overdue check error:', err); }
+    try { await checkOverdueTraining(); }
+    catch (err) { console.error('[CRON] Training overdue check error:', err); }
+  });
+
+  // Daily at 08:15 UTC — run due "scheduled" and "onCertExpiry" training assignment rules
+  cron.schedule('15 8 * * *', async () => {
+    try { await runTrainingAutomationRules(); }
+    catch (err) { console.error('[CRON] Training automation rule error:', err); }
   });
 
   console.log('[CRON] All cron jobs scheduled');
 }
 
-module.exports = { startCronJobs, dailyTaskJobs, autoCompleteTraining };
+module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules };
