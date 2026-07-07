@@ -62,7 +62,7 @@ const generatePayslipFromResult = (employee, result, cycle) => {
       65, infoY + 16,
     );
     doc.text(
-      `Bank: ${employee?.bankAccount ? `****${String(employee.bankAccount).slice(-4)}` : 'Not on file'}`,
+      `Bank: ${employee?.bankAccountNumber ? `****${String(employee.bankAccountNumber).slice(-4)}` : employee?.mpesaNumber ? `M-Pesa ****${String(employee.mpesaNumber).slice(-4)}` : 'Not on file'}`,
       65, infoY + 30,
     );
     doc.y += 75;
@@ -86,13 +86,22 @@ const generatePayslipFromResult = (employee, result, cycle) => {
     row(doc, 'GROSS PAY', fmt(result.grossPay, cur), true);
     doc.moveDown(0.5);
 
+    // ── Leave taken ───────────────────────────────────────────────────────────
+    // Every approved leave type shows as its own line; only 'unpaid' leave carries an
+    // amount (deducted from net pay) — paid leave types are shown for information only.
+    const leave = result.leave ?? [];
+    if (leave.length > 0) {
+      sectionHeader(doc, 'LEAVE TAKEN', '#38bdf8');
+      for (const l of leave) {
+        const label = `${l.leaveType.charAt(0).toUpperCase()}${l.leaveType.slice(1)} Leave (${l.days} day${l.days === 1 ? '' : 's'})`;
+        row(doc, label, l.amount > 0 ? `-${fmt(l.amount, cur)}` : 'Paid');
+      }
+      doc.moveDown(0.5);
+    }
+
     // ── Statutory deductions ──────────────────────────────────────────────────
-    // Support both the cycle result format (result.statutoryDeductions) and
-    // the legacy payroll_summaries format (result.deductions object with paye/nssf/sha/ahl)
     const sd = result.statutoryDeductions;
-    const legacyDed = (!sd && result.deductions && !Array.isArray(result.deductions))
-      ? result.deductions : null;
-    const sdLabels = sd?.labels || result.taxLabels || {};
+    const sdLabels = sd?.labels || {};
 
     const statutory = [];
     if (sd) {
@@ -100,11 +109,6 @@ const generatePayslipFromResult = (employee, result, cycle) => {
       if (sd.nssf) statutory.push({ name: sdLabels.nssf || 'NSSF',                     amount: sd.nssf });
       if (sd.sha)  statutory.push({ name: sdLabels.sha  || 'SHA',                      amount: sd.sha  });
       if (sd.ahl)  statutory.push({ name: sdLabels.ahl  || 'Affordable Housing Levy',  amount: sd.ahl  });
-    } else if (legacyDed) {
-      if (legacyDed.paye) statutory.push({ name: sdLabels.incomeTax   || 'PAYE',                    amount: legacyDed.paye });
-      if (legacyDed.nssf) statutory.push({ name: sdLabels.pension     || 'NSSF',                    amount: legacyDed.nssf });
-      if (legacyDed.sha)  statutory.push({ name: sdLabels.health      || 'SHA',                     amount: legacyDed.sha  });
-      if (legacyDed.ahl)  statutory.push({ name: sdLabels.housingLevy || 'Affordable Housing Levy', amount: legacyDed.ahl  });
     }
 
     if (statutory.length > 0) {
@@ -119,17 +123,7 @@ const generatePayslipFromResult = (employee, result, cycle) => {
     }
 
     // ── Other deductions (loans, advances, voluntary) ─────────────────────────
-    const otherDeds = [];
-    if (sd && Array.isArray(result.deductions)) {
-      // Cycle format: deductions array = compensations deductions (loans etc.)
-      for (const d of result.deductions) {
-        otherDeds.push({ name: d.conceptName, amount: d.amount });
-      }
-    } else if (legacyDed) {
-      for (const d of (legacyDed.otherDeductions || [])) {
-        otherDeds.push({ name: d.label || d.name, amount: d.amount });
-      }
-    }
+    const otherDeds = (result.deductions ?? []).map((d) => ({ name: d.conceptName, amount: d.amount }));
 
     if (otherDeds.length > 0) {
       sectionHeader(doc, 'OTHER DEDUCTIONS', '#ef4444');

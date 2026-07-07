@@ -113,14 +113,29 @@ async function initIndexes() {
     idx('notifications', { recipientId: 1, isRead: 1 }),
     idx('notifications', { createdAt: -1 }),
 
-    // ── payroll_summaries ────────────────────────────────────────────────────
-    idx('payroll_summaries', { employeeId: 1 }),
-    idx('payroll_summaries', { month: 1, year: 1 }),
-    idx('payroll_summaries', { employeeId: 1, month: 1, year: 1 }, { unique: true }),
-
     // ── payroll_cycles ───────────────────────────────────────────────────────
+    // Not unique: multiple cycles can share a calendar month once weekly/biweekly pay
+    // frequencies and off-cycle runs are in play (see payrollCyclesFunctions.js createCycle,
+    // which enforces the real non-overlap rule at the app level instead).
     idx('payroll_cycles', { status: 1 }),
-    idx('payroll_cycles', { month: 1, year: 1 }),
+    idx('payroll_cycles', { 'period.month': 1, 'period.year': 1 }),
+    idx('payroll_cycles', { payFrequency: 1 }),
+    idx('payroll_cycles', { runType: 1 }),
+
+    // ── payslips ─────────────────────────────────────────────────────────────
+    idx('payslips', { employeeId: 1 }),
+    idx('payslips', { cycleId: 1 }),
+
+    // ── employee_compensations ───────────────────────────────────────────────
+    idx('employee_compensations', { employeeId: 1, isActive: 1 }),
+    idx('employee_compensations', { conceptId: 1 }),
+
+    // ── compensation_audit_logs ──────────────────────────────────────────────
+    idx('compensation_audit_logs', { employeeId: 1, performedAt: -1 }),
+
+    // ── payroll_concepts ─────────────────────────────────────────────────────
+    idx('payroll_concepts', { category: 1 }),
+    idx('payroll_concepts', { alertIfUndefined: 1, isActive: 1 }),
 
     // ── jobRequisitions ───────────────────────────────────────────────────────
     idx('jobRequisitions', { status: 1 }),

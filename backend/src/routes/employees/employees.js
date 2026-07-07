@@ -7,6 +7,7 @@ const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   listEmployees, getEmployee, createEmployee, updateEmployee,
   patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness,
+  listPayGroups, setPayGroupFrequency,
 } = require('./employeesFunctions');
 
 const SUPER_ADMIN  = 'super_admin';
@@ -24,6 +25,8 @@ const upload = multer({
 
 router.get('/org-chart',          allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getOrgChart));
 router.get('/payroll-readiness',  allowRoles([SUPER_ADMIN, HR_MANAGER]),            AsyncHandler(getPayrollReadiness));
+router.get('/pay-groups',         allowRoles([SUPER_ADMIN, HR_MANAGER]),            AsyncHandler(listPayGroups));
+router.patch('/pay-groups/:payGroup/frequency', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(setPayGroupFrequency));
 router.get('/',                   allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(listEmployees));
 router.get('/:id', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getEmployee));
 router.post('/', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(createEmployee));

@@ -3,6 +3,15 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 
+// Immutable log of every change to an employee's compensation — amount, effective dates,
+// active/inactive (added/removed), viewable by HR on the employee's payroll profile.
+const logCompensationChange = (employeeId, compensationId, conceptName, action, changes, userId) =>
+  insertOne('compensation_audit_logs', {
+    employeeId, compensationId, conceptName, action, changes,
+    performedBy: userId ?? null,
+    performedAt: new Date(),
+  }).catch(() => {});
+
 // List compensations for one employee
 const getEmployeeCompensations = async (req, res) => {
   const { employeeId } = req.params;
@@ -68,6 +77,8 @@ const addCompensation = async (req, res) => {
     updatedAt:     new Date(),
   };
   const result = await insertOne('employee_compensations', doc);
+  logCompensationChange(doc.employeeId, result.insertedId, doc.conceptName, 'added',
+    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
@@ -84,7 +95,16 @@ const updateCompensation = async (req, res) => {
   if (effectiveTo  !== undefined) update.effectiveTo  = effectiveTo ? new Date(effectiveTo) : null;
   if (notes        !== undefined) update.notes        = notes;
   if (isActive     !== undefined) update.isActive     = Boolean(isActive);
+
+  const changes = Object.keys(update)
+    .filter((f) => f !== 'updatedAt')
+    .map((field) => ({ field, oldValue: existing[field] ?? null, newValue: update[field] }))
+    .filter((c) => String(c.oldValue) !== String(c.newValue));
+
   await updateOne('employee_compensations', { _id: new ObjectId(id) }, { $set: update });
+  if (changes.length) {
+    logCompensationChange(existing.employeeId, existing._id, existing.conceptName, 'updated', changes, req.user?._id);
+  }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -93,7 +113,19 @@ const removeCompensation = async (req, res) => {
   const existing = await findOne('employee_compensations', { _id: new ObjectId(req.params.id) });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   await updateOne('employee_compensations', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  logCompensationChange(existing.employeeId, existing._id, existing.conceptName, 'removed',
+    [{ field: 'isActive', oldValue: true, newValue: false }], req.user?._id);
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
-module.exports = { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation };
+// Audit log for one employee's compensation history — viewable by HR on the employee's payroll profile
+const getCompensationAuditLog = async (req, res) => {
+  const logs = await findMany('compensation_audit_logs', { employeeId: new ObjectId(req.params.employeeId) }, { sort: { performedAt: -1 } });
+  const userIds = [...new Set(logs.filter((l) => l.performedBy).map((l) => String(l.performedBy)))].map((id) => new ObjectId(id));
+  const users = userIds.length ? await findMany('users', { _id: { $in: userIds } }, { projection: { name: 1 } }) : [];
+  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u.name]));
+  const enriched = logs.map((l) => ({ ...l, performedByName: l.performedBy ? (userMap[String(l.performedBy)] || 'Unknown') : 'System' }));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+module.exports = { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation, getCompensationAuditLog };

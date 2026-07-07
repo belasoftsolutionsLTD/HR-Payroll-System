@@ -110,6 +110,8 @@ const createEmployee = async (req, res) => {
     location:    req.body.location    || null,
     costCenter:  req.body.costCenter  || null,
     managerId:   req.body.managerId   ? new ObjectId(req.body.managerId) : null,
+    payGroup:    req.body.payGroup    || 'all',
+    payFrequency: req.body.payFrequency || 'monthly',
     status: 'active',
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -269,4 +271,40 @@ const getPayrollReadiness = async (req, res) => {
   });
 };
 
-module.exports = { listEmployees, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness };
+// ── Pay Groups (payroll schedule configuration) ───────────────────────────────
+// A pay group is just a free-form tag on the employee record (default 'all'); this endpoint
+// summarizes the distinct groups in use so HR can see headcount and pay frequency per group,
+// and bulk-set a frequency for everyone in one.
+
+const listPayGroups = async (req, res) => {
+  const employees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, { projection: { payGroup: 1, payFrequency: 1 } });
+  const groups = {};
+  for (const e of employees) {
+    const g = e.payGroup || 'all';
+    if (!groups[g]) groups[g] = { payGroup: g, employeeCount: 0, frequencies: {} };
+    groups[g].employeeCount++;
+    const f = e.payFrequency || 'monthly';
+    groups[g].frequencies[f] = (groups[g].frequencies[f] || 0) + 1;
+  }
+  const result = Object.values(groups).map((g) => ({
+    payGroup: g.payGroup,
+    employeeCount: g.employeeCount,
+    // 'mixed' if the group has employees on more than one frequency
+    payFrequency: Object.keys(g.frequencies).length === 1 ? Object.keys(g.frequencies)[0] : 'mixed',
+  }));
+  return returnFunction(res, 200, true, req.locale.success, result);
+};
+
+const setPayGroupFrequency = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['payFrequency'])) return;
+  if (!['weekly', 'biweekly', 'monthly'].includes(req.body.payFrequency)) {
+    return returnFunction(res, 400, false, 'payFrequency must be weekly, biweekly, or monthly.');
+  }
+  await global.dbo.collection('employees').updateMany(
+    { payGroup: req.params.payGroup },
+    { $set: { payFrequency: req.body.payFrequency, updatedAt: new Date() } }
+  );
+  return returnFunction(res, 200, true, `Pay frequency updated for "${req.params.payGroup}".`);
+};
+
+module.exports = { listEmployees, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness, listPayGroups, setPayGroupFrequency };
