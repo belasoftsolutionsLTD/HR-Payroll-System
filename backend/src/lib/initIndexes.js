@@ -33,11 +33,27 @@ async function initIndexes() {
     idx('expense_claims', { status: 1 }),
     idx('expense_claims', { payrollCycleId: 1 }, { sparse: true }),
 
-    // ── training ─────────────────────────────────────────────────────────────
-    idx('training_enrollments', { userId: 1 }),
-    idx('training_enrollments', { courseId: 1 }),
-    idx('training_enrollments', { userId: 1, courseId: 1 }, { unique: true }),
-    idx('training_enrollments', { status: 1 }),
+    // ── training / LMS ───────────────────────────────────────────────────────
+    idx('courses', { status: 1 }),
+    idx('courses', { category: 1 }),
+    idx('courses', { isMandatory: 1 }),
+    idx('courseModules', { courseId: 1, order: 1 }),
+    idx('quizzes', { moduleId: 1 }),
+    idx('quizzes', { courseId: 1 }),
+    idx('learningPaths', { status: 1 }),
+    idx('enrollments', { employeeId: 1 }),
+    idx('enrollments', { courseId: 1 }),
+    idx('enrollments', { learningPathId: 1 }),
+    idx('enrollments', { status: 1 }),
+    idx('enrollments', { employeeId: 1, courseId: 1 }, { unique: true, partialFilterExpression: { courseId: { $exists: true } } }),
+    idx('certificates', { employeeId: 1 }),
+    idx('certificates', { courseId: 1 }),
+    idx('certificates', { certificateNumber: 1 }, { unique: true }),
+    idx('externalCertificates', { employeeId: 1 }),
+    idx('externalCertificates', { status: 1 }),
+    idx('trainingAssignmentRules', { isActive: 1, trigger: 1 }),
+    idx('trainingFeedback', { courseId: 1 }),
+    idx('ruleExecutionLogs', { ruleId: 1, runAt: -1 }),
 
     // ── onboarding_tasks ─────────────────────────────────────────────────────
     idx('onboarding_tasks', { employeeId: 1 }),

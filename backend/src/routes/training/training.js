@@ -1,96 +1,108 @@
-const express  = require('express');
-const multer   = require('multer');
-const path     = require('path');
-const fs       = require('fs');
-const router   = express.Router();
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const router = express.Router();
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
-  listCourses, getCourse, createCourse, updateCourse, deleteCourse,
-  enrollInCourse, assignCourseToEmployees, getMyTraining, updateProgress, getTeamTraining,
-  startCourse, toggleObjective, downloadCertificate,
-  addMaterial, removeMaterial, saveMaterialProgress,
-  createQuiz, getQuiz, deleteQuiz, submitQuiz,
-  listPaths, createPath, updatePath, deletePath, enrollInPath,
+  createCourse, listCourses, getCourse, updateCourse, publishCourse, archiveCourse, addCourseAuthor,
+  listCatalog, getCatalogCourse, getModuleQuizForLearner,
+  addModule, updateModule, deleteModule,
+  createQuiz, updateQuiz,
+  createLearningPath, listLearningPaths, getLearningPath, updateLearningPath, archiveLearningPath,
+  assignTraining, listEnrollments, waiveEnrollment,
+  getMyEnrollments, updateMyProgress, submitQuizAttempt, submitCourseFeedback, getMyLearningPaths,
+  generateMyCertificate, getMyCertificates,
+  uploadExternalCertificate, getMyExternalCertificates, listExternalCertificates, verifyExternalCertificate,
+  createRule, listRules, updateRule, runRuleNow,
+  getTrainingOverview, getComplianceReport, getCourseAnalytics, getEmployeeTrainingRecord, getLeaderboard,
+  sendComplianceReminder,
 } = require('./trainingFunctions');
 
-const ALL  = ['super_admin', 'hr_manager', 'department_head', 'staff'];
-const HR   = ['super_admin', 'hr_manager'];
-const MGMT = ['super_admin', 'hr_manager', 'department_head'];
+const { SUPER_ADMIN, HR_MANAGER, ALL_ROLES } = require('../../constants/roles');
+const HR = [SUPER_ADMIN, HR_MANAGER];
 
-// ── Multer for material uploads ───────────────────────────────────────────────
-
+// ── Multer for module content uploads (documents/videos) ─────────────────────
 const trainingUploadDir = path.join(
   process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, '..', '..', '..', 'uploads'),
   'training'
 );
 if (!fs.existsSync(trainingUploadDir)) fs.mkdirSync(trainingUploadDir, { recursive: true });
 
-const materialStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, trainingUploadDir),
-  filename:    (_req, file, cb) => {
-    const safe = file.originalname.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '');
-    cb(null, `${Date.now()}-${safe}`);
-  },
-});
-
-const materialUpload = multer({
-  storage: materialStorage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB for videos
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, trainingUploadDir),
+    filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = ['application/pdf', 'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime'];
     cb(null, allowed.includes(file.mimetype));
   },
 });
 
-// ── Course routes ─────────────────────────────────────────────────────────────
+// ── Courses (HR admin only) ────────────────────────────────────────────────────
+router.post('/courses',              allowRoles(HR), AsyncHandler(createCourse));
+router.get('/courses',               allowRoles(HR), AsyncHandler(listCourses));
+router.get('/courses/:id',           allowRoles(HR), AsyncHandler(getCourse));
+router.patch('/courses/:id',         allowRoles(HR), AsyncHandler(updateCourse));
+router.post('/courses/:id/publish',  allowRoles(HR), AsyncHandler(publishCourse));
+router.delete('/courses/:id',        allowRoles(HR), AsyncHandler(archiveCourse));
+router.post('/courses/:id/authors',  allowRoles(HR), AsyncHandler(addCourseAuthor));
 
-router.get('/my',                allowRoles(ALL),  AsyncHandler(getMyTraining));
-router.get('/team',              allowRoles(MGMT), AsyncHandler(getTeamTraining));
-router.get('/courses',           allowRoles(ALL),  AsyncHandler(listCourses));
-router.get('/courses/:id',       allowRoles(ALL),  AsyncHandler(getCourse));
-router.post('/courses',          allowRoles(HR),   AsyncHandler(createCourse));
-router.put('/courses/:id',       allowRoles(HR),   AsyncHandler(updateCourse));
-router.delete('/courses/:id',    allowRoles(HR),   AsyncHandler(deleteCourse));
+// ── Modules / Quizzes (HR admin only) ─────────────────────────────────────────
+router.post('/courses/:id/modules',  allowRoles(HR), AsyncHandler(addModule));
+router.patch('/modules/:id',         allowRoles(HR), AsyncHandler(updateModule));
+router.delete('/modules/:id',        allowRoles(HR), AsyncHandler(deleteModule));
+router.post('/modules/:id/quiz',     allowRoles(HR), AsyncHandler(createQuiz));
+router.patch('/quizzes/:id',         allowRoles(HR), AsyncHandler(updateQuiz));
 
-// ── Enrollment routes ─────────────────────────────────────────────────────────
+// ── Learning Paths (HR admin only) ────────────────────────────────────────────
+router.post('/learning-paths',           allowRoles(HR), AsyncHandler(createLearningPath));
+router.get('/learning-paths',            allowRoles(HR), AsyncHandler(listLearningPaths));
+router.get('/learning-paths/:id',        allowRoles(HR), AsyncHandler(getLearningPath));
+router.patch('/learning-paths/:id',      allowRoles(HR), AsyncHandler(updateLearningPath));
+router.delete('/learning-paths/:id',     allowRoles(HR), AsyncHandler(archiveLearningPath));
 
-router.post('/courses/:id/enroll',   allowRoles(ALL),  AsyncHandler(enrollInCourse));
-router.post('/courses/:id/start',    allowRoles(ALL),  AsyncHandler(startCourse));
-router.post('/courses/:id/assign',   allowRoles(HR),   AsyncHandler(assignCourseToEmployees));
+// ── Enrollments (HR admin only) ───────────────────────────────────────────────
+router.post('/enrollments',             allowRoles(HR), AsyncHandler(assignTraining));
+router.get('/enrollments',              allowRoles(HR), AsyncHandler(listEnrollments));
+router.patch('/enrollments/:id/waive',  allowRoles(HR), AsyncHandler(waiveEnrollment));
 
-router.put('/enrollments/:id/progress',          allowRoles(ALL), AsyncHandler(updateProgress));
-router.patch('/enrollments/:id/objective',       allowRoles(ALL), AsyncHandler(toggleObjective));
-router.get('/enrollments/:id/certificate',       allowRoles(ALL), AsyncHandler(downloadCertificate));
-router.put('/enrollments/:id/material-progress', allowRoles(ALL), AsyncHandler(saveMaterialProgress));
+// ── Employee — own data only ──────────────────────────────────────────────────
+router.get('/my/enrollments',                    allowRoles(ALL_ROLES), AsyncHandler(getMyEnrollments));
+router.patch('/my/enrollments/:id/progress',     allowRoles(ALL_ROLES), AsyncHandler(updateMyProgress));
+router.post('/my/enrollments/:id/quiz-attempt',  allowRoles(ALL_ROLES), AsyncHandler(submitQuizAttempt));
+router.post('/my/enrollments/:id/feedback',      allowRoles(ALL_ROLES), AsyncHandler(submitCourseFeedback));
+router.get('/my/learning-paths',                  allowRoles(ALL_ROLES), AsyncHandler(getMyLearningPaths));
+router.get('/my/certificates',                             allowRoles(ALL_ROLES), AsyncHandler(getMyCertificates));
+router.post('/my/certificates/generate/:enrollmentId',     allowRoles(ALL_ROLES), AsyncHandler(generateMyCertificate));
+router.post('/my/external-certificates',  allowRoles(ALL_ROLES), AsyncHandler(uploadExternalCertificate));
+router.get('/my/external-certificates',   allowRoles(ALL_ROLES), AsyncHandler(getMyExternalCertificates));
 
-// ── Material management (HR only) ─────────────────────────────────────────────
+// ── External Certificates (HR admin only) ─────────────────────────────────────
+router.get('/external-certificates',              allowRoles(HR), AsyncHandler(listExternalCertificates));
+router.patch('/external-certificates/:id/verify',  allowRoles(HR), AsyncHandler(verifyExternalCertificate));
 
-router.post(
-  '/courses/:id/materials',
-  allowRoles(HR),
-  materialUpload.single('file'),
-  AsyncHandler(addMaterial)
-);
-router.delete(
-  '/courses/:id/materials/:materialId',
-  allowRoles(HR),
-  AsyncHandler(removeMaterial)
-);
+// ── Assignment Rules (HR admin only) ──────────────────────────────────────────
+router.post('/rules',          allowRoles(HR), AsyncHandler(createRule));
+router.get('/rules',           allowRoles(HR), AsyncHandler(listRules));
+router.patch('/rules/:id',     allowRoles(HR), AsyncHandler(updateRule));
+router.post('/rules/:id/run',  allowRoles(HR), AsyncHandler(runRuleNow));
 
-// ── Quiz routes ───────────────────────────────────────────────────────────────
+// ── Analytics (HR admin only) ─────────────────────────────────────────────────
+router.get('/analytics/overview',        allowRoles(HR), AsyncHandler(getTrainingOverview));
+router.get('/analytics/compliance',      allowRoles(HR), AsyncHandler(getComplianceReport));
+router.get('/analytics/course/:id',      allowRoles(HR), AsyncHandler(getCourseAnalytics));
+router.get('/analytics/employee/:id',    allowRoles(HR), AsyncHandler(getEmployeeTrainingRecord));
+router.get('/analytics/leaderboard',     allowRoles(HR), AsyncHandler(getLeaderboard));
+router.post('/analytics/compliance/remind', allowRoles(HR), AsyncHandler(sendComplianceReminder));
 
-router.get('/courses/:id/quiz',          allowRoles(ALL), AsyncHandler(getQuiz));
-router.put('/courses/:id/quiz',          allowRoles(HR),  AsyncHandler(createQuiz));
-router.delete('/courses/:id/quiz',       allowRoles(HR),  AsyncHandler(deleteQuiz));
-router.post('/courses/:id/quiz/submit',  allowRoles(ALL), AsyncHandler(submitQuiz));
-
-// ── Learning path routes ──────────────────────────────────────────────────────
-
-router.get('/paths',            allowRoles(ALL),  AsyncHandler(listPaths));
-router.post('/paths',           allowRoles(HR),   AsyncHandler(createPath));
-router.put('/paths/:id',        allowRoles(HR),   AsyncHandler(updatePath));
-router.delete('/paths/:id',     allowRoles(HR),   AsyncHandler(deletePath));
-router.post('/paths/:id/enroll', allowRoles(ALL), AsyncHandler(enrollInPath));
+// ── Catalog (employee — own data, published only) ────────────────────────────
+router.get('/catalog',      allowRoles(ALL_ROLES), AsyncHandler(listCatalog));
+router.get('/catalog/:id',  allowRoles(ALL_ROLES), AsyncHandler(getCatalogCourse));
+router.get('/my/modules/:moduleId/quiz', allowRoles(ALL_ROLES), AsyncHandler(getModuleQuizForLearner));
 
 module.exports = router;
+module.exports.upload = upload;
