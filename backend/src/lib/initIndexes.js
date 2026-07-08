@@ -32,6 +32,28 @@ async function initIndexes() {
     idx('expense_claims', { employeeId: 1, status: 1 }),
     idx('expense_claims', { status: 1 }),
     idx('expense_claims', { payrollCycleId: 1 }, { sparse: true }),
+    idx('expense_claims', { department: 1 }),
+    idx('expense_claims', { policyId: 1 }),
+
+    // ── expense_policies / procurement_policies ─────────────────────────────
+    idx('expense_policies', { isActive: 1, isDefault: 1 }),
+    idx('procurement_policies', { isActive: 1, isDefault: 1 }),
+
+    // ── Spend Management: Procurement ────────────────────────────────────────
+    idx('purchase_requests', { employeeId: 1, status: 1 }),
+    idx('purchase_requests', { department: 1 }),
+    idx('purchase_requests', { status: 1 }),
+    idx('vendors', { status: 1 }),
+    idx('vendors', { category: 1 }),
+    idx('purchase_orders', { requisitionId: 1 }),
+    idx('purchase_orders', { vendorId: 1 }),
+    idx('purchase_orders', { departmentId: 1 }),
+    idx('purchase_orders', { status: 1 }),
+    idx('purchase_orders', { poNumber: 1 }, { unique: true }),
+    idx('goods_receipts', { purchaseOrderId: 1 }),
+    idx('vendor_invoices', { purchaseOrderId: 1 }),
+    idx('vendor_invoices', { vendorId: 1 }),
+    idx('vendor_invoices', { status: 1 }),
 
     // ── training / LMS ───────────────────────────────────────────────────────
     idx('courses', { status: 1 }),
