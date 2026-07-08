@@ -9,6 +9,7 @@ const {
   listOnboarding, getEmployeeOnboarding, getOnboardingDetails, completeTask, clearEmployeeOnboarding,
   serveJdPdf,
   startOffboarding, listOffboarding, getEmployeeOffboarding, completeOffboardingTask, addOffboardingTask, clearEmployeeOffboarding,
+  getEmployeeSpendClearance,
   getOverdueTasks,
 } = require('./onboardingFunctions');
 
@@ -59,6 +60,7 @@ router.patch('/onboarding/tasks/:taskId',  AsyncHandler(completeTask));
 router.get('/offboarding',                              hrOnly, AsyncHandler(listOffboarding));
 router.post('/offboarding',                             hrOnly, AsyncHandler(startOffboarding));
 router.get('/offboarding/:employeeId',                  hrOnly, AsyncHandler(getEmployeeOffboarding));
+router.get('/offboarding/:employeeId/spend-clearance',  hrOnly, AsyncHandler(getEmployeeSpendClearance));
 router.post('/offboarding/:employeeId/tasks',           hrOnly, AsyncHandler(addOffboardingTask));
 router.patch('/offboarding/tasks/:taskId',              AsyncHandler(completeOffboardingTask));
 router.delete('/offboarding/:employeeId',               hrOnly, AsyncHandler(clearEmployeeOffboarding));
