@@ -5,7 +5,10 @@ const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../
 const path = require('path');
 const fs   = require('fs');
 const { createInboxItem, notifyHR, notifyManager } = require('../inbox/inboxFunctions');
-const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
+const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('../../lib/spend/approvalChain');
+const { resolvePolicy } = require('../../lib/spend/policyResolver');
+const { buildSpendScopeFilter, getDirectReportIds } = require('../../lib/spend/orgScope');
 
 // ── List Claims ───────────────────────────────────────────────────────────────
 
@@ -24,11 +27,15 @@ const listClaims = async (req, res) => {
       ? await findOne('employees', { _id: new ObjectId(req.user.employeeId) }, { projection: { department: 1 } })
       : null;
     if (deptRecord?.department) {
-      const deptEmps = await findMany('employees', { department: deptRecord.department }, { projection: { _id: 1 } });
-      filter.employeeId = { $in: deptEmps.map(e => e._id) };
+      filter.department = deptRecord.department;
     } else {
       return returnFunction(res, 200, true, req.locale.success, { data: [], total: 0, page: 1, totalPages: 0, stats: null });
     }
+  } else if (showAll && req.user?.employeeId) {
+    // "Team" tab for anyone with direct reports (employees.managerId) — not a role,
+    // a relationship. Falls back to own-only if this requester manages no one.
+    const reportIds = await getDirectReportIds(new ObjectId(req.user.employeeId));
+    filter.employeeId = { $in: [...reportIds, new ObjectId(req.user.employeeId)] };
   } else {
     filter.employeeId = req.user?.employeeId ? new ObjectId(req.user.employeeId) : null;
   }
@@ -86,20 +93,25 @@ const submitClaim = async (req, res) => {
   if (!validateRequiredFields(req, res, ['type'])) return;
   const { type, category, amount, currency, date, description, notes,
           destination, startDate, endDate, fromLocation, toLocation, distanceKm, isRoundTrip,
-          projectId, isBillable } = req.body;
+          projectId, isBillable, items } = req.body;
 
-  if (!['regular','per_diem','mileage'].includes(type)) return returnFunction(res, 400, false, 'Invalid expense type.');
+  if (!['regular','per_diem','mileage','itemized'].includes(type)) return returnFunction(res, 400, false, 'Invalid expense type.');
 
   const employeeId = req.user?.employeeId;
   if (!employeeId) {
     return returnFunction(res, 400, false, 'Your account is not linked to an employee profile. Ask your HR admin to create an employee record for you and link it to your account.');
   }
 
-  // Fetch policy for rate lookups
-  const policy = await findOne('expense_policies', {}) ?? {};
+  // Resolve the applicable policy for this employee — most specific targeting wins
+  // (employeeId > role > department), falling back to the org's default policy.
+  const employeeDoc = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { department: 1 } });
+  const policy = await resolvePolicy('expense_policies', {
+    employeeId, role: req.user?.role, department: employeeDoc?.department,
+  }) ?? {};
 
   let finalAmount = Number(amount) || 0;
   let days = 0;
+  let lineItems = null;
 
   if (type === 'per_diem') {
     if (!destination || !startDate || !endDate) return returnFunction(res, 400, false, 'Per diem requires destination, startDate, endDate.');
@@ -115,7 +127,33 @@ const submitClaim = async (req, res) => {
     finalAmount = km * rate;
   }
 
-  // Policy violation check
+  if (type === 'itemized') {
+    if (!Array.isArray(items) || !items.length) return returnFunction(res, 400, false, 'Add at least one line item.');
+    lineItems = items.map((it) => ({
+      id: it.id || new ObjectId().toString(),
+      categoryId: it.categoryId || '',
+      categoryName: it.categoryName || it.categoryId || 'Other',
+      description: it.description || '',
+      amount: Number(it.amount) || 0,
+      currency: it.currency || currency || 'KES',
+      expenseDate: it.expenseDate ? new Date(it.expenseDate) : new Date(),
+      receiptFile: it.receiptFile || null,
+      merchantName: it.merchantName || null,
+      notes: it.notes || null,
+      policyViolation: null,
+    }));
+    finalAmount = lineItems.reduce((s, it) => s + it.amount, 0);
+
+    // Per-item policy violation check against the same categoryLimits used by 'regular'
+    for (const it of lineItems) {
+      const catLimit = policy.categoryLimits?.find((l) => l.category === it.categoryName || l.category === it.categoryId);
+      if (catLimit?.maxPerClaim && it.amount > catLimit.maxPerClaim) {
+        it.policyViolation = `Exceeds per-item limit of ${catLimit.maxPerClaim} for ${it.categoryName}.`;
+      }
+    }
+  }
+
+  // Policy violation check (single-item types)
   let isPolicyViolation = false;
   let violationReason   = null;
   if (type === 'regular' && category) {
@@ -125,11 +163,22 @@ const submitClaim = async (req, res) => {
       violationReason   = `Exceeds per-claim limit of ${catLimit.maxPerClaim} for ${category}.`;
     }
   }
+  if (type === 'itemized' && lineItems.some((it) => it.policyViolation)) {
+    isPolicyViolation = true;
+    violationReason = 'One or more line items exceed their category limit.';
+  }
 
   const receiptFile = req.file ? req.file.filename : null;
 
+  // Auto-approve: claims under the policy's configured threshold skip the approval
+  // chain entirely (an already-declared policy field that had no effect until now).
+  const autoApprove = policy.autoApproveUnder != null && finalAmount <= policy.autoApproveUnder;
+  const now = new Date();
+  const approvalChain = autoApprove ? [] : await buildApprovalChain(new ObjectId(employeeId), finalAmount, policy);
+
   const doc = {
     employeeId:       new ObjectId(employeeId),
+    department:       employeeDoc?.department || null,
     type,
     category:         category || null,
     amount:           finalAmount,
@@ -148,37 +197,49 @@ const submitClaim = async (req, res) => {
     isRoundTrip:      Boolean(isRoundTrip),
     projectId:        projectId     ? new ObjectId(projectId) : null,
     isBillable:       Boolean(isBillable),
+    items:            lineItems,
     isPolicyViolation,
     violationReason,
-    status:           'submitted',
-    approvedBy:       null, approvedAt: null,
+    policyId:         policy._id || null,
+    approvalChain,
+    currentApprovalLevel: approvalChain[0]?.level ?? 0,
+    status:           autoApprove ? 'approved' : 'submitted',
+    approvedBy:       null, approvedAt: autoApprove ? now : null,
     rejectedBy:       null, rejectedAt: null, rejectionReason: null,
     reimbursedAt:     null,
     payrollCycleId:   null,
-    createdAt:        new Date(), updatedAt: new Date(),
+    createdAt:        now, updatedAt: now,
   };
 
   const result = await insertOne('expense_claims', doc);
 
-  // Inbox: notify manager that an expense claim was submitted
+  // Inbox: notify manager that an expense claim was submitted (skip if auto-approved)
   const empForInbox = await findOne('employees', { _id: doc.employeeId }, { projection: { fullName: 1 } });
   const empNameInbox = empForInbox?.fullName || 'An employee';
-  const expensePayload = {
-    type: 'expense', subType: 'expense_claim',
-    title: `Expense claim from ${empNameInbox}`,
-    subtitle: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type} · ${description || ''}`.trim().replace(/·\s*$/, ''),
-    referenceId: result.insertedId, referenceModel: 'expense_claims',
-    requiresAction: true, triggeredBy: req.user._id,
-  };
-  await notifyManager(doc.employeeId, expensePayload);
-  notifyHR(expensePayload).catch(() => {});
-  notifyByRoles(['super_admin', 'hr_manager'], {
-    title: `Expense claim from ${empNameInbox}`,
-    body: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type}`,
-    type: 'expense',
-  }).catch(() => {});
+  if (!autoApprove) {
+    const expensePayload = {
+      type: 'expense', subType: 'expense_claim',
+      title: `Expense claim from ${empNameInbox}`,
+      subtitle: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type} · ${description || ''}`.trim().replace(/·\s*$/, ''),
+      referenceId: result.insertedId, referenceModel: 'expense_claims',
+      requiresAction: true, triggeredBy: req.user._id,
+    };
+    await notifyManager(doc.employeeId, expensePayload);
+    notifyHR(expensePayload).catch(() => {});
+    notifyByRoles(['super_admin', 'hr_manager'], {
+      title: `Expense claim from ${empNameInbox}`,
+      body: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type}`,
+      type: 'expense',
+    }).catch(() => {});
+  } else {
+    notifyEmployee(doc.employeeId, {
+      title: 'Expense Claim Auto-Approved',
+      body: `Your claim of ${currency || 'KES'} ${finalAmount.toLocaleString()} was auto-approved (under the policy threshold).`,
+      type: 'expense',
+    }).catch(() => {});
+  }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, isPolicyViolation });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, isPolicyViolation, autoApproved: autoApprove });
 };
 
 // ── Update Claim ──────────────────────────────────────────────────────────────
@@ -189,13 +250,26 @@ const updateClaim = async (req, res) => {
   if (claim.status !== 'submitted' && claim.status !== 'draft') return returnFunction(res, 400, false, 'Cannot edit after approval.');
   const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
   if (!isHR && String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
-  const { amount, description, category, date, notes } = req.body;
+  const { amount, description, category, date, notes, items } = req.body;
   const update = { updatedAt: new Date() };
-  if (amount)      update.amount      = Number(amount);
   if (description) update.description = description;
   if (category)    update.category    = category;
   if (date)        update.date        = new Date(date);
   if (notes)       update.notes       = notes;
+  if (claim.type === 'itemized' && Array.isArray(items)) {
+    update.items = items.map((it) => ({
+      id: it.id || new ObjectId().toString(),
+      categoryId: it.categoryId || '', categoryName: it.categoryName || it.categoryId || 'Other',
+      description: it.description || '', amount: Number(it.amount) || 0,
+      currency: it.currency || claim.currency || 'KES',
+      expenseDate: it.expenseDate ? new Date(it.expenseDate) : new Date(),
+      receiptFile: it.receiptFile || null, merchantName: it.merchantName || null,
+      notes: it.notes || null, policyViolation: null,
+    }));
+    update.amount = update.items.reduce((s, it) => s + it.amount, 0);
+  } else if (amount) {
+    update.amount = Number(amount);
+  }
   await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
@@ -240,7 +314,14 @@ const disputeClaim = async (req, res) => {
   return returnFunction(res, 200, true, 'Claim dispute submitted.');
 };
 
-// ── Approve ───────────────────────────────────────────────────────────────────
+// ── Approve / Reject — act on the current approval-chain level ──────────────
+// "Manager" isn't a role in this app — the resolved chain entry's approverId (an
+// employee's managerId, resolved to their user account) is who's actually authorized
+// for level 1. HR/super_admin can always override any level; a department_head can
+// always act on claims from their own department even if the auto-resolved chain
+// didn't specifically name them (e.g. no matching department_head user existed at
+// submit time). Claims created before this feature shipped have no approvalChain —
+// they fall through to the HR/dept-head-only override path, same as before.
 
 const approveClaim = async (req, res) => {
   const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
@@ -249,20 +330,53 @@ const approveClaim = async (req, res) => {
   if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'You cannot approve your own expense claim.');
   }
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'approved', approvedBy: req.user?._id ?? null, approvedAt: new Date(), updatedAt: new Date() },
-  });
-  if (claim.employeeId) {
+
+  const levelEntry = findCurrentLevelEntry(claim);
+  if (!(await canActOnLevel(req, claim, levelEntry))) {
+    return returnFunction(res, 403, false, 'You are not authorized to approve this claim at its current stage.');
+  }
+
+  const now = new Date();
+  const update = { updatedAt: now };
+  let nextPending = null;
+
+  if (levelEntry) {
+    const chain = claim.approvalChain.map((a) => a.level === levelEntry.level
+      ? { ...a, status: 'approved', actedAt: now, comment: req.body?.comment || null }
+      : a);
+    nextPending = chain.find((a) => a.status === 'pending' && a.level > levelEntry.level) || null;
+    update.approvalChain = chain;
+  }
+
+  if (nextPending) {
+    update.currentApprovalLevel = nextPending.level;
+  } else {
+    update.status = 'approved';
+    update.approvedBy = req.user?._id ?? null;
+    update.approvedAt = now;
+  }
+
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
+
+  if (nextPending) {
+    notifyUser(nextPending.approverId, {
+      title: 'Expense Claim Awaiting Your Approval',
+      body: `A ${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()} expense claim has escalated to you for approval.`,
+      type: 'expense',
+    }).catch(() => {});
+  } else if (claim.employeeId) {
     notifyEmployee(claim.employeeId, {
       title: 'Expense Claim Approved',
       body: `Your expense claim${claim.description ? ` "${claim.description}"` : ''} of ${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()} has been approved.`,
       type: 'expense',
     }).catch(() => {});
   }
-  return returnFunction(res, 200, true, 'Claim approved.');
+  return returnFunction(res, 200, true, nextPending ? 'Approved — escalated to the next approval level.' : 'Claim approved.');
 };
 
 // ── Reject ────────────────────────────────────────────────────────────────────
+// Rejection at any level stops the whole claim — unlike approval, it doesn't require
+// walking every remaining level.
 
 const rejectClaim = async (req, res) => {
   if (!validateRequiredFields(req, res, ['reason'])) return;
@@ -272,9 +386,23 @@ const rejectClaim = async (req, res) => {
   if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'You cannot reject your own expense claim.');
   }
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'rejected', rejectedBy: req.user?._id ?? null, rejectedAt: new Date(), rejectionReason: req.body.reason, updatedAt: new Date() },
-  });
+
+  const levelEntry = findCurrentLevelEntry(claim);
+  if (!(await canActOnLevel(req, claim, levelEntry))) {
+    return returnFunction(res, 403, false, 'You are not authorized to reject this claim at its current stage.');
+  }
+
+  const now = new Date();
+  const update = {
+    status: 'rejected', rejectedBy: req.user?._id ?? null, rejectedAt: now,
+    rejectionReason: req.body.reason, updatedAt: now,
+  };
+  if (levelEntry) {
+    update.approvalChain = claim.approvalChain.map((a) => a.level === levelEntry.level
+      ? { ...a, status: 'rejected', actedAt: now, comment: req.body.reason }
+      : a);
+  }
+  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
   if (claim.employeeId) {
     notifyEmployee(claim.employeeId, {
       title: 'Expense Claim Rejected',
@@ -307,7 +435,10 @@ const exportClaims = async (req, res) => {
 const getAnalytics = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
   const start = new Date(year, 0, 1); const end = new Date(year + 1, 0, 1);
-  const filter = { createdAt: { $gte: start, $lt: end }, status: { $in: ['approved','reimbursed'] } };
+  // super_admin/hr: org-wide. department_head: their department only. Anyone with
+  // direct reports (employees.managerId): their team only. Everyone else: own data.
+  const scope = await buildSpendScopeFilter(req);
+  const filter = { ...scope, createdAt: { $gte: start, $lt: end }, status: { $in: ['approved','reimbursed'] } };
 
   const [byCategory, byMonth, byDept, topSpenders] = await Promise.all([
     global.dbo.collection('expense_claims').aggregate([
@@ -346,10 +477,78 @@ const getAnalytics = async (req, res) => {
 };
 
 // ── Policy ────────────────────────────────────────────────────────────────────
+// GET/PUT /expense-claims/policy (singular) — the original single-policy editor route,
+// kept working unchanged: it always reads/writes the org's default policy. New,
+// targeted policies (by role/department/employee) live under the plural
+// /expense-claims/policies routes below and never touch the default.
 
 const getPolicy = async (req, res) => {
-  const policy = await findOne('expense_policies', {});
+  const policy = await findOne('expense_policies', { isDefault: true }) || await findOne('expense_policies', {});
   return returnFunction(res, 200, true, req.locale.success, policy ?? {});
+};
+
+// ── Multi-policy CRUD (targeted policies) ────────────────────────────────────
+
+const listPolicies = async (req, res) => {
+  const policies = await findMany('expense_policies', {}, { sort: { isDefault: -1, createdAt: -1 } });
+  return returnFunction(res, 200, true, req.locale.success, policies);
+};
+
+const getPolicyById = async (req, res) => {
+  const policy = await findOne('expense_policies', { _id: new ObjectId(req.params.id) });
+  if (!policy) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.success, policy);
+};
+
+const createPolicy = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name'])) return;
+  const { name, description, appliesTo, categories, approvalChain, isDefault,
+          perDiemRates, defaultPerDiemRate, mileageRate, categoryLimits, autoApproveUnder,
+          hrApprovalThreshold, reimbursementCycle } = req.body;
+
+  if (isDefault) {
+    await global.dbo.collection('expense_policies').updateMany({}, { $set: { isDefault: false } });
+  }
+
+  const doc = {
+    name, description: description || null,
+    isDefault: Boolean(isDefault),
+    appliesTo: appliesTo || {},
+    categories: categories || [],
+    approvalChain: approvalChain || [],
+    perDiemRates: perDiemRates || [],
+    defaultPerDiemRate: defaultPerDiemRate ?? null,
+    mileageRate: mileageRate ?? null,
+    categoryLimits: categoryLimits || [],
+    autoApproveUnder: autoApproveUnder ?? null,
+    hrApprovalThreshold: hrApprovalThreshold ?? null,
+    reimbursementCycle: reimbursementCycle || 'withNextPayroll',
+    isActive: true,
+    createdBy: req.user?._id ?? null,
+    createdAt: new Date(), updatedAt: new Date(),
+  };
+  const result = await insertOne('expense_policies', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const updatePolicyById = async (req, res) => {
+  const existing = await findOne('expense_policies', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  if (req.body.isDefault) {
+    await global.dbo.collection('expense_policies').updateMany({ _id: { $ne: existing._id } }, { $set: { isDefault: false } });
+  }
+  const update = { ...req.body, updatedAt: new Date() };
+  delete update._id;
+  await updateOne('expense_policies', { _id: existing._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deletePolicyById = async (req, res) => {
+  const existing = await findOne('expense_policies', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  if (existing.isDefault) return returnFunction(res, 400, false, 'Cannot deactivate the default policy — mark another policy as default first.');
+  await updateOne('expense_policies', { _id: existing._id }, { $set: { isActive: false, updatedAt: new Date() } });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 // ── Mark Reimbursed ───────────────────────────────────────────────────────────
@@ -372,12 +571,13 @@ const markReimbursed = async (req, res) => {
 };
 
 const updatePolicy = async (req, res) => {
-  const existing = await findOne('expense_policies', {});
-  const update = { ...req.body, updatedAt: new Date() };
+  const existing = await findOne('expense_policies', { isDefault: true }) || await findOne('expense_policies', {});
+  const update = { ...req.body, isDefault: true, updatedAt: new Date() };
+  delete update._id;
   if (existing) {
     await updateOne('expense_policies', { _id: existing._id }, { $set: update });
   } else {
-    await insertOne('expense_policies', { ...update, createdAt: new Date() });
+    await insertOne('expense_policies', { ...update, name: update.name || 'Default Policy', appliesTo: {}, isActive: true, createdBy: req.user?._id ?? null, createdAt: new Date() });
   }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
@@ -397,4 +597,8 @@ const calculateDistance = async (req, res) => {
   return returnFunction(res, 200, true, 'Distance calculated.', { distanceKm, distanceText: element.distance.text, durationText: element.duration.text });
 };
 
-module.exports = { listClaims, getClaim, submitClaim, updateClaim, deleteClaim, disputeClaim, approveClaim, rejectClaim, markReimbursed, exportClaims, getAnalytics, getPolicy, updatePolicy, calculateDistance };
+module.exports = {
+  listClaims, getClaim, submitClaim, updateClaim, deleteClaim, disputeClaim, approveClaim, rejectClaim,
+  markReimbursed, exportClaims, getAnalytics, getPolicy, updatePolicy, calculateDistance,
+  listPolicies, createPolicy, getPolicyById, updatePolicyById, deletePolicyById,
+};

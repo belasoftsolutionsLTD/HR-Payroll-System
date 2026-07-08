@@ -6,6 +6,7 @@ const { validateRequiredFields } = require('../../functions/Route Fns/routeFns')
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
+const { getOpenSpendItems } = require('../../lib/spend/clearanceCheck');
 
 // ── Templates ──────────────────────────────────────────────────────────────────
 const listTemplates = async (req, res) => {
@@ -333,6 +334,7 @@ const DEFAULT_OFFBOARDING_TASKS = [
   { taskTitle: 'Revoke email access',             taskSection: 'last_day',        assignedDepartment: 'IT',       daysFromNow: 0   },
   { taskTitle: 'Revoke system & platform access', taskSection: 'last_day',        assignedDepartment: 'IT',       daysFromNow: 0   },
   { taskTitle: 'Process final payslip',           taskSection: 'last_day',        assignedDepartment: 'HR',       daysFromNow: 0   },
+  { taskTitle: 'Clear outstanding expense claims and purchase requests', taskSection: 'last_day', assignedDepartment: 'Finance', taskType: 'spend_clearance', daysFromNow: 0 },
   { taskTitle: 'Issue reference letter',          taskSection: 'after_departure', assignedDepartment: 'HR',       daysFromNow: 7   },
   { taskTitle: 'Send alumni network invite',      taskSection: 'after_departure', assignedDepartment: 'HR',       daysFromNow: 14  },
 ];
@@ -355,6 +357,7 @@ const startOffboarding = async (req, res) => {
       taskTitle: t.taskTitle,
       taskSection: t.taskSection,
       assignedDepartment: t.assignedDepartment,
+      taskType: t.taskType || null,
       dueDate: due.toISOString().slice(0, 10),
       status: 'pending',
       createdAt: new Date(),
@@ -400,6 +403,13 @@ const getEmployeeOffboarding = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, tasks);
 };
 
+// Lets the frontend show exactly what's blocking spend clearance before HR even
+// attempts to complete that task.
+const getEmployeeSpendClearance = async (req, res) => {
+  const result = await getOpenSpendItems(new ObjectId(req.params.employeeId));
+  return returnFunction(res, 200, true, req.locale.success, result);
+};
+
 const completeOffboardingTask = async (req, res) => {
   const task = await findOne('offboarding_tasks', { _id: new ObjectId(req.params.taskId) });
   if (!task) return returnFunction(res, 404, false, req.locale.notFound);
@@ -407,6 +417,17 @@ const completeOffboardingTask = async (req, res) => {
   const isHR = ['super_admin', 'hr_manager', 'department_head'].includes(req.user?.role);
   if (!isHR && String(task.employeeId) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
+  }
+
+  // The spend-clearance task can't be marked complete while the employee still has
+  // an unresolved expense claim or purchase request — offboarding must not finish
+  // with open financial exposure.
+  if (task.taskType === 'spend_clearance') {
+    const { hasOpenItems, openClaims, openRequests } = await getOpenSpendItems(task.employeeId);
+    if (hasOpenItems) {
+      return returnFunction(res, 400, false,
+        `Cannot clear: ${openClaims.length} expense claim(s) and ${openRequests.length} purchase request(s) are still open. Approve or reject them first.`);
+    }
   }
 
   await updateOne(
@@ -480,5 +501,6 @@ module.exports = {
   listOnboarding, getEmployeeOnboarding, getOnboardingDetails, completeTask, clearEmployeeOnboarding,
   serveJdPdf,
   startOffboarding, listOffboarding, getEmployeeOffboarding, completeOffboardingTask, addOffboardingTask, clearEmployeeOffboarding,
+  getEmployeeSpendClearance,
   getOverdueTasks,
 };
