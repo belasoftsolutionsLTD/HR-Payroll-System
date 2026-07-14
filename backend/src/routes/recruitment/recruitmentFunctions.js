@@ -7,7 +7,7 @@ const {
 const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
-const { getDefaultOnboardingTasks } = require('../../functions/HR/onboardingTemplates');
+const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
 const { sendEmail } = require('../../services/emailService');
 const { fireAutoActions } = require('../../lib/recruitment/autoActions');
 const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
@@ -238,34 +238,34 @@ const hireCandidate = async (application, requisition, actingUser) => {
     department: requisition.department,
     dateOfHire: hireDate,
     contractEndDate: null,
-    salaryGrade: application.offerDetails?.salary || requisition.salaryRange?.min || null,
+    jobGroupId: null, // HR assigns a job group post-hire via the employee's Work tab — flagged by the payroll readiness check until then
+    grossPay: application.offerDetails?.salary || requisition.salaryRange?.min || null,
     nextOfKin: null,
     profilePhoto: null,
     documents: candidate?.resumeUrl
       ? [{ docId: new ObjectId(), docType: 'CV', fileName: 'resume', filePath: candidate.resumeUrl, uploadedAt: new Date() }]
       : [],
-    staffCategory: 'non-teaching',
     status: 'active',
     createdAt: new Date(),
     updatedAt: new Date(),
   };
   const empResult = await insertOne('employees', empDoc);
 
-  await insertOne('leave_balances', {
-    employeeId: empResult.insertedId,
-    year: hireDate.getFullYear(),
-    balances: {
-      annual: { allocated: 21, used: 0, remaining: 21 },
-      sick: { allocated: 30, used: 0, remaining: 30 },
-      maternity: { allocated: 90, used: 0, remaining: 90 },
-      paternity: { allocated: 14, used: 0, remaining: 14 },
-      unpaid: { allocated: null, used: 0, remaining: null },
-      emergency: { allocated: 3, used: 0, remaining: 3 },
-    },
-  });
+  // One leave_balances record per active leave type — builds up via the monthly
+  // accrual cron (lib/leave/accrualEngine.js), same as direct employee creation.
+  const activeLeaveTypes = await global.dbo.collection('leave_types').find({ isActive: true }, { projection: { _id: 1 } }).toArray();
+  if (activeLeaveTypes.length) {
+    await global.dbo.collection('leave_balances').insertMany(activeLeaveTypes.map(lt => ({
+      employeeId: empResult.insertedId, leaveTypeId: lt._id, year: hireDate.getFullYear(),
+      openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, carryOverExpiry: null,
+      closingBalance: 0, lastAccrualDate: null, updatedAt: new Date(),
+    })));
+  }
 
-  const tasks = getDefaultOnboardingTasks(empResult.insertedId, hireDate.toISOString());
-  await global.dbo.collection('onboarding_tasks').insertMany(tasks);
+  const onboardingTemplate = await resolveDefaultTemplate(empDoc.department);
+  if (onboardingTemplate) {
+    await initiateOnboarding(empResult.insertedId, onboardingTemplate._id, hireDate, null).catch(() => {});
+  }
 
   await updateOne('applications', { _id: application._id }, { $set: { status: 'hired', updatedAt: new Date() } });
 

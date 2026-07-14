@@ -271,10 +271,19 @@ async function lockCycleInternal(req, res, cycle) {
   await global.dbo.collection('payroll_results').deleteMany({ cycleId: cycle._id });
 
   let totalGross = 0, totalDeductions = 0, totalNet = 0, totalEmployerCost = 0, exceptionCount = 0;
+  const matchedTimesheetIds = [];
+  const loanApplications = []; // { loanId, installmentApplied } — balance decremented after lock succeeds
 
   // Load tax config once for all employees (avoids N+1 DB calls)
   const taxConfig = await loadTaxConfig();
   const taxCalc   = buildCalculator(taxConfig);
+
+  // Job-group-scoped Allowances/Deductions (Payroll Settings) — fetched once per cycle,
+  // filtered per employee below by jobGroupId. Empty jobGroupIds = applies to everyone.
+  const jobGroupAllowanceDefs = await findMany('fixed_allowances', { isEnabled: true }, {});
+  const jobGroupDeductionDefs = await findMany('deduction_types', { isEnabled: true }, {});
+  const matchesJobGroup = (def, emp) =>
+    !def.jobGroupIds || def.jobGroupIds.length === 0 || def.jobGroupIds.map(String).includes(String(emp.jobGroupId));
 
   // Get all required alert concepts
   const alertConcepts = await findMany('payroll_concepts', { alertIfUndefined: true, isActive: true }, {});
@@ -301,8 +310,26 @@ async function lockCycleInternal(req, res, cycle) {
     const benefits             = comps.filter(c => c.category === 'benefits');
     const employerContributions= comps.filter(c => c.category === 'employer_contributions');
 
-    const grossPay           = earnings.reduce((s, c) => s + (c.amount || 0), 0);
-    const totalDeds          = deductions.reduce((s, c) => s + (c.amount || 0), 0);
+    // Job-group-scoped Allowances (Payroll Settings) — taxable ones flow into gross
+    // pay like any other earning; non-taxable ones are added straight to net pay
+    // further down, after the statutory tax calc, so they never inflate PAYE/NSSF/SHA/AHL.
+    const jgAllowanceItems = jobGroupAllowanceDefs.filter(d => matchesJobGroup(d, emp)).map(d => ({
+      conceptId: null, conceptName: d.name, conceptCode: 'JG-ALW', subCategory: 'fixed_pay',
+      amount: d.amount || 0, isTaxable: d.isTaxable !== false, source: 'job_group',
+    }));
+    const taxableJgAllowanceTotal    = jgAllowanceItems.filter(i => i.isTaxable).reduce((s, i) => s + i.amount, 0);
+    const nonTaxableJgAllowanceTotal = jgAllowanceItems.filter(i => !i.isTaxable).reduce((s, i) => s + i.amount, 0);
+
+    // Job-group-scoped Deductions — fixed amounts resolve now; percentage-of-gross ones
+    // resolve further down once adjustedGross is known.
+    const jgDeductionDefsForEmp = jobGroupDeductionDefs.filter(d => matchesJobGroup(d, emp));
+    const jgFixedDeductionItems = jgDeductionDefsForEmp.filter(d => d.type !== 'percentage').map(d => ({
+      conceptId: null, conceptName: d.name, conceptCode: 'JG-DED', subCategory: 'other_withholding',
+      amount: d.amount || 0, source: 'job_group',
+    }));
+    const jgFixedDeductionTotal = jgFixedDeductionItems.reduce((s, i) => s + i.amount, 0);
+
+    const grossPay           = earnings.reduce((s, c) => s + (c.amount || 0), 0) + taxableJgAllowanceTotal;
     const empContribTotal    = employerContributions.reduce((s, c) => s + (c.amount || 0), 0);
 
     // Real proration — new hires / mid-cycle terminations only get paid for days actually
@@ -340,18 +367,48 @@ async function lockCycleInternal(req, res, cycle) {
       exceptions.push({ type: 'pro_rata', message: `${label} — pay prorated to ${proration.workedDays}/${proration.totalDays} days.`, severity: 'warning' });
     }
 
-    // Pull overtime from attendance records for this cycle period
-    const attendanceRecs = await global.dbo.collection('attendance_records').find({
+    // Pull overtime from approved, not-yet-processed timesheets covering this cycle
+    // period — not raw attendance_records. A timesheet must go through the manager
+    // approval gate before its overtime hours affect pay, and each one is stamped
+    // with this cycle's id below so it's never counted into a payroll run twice.
+    const cycleTimesheets = await global.dbo.collection('timesheets').find({
       employeeId: emp._id,
-      date: {
-        $gte: cycle.period.startDate.toISOString().slice(0, 10),
-        $lte: cycle.period.endDate.toISOString().slice(0, 10),
-      },
+      status: 'approved',
+      payrollRunId: null,
+      weekStart: { $gte: cycle.period.startDate, $lte: cycle.period.endDate },
     }).toArray();
-    const overtimeHours  = attendanceRecs.reduce((sum, r) => sum + (r.overtimeHours || 0), 0);
+    matchedTimesheetIds.push(...cycleTimesheets.map((t) => t._id));
+    const overtimeMinutesTotal = cycleTimesheets.reduce((sum, t) => sum + (t.overtimeMinutes || 0), 0);
+    const overtimeHours  = Math.round((overtimeMinutesTotal / 60) * 100) / 100;
     const overtimeRate   = emp.grossPay ? (emp.grossPay / 22 / 8) * 1.5 : 0;
     const overtimeAmount = Math.round(overtimeHours * overtimeRate);
     const adjustedGross  = proratedGross + overtimeAmount;
+
+    // Percentage-of-gross job-group deductions resolve now that adjustedGross is known.
+    const jgPercentageDeductionItems = jgDeductionDefsForEmp.filter(d => d.type === 'percentage').map(d => ({
+      conceptId: null, conceptName: d.name, conceptCode: 'JG-DED', subCategory: 'other_withholding',
+      amount: Math.round(adjustedGross * (d.percentage || 0) / 100 * 100) / 100, source: 'job_group',
+    }));
+    const jgPercentageDeductionTotal = jgPercentageDeductionItems.reduce((s, i) => s + i.amount, 0);
+
+    // Staff loans — unlike a flat employee_compensations deduction, a loan has a running
+    // balance. Deduct min(installment, balanceRemaining) so the final payment never
+    // overshoots what's actually still owed; the balance itself is only decremented (and
+    // the loan marked completed) after this cycle successfully locks, mirroring how
+    // timesheets are only stamped processed once the lock actually goes through.
+    const activeLoans = await global.dbo.collection('staff_loans').find({ employeeId: emp._id, status: 'active' }).toArray();
+    const loanDeductionItems = activeLoans.map((loan) => {
+      const installmentApplied = Math.min(loan.monthlyInstallment, loan.balanceRemaining);
+      loanApplications.push({ loanId: loan._id, installmentApplied });
+      return {
+        conceptId: null, conceptName: loan.loanType || 'Staff Loan', conceptCode: 'LOAN', subCategory: 'other_withholding',
+        amount: installmentApplied, source: 'loan', loanId: loan._id,
+        balanceAfter: Math.round((loan.balanceRemaining - installmentApplied) * 100) / 100,
+      };
+    }).filter((i) => i.amount > 0);
+    const loanDeductionTotal = loanDeductionItems.reduce((s, i) => s + i.amount, 0);
+
+    const totalDeds = deductions.reduce((s, c) => s + (c.amount || 0), 0) + jgFixedDeductionTotal + jgPercentageDeductionTotal + loanDeductionTotal;
 
     // Pull approved expense reimbursements for this cycle period
     const expenseDocs = await global.dbo.collection('expense_claims').find({
@@ -374,15 +431,19 @@ async function lockCycleInternal(req, res, cycle) {
     // the daily rate is the standard 22-working-day monthly rate, matching the overtime calc.
     const leaveDocs = await global.dbo.collection('leave_requests').find({
       employeeId: emp._id, status: 'approved',
-      startDate: { $lte: cycleEndStr }, endDate: { $gte: cycleStartStr },
+      startDate: { $lte: cycle.period.endDate }, endDate: { $gte: cycle.period.startDate },
     }).toArray();
+    const leaveTypeIds = [...new Set(leaveDocs.map(lr => String(lr.leaveTypeId)))].map(id => new ObjectId(id));
+    const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }).toArray();
+    const leaveTypeById = Object.fromEntries(leaveTypes.map(lt => [String(lt._id), lt]));
     const dailyRate = grossPay ? grossPay / 22 : 0;
     const leave = leaveDocs.map((lr) => {
-      const clampedStart = lr.startDate < cycleStartStr ? cycleStartStr : lr.startDate;
-      const clampedEnd    = lr.endDate   > cycleEndStr   ? cycleEndStr   : lr.endDate;
+      const clampedStart = lr.startDate < cycle.period.startDate ? cycleStartStr : lr.startDate.toISOString().slice(0, 10);
+      const clampedEnd    = lr.endDate   > cycle.period.endDate   ? cycleEndStr   : lr.endDate.toISOString().slice(0, 10);
       const days = calculateWorkingDays(clampedStart, clampedEnd, holidaySet);
-      const amount = lr.leaveType === 'unpaid' ? Math.round(dailyRate * days * 100) / 100 : 0;
-      return { leaveType: lr.leaveType, startDate: clampedStart, endDate: clampedEnd, days, amount };
+      const leaveType = leaveTypeById[String(lr.leaveTypeId)];
+      const amount = leaveType && !leaveType.isPaid ? Math.round(dailyRate * days * 100) / 100 : 0;
+      return { leaveType: leaveType?.name || 'Unknown', startDate: clampedStart, endDate: clampedEnd, days, amount };
     });
     const leaveDeductionTotal = Math.round(leave.reduce((s, l) => s + l.amount, 0) * 100) / 100;
 
@@ -393,16 +454,23 @@ async function lockCycleInternal(req, res, cycle) {
     const statAHL  = taxCalc.calcHousingLevy(adjustedGross);
     const totalStatutory = Math.round((statPAYE + statNSSF + statSHA + statAHL) * 100) / 100;
 
-    // Net pay = gross − statutory deductions − voluntary deductions − unpaid leave + expense reimbursements
+    // Net pay = gross − statutory deductions − voluntary deductions − unpaid leave + expense
+    // reimbursements + non-taxable job-group allowances (never entered gross, so add them back here)
     const adjustedNet = Math.round(
-      (adjustedGross - totalStatutory - totalDeds - leaveDeductionTotal + expenseReimbursements) * 100
+      (adjustedGross - totalStatutory - totalDeds - leaveDeductionTotal + expenseReimbursements + nonTaxableJgAllowanceTotal) * 100
     ) / 100;
 
     const resultDoc = {
       cycleId:      cycle._id,
       employeeId:   emp._id,
-      earnings:     earnings.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, conceptCode: c.conceptCode, subCategory: c.subCategory, amount: c.amount, isTaxable: true })),
-      deductions:   deductions.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, conceptCode: c.conceptCode, subCategory: c.subCategory, amount: c.amount })),
+      earnings:     [
+        ...earnings.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, conceptCode: c.conceptCode, subCategory: c.subCategory, amount: c.amount, isTaxable: true })),
+        ...jgAllowanceItems,
+      ],
+      deductions:   [
+        ...deductions.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, conceptCode: c.conceptCode, subCategory: c.subCategory, amount: c.amount })),
+        ...jgFixedDeductionItems, ...jgPercentageDeductionItems, ...loanDeductionItems,
+      ],
       benefits:     benefits.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, amount: c.amount })),
       employerContributions: employerContributions.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, amount: c.amount })),
       // Statutory deductions stored separately so the payslip PDF can render them as their own section
@@ -450,6 +518,29 @@ async function lockCycleInternal(req, res, cycle) {
       updatedAt: new Date(),
     },
   });
+
+  if (matchedTimesheetIds.length) {
+    await global.dbo.collection('timesheets').updateMany(
+      { _id: { $in: matchedTimesheetIds } },
+      { $set: { payrollRunId: cycle._id, updatedAt: new Date() } }
+    );
+  }
+
+  for (const { loanId, installmentApplied } of loanApplications) {
+    const loan = await findOne('staff_loans', { _id: loanId });
+    if (!loan) continue;
+    const newBalance = Math.round((loan.balanceRemaining - installmentApplied) * 100) / 100;
+    const isPaidOff = newBalance <= 0;
+    await updateOne('staff_loans', { _id: loanId }, {
+      $set: {
+        balanceRemaining: Math.max(0, newBalance),
+        totalRepaid: Math.round((loan.totalRepaid + installmentApplied) * 100) / 100,
+        status: isPaidOff ? 'completed' : 'active',
+        completedAt: isPaidOff ? new Date() : null,
+        updatedAt: new Date(),
+      },
+    });
+  }
 
   return returnFunction(res, 200, true, 'Cycle locked and payroll calculated.');
 }

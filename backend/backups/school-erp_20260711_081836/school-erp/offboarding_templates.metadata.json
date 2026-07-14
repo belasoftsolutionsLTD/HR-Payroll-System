@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"}],"uuid":"6047ce05b9a14d3691485212d1fc19ef","collectionName":"offboarding_templates","type":"collection"}

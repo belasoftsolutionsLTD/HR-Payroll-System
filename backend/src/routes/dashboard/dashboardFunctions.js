@@ -14,40 +14,42 @@ const getDashboardSummary = async (req, res) => {
     const empId = req.user.employeeId;
     const year = new Date().getFullYear();
 
-    const [balance, pendingExpenses, goals] = await Promise.all([
-      empId ? findOne('leave_balances', { employeeId: empId, year }) : null,
+    const [balances, pendingExpenses, goals] = await Promise.all([
+      empId ? findMany('leave_balances', { employeeId: empId, year }) : [],
       empId ? countDocuments('expense_claims', { employeeId: empId, status: 'submitted' }) : 0,
       empId ? countDocuments('goals', { employeeId: empId, status: { $in: ['at_risk', 'behind'] } }) : 0,
     ]);
 
-    const annualBalance = balance?.balances?.annual?.remaining ?? 0;
+    const totalLeaveBalance = balances.reduce((sum, b) => sum + Math.max(0, b.closingBalance), 0);
     return returnFunction(res, 200, true, 'ok', {
       role: 'staff',
-      leaveBalance: annualBalance,
+      leaveBalance: totalLeaveBalance,
       pendingExpenses,
       goalsAtRisk: goals,
     });
   }
 
   if (role === 'department_head') {
+    const now = new Date();
     const emp = req.user.employeeId ? await findOne('employees', { _id: req.user.employeeId }) : null;
     const dept = emp?.department;
-    const filter = dept ? { department: dept } : {};
+
+    const teamEmps = dept ? await findMany('employees', { department: dept, status: 'active' }, { projection: { _id: 1 } }) : [];
+    const teamIds = teamEmps.map(e => e._id);
 
     const [teamSize, onLeaveToday, pendingLeave, pendingExpenses] = await Promise.all([
-      countDocuments('employees', { ...filter, status: 'active' }),
-      countDocuments('leave_requests', { ...filter, status: 'approved', startDate: { $lte: todayStr }, endDate: { $gte: todayStr } }),
-      countDocuments('leave_requests', { ...filter, status: 'pending' }),
+      countDocuments('employees', { ...(dept ? { department: dept } : {}), status: 'active' }),
+      teamIds.length ? countDocuments('leave_requests', { employeeId: { $in: teamIds }, status: 'approved', startDate: { $lte: now }, endDate: { $gte: now } }) : 0,
+      teamIds.length ? countDocuments('leave_requests', { employeeId: { $in: teamIds }, status: 'pending' }) : 0,
       countDocuments('expense_claims', { status: 'pending' }),
     ]);
 
     // Missing clock-in (active team members with no attendance record today)
     let missingClockIn = 0;
     if (dept) {
-      const teamEmps = await findMany('employees', { department: dept, status: 'active' }, { projection: { _id: 1 } });
       const clockedIn = await global.dbo.collection('attendance_records')
-        .countDocuments({ date: todayStr, employeeId: { $in: teamEmps.map(e => e._id) }, checkInTime: { $ne: null } });
-      missingClockIn = Math.max(0, teamEmps.length - clockedIn);
+        .countDocuments({ date: todayStr, employeeId: { $in: teamIds }, checkInTime: { $ne: null } });
+      missingClockIn = Math.max(0, teamIds.length - clockedIn);
     }
 
     return returnFunction(res, 200, true, 'ok', {
@@ -153,7 +155,8 @@ const getLiveAttendance = async (req, res) => {
   const clockedIn = records.filter(r => r.checkInTime && !r.checkOutTime && !(r.breaks || []).find(b => !b.endTime)).length;
   const onBreak   = records.filter(r => r.checkInTime && (r.breaks || []).find(b => !b.endTime)).length;
   const clockedOut = records.filter(r => r.checkOutTime).length;
-  const onLeave   = await countDocuments('leave_requests', { status: 'approved', startDate: { $lte: todayStr }, endDate: { $gte: todayStr } });
+  const now = new Date();
+  const onLeave   = await countDocuments('leave_requests', { status: 'approved', startDate: { $lte: now }, endDate: { $gte: now } });
   const notIn     = Math.max(0, totalActive - clockedIn - onBreak - clockedOut - onLeave);
 
   // Recent clock-ins (last 5)
@@ -199,13 +202,17 @@ const getTodaySchedule = async (req, res) => {
   const todayStr = today();
 
   // Check if employee is on leave
+  const now = new Date();
   const onLeave = await findOne('leave_requests', {
     employeeId: req.user.employeeId,
     status: 'approved',
-    startDate: { $lte: todayStr },
-    endDate: { $gte: todayStr },
+    startDate: { $lte: now },
+    endDate: { $gte: now },
   });
-  if (onLeave) return returnFunction(res, 200, true, 'ok', { type: 'leave', leaveType: onLeave.leaveType });
+  if (onLeave) {
+    const leaveType = await findOne('leave_types', { _id: onLeave.leaveTypeId }, { projection: { name: 1 } });
+    return returnFunction(res, 200, true, 'ok', { type: 'leave', leaveType: leaveType?.name || 'Leave' });
+  }
 
   // Check public holiday
   const holiday = await findOne('public_holidays', { date: todayStr });

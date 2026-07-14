@@ -5,9 +5,12 @@ const path = require('path');
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
-  listEmployees, getEmployee, createEmployee, updateEmployee,
+  listEmployees, exportEmployeesCSV, getEmployee, createEmployee, updateEmployee,
   patchEmployeeStatus, deleteEmployee, uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness,
-  listPayGroups, setPayGroupFrequency,
+  listPayGroups, setPayGroupFrequency, getJobHistory,
+  updateSkills, addCertification, deleteCertification, addEducation, deleteEducation,
+  updateEmergencyContacts,
+  getHeadcountAnalytics, getTurnoverAnalytics, getTenureAnalytics, getDemographicsAnalytics, getUpcomingAnalytics,
 } = require('./employeesFunctions');
 
 const SUPER_ADMIN  = 'super_admin';
@@ -27,13 +30,30 @@ router.get('/org-chart',          allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD
 router.get('/payroll-readiness',  allowRoles([SUPER_ADMIN, HR_MANAGER]),            AsyncHandler(getPayrollReadiness));
 router.get('/pay-groups',         allowRoles([SUPER_ADMIN, HR_MANAGER]),            AsyncHandler(listPayGroups));
 router.patch('/pay-groups/:payGroup/frequency', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(setPayGroupFrequency));
+router.get('/export',             allowRoles([SUPER_ADMIN, HR_MANAGER]),             AsyncHandler(exportEmployeesCSV));
 router.get('/',                   allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(listEmployees));
 router.get('/:id', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getEmployee));
+router.get('/:id/job-history', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getJobHistory));
 router.post('/', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(createEmployee));
 router.put('/:id', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(updateEmployee));
 router.patch('/:id/status', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(patchEmployeeStatus));
 router.delete('/:id', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(deleteEmployee));
 router.post('/:id/documents', allowRoles([SUPER_ADMIN, HR_MANAGER]), upload.single('document'), AsyncHandler(uploadDocument));
 router.get('/:id/documents/:docId/download', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(downloadDocument));
+
+// ── Skills & Qualifications ───────────────────────────────────────────────────
+router.patch('/:id/skills',                    allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(updateSkills));
+router.post('/:id/certifications',             allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(addCertification));
+router.delete('/:id/certifications/:certId',   allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(deleteCertification));
+router.post('/:id/education',                  allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(addEducation));
+router.delete('/:id/education/:eduId',         allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(deleteEducation));
+router.patch('/:id/emergency-contacts',        allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(updateEmergencyContacts));
+
+// ── Workforce Analytics ────────────────────────────────────────────────────────
+router.get('/analytics/headcount',    allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getHeadcountAnalytics));
+router.get('/analytics/turnover',     allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getTurnoverAnalytics));
+router.get('/analytics/tenure',       allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getTenureAnalytics));
+router.get('/analytics/demographics', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getDemographicsAnalytics));
+router.get('/analytics/upcoming',     allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getUpcomingAnalytics));
 
 module.exports = router;

@@ -1,6 +1,6 @@
 module.exports = {
-  companyName: 'School ERP',
-  shortCompanyName: 'SERP',
+  companyName: 'Bela ERP',
+  shortCompanyName: 'BERP',
   defaultLocale: 'en',
   defaultTimezone: 'Africa/Nairobi',
   defaultCurrency: 'KES',

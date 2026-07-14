@@ -6,6 +6,7 @@ const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('../../lib/spend/approvalChain');
 const { resolvePolicy } = require('../../lib/spend/policyResolver');
 const { buildSpendScopeFilter, canAccessRecord } = require('../../lib/spend/orgScope');
+const { sendEmail } = require('../../services/emailService');
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  CORPORATE CARDS
@@ -408,16 +409,43 @@ const getVendor = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, vendor);
 };
 
+// Company vendors must prove they're legitimately registered in Kenya before they can
+// transact — KRA PIN certificate, certificate of registration/incorporation, and a
+// business permit. Individual vendors skip this (no company to verify).
+const COMPANY_KYC_DOCS = [
+  { field: 'kraPinCertificate',    docType: 'KRA PIN Certificate' },
+  { field: 'registrationCertificate', docType: 'Certificate of Registration' },
+  { field: 'businessPermit',       docType: 'Business Permit' },
+];
+
 const createVendor = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['name', 'category'])) return;
-  const { name, contactName, email, phone, address, category, taxId, paymentTerms, bankDetails, notes } = req.body;
+  if (!validateRequiredFields(req, res, ['name', 'category', 'type'])) return;
+  const { name, contactName, email, phone, address, category, type, taxId, paymentTerms, bankDetails, notes } = req.body;
+  if (!['company', 'individual'].includes(type)) return returnFunction(res, 400, false, 'Vendor type must be "company" or "individual".');
+
+  let documents = [];
+  if (type === 'company') {
+    const missing = COMPANY_KYC_DOCS.filter(d => !req.files?.[d.field]?.[0]);
+    if (missing.length) {
+      return returnFunction(res, 400, false, `Company vendors must provide: ${missing.map(d => d.docType).join(', ')}.`);
+    }
+    documents = COMPANY_KYC_DOCS.map(d => {
+      const file = req.files[d.field][0];
+      return { docId: new ObjectId(), docType: d.docType, fileName: file.originalname, filePath: `/uploads/${file.filename}`, uploadedAt: new Date() };
+    });
+  }
+
   const doc = {
     name, contactName: contactName || null, email: email || null, phone: phone || null,
-    address: address || null, category, taxId: taxId || null, paymentTerms: paymentTerms || null,
-    bankDetails: bankDetails || null, status: 'active', notes: notes || null,
+    address: address || null, category, type, taxId: taxId || null, paymentTerms: paymentTerms || null,
+    bankDetails: bankDetails || null, documents, status: 'pending_approval', notes: notes || null,
+    approvedBy: null, approvedAt: null, rejectedBy: null, rejectedAt: null, rejectionReason: null,
     createdBy: req.user?._id ?? null, createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('vendors', doc);
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'New Vendor Pending Approval', body: `${name} has been submitted and is awaiting approval.`, type: 'general',
+  }).catch(() => {});
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
@@ -428,6 +456,41 @@ const updateVendor = async (req, res) => {
   delete update._id;
   await updateOne('vendors', { _id: new ObjectId(req.params.id) }, { $set: update });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const approveVendor = async (req, res) => {
+  const vendor = await findOne('vendors', { _id: new ObjectId(req.params.id) });
+  if (!vendor) return returnFunction(res, 404, false, req.locale.notFound);
+  if (vendor.status !== 'pending_approval') return returnFunction(res, 400, false, 'This vendor is not pending approval.');
+  await updateOne('vendors', { _id: vendor._id }, {
+    $set: { status: 'active', approvedBy: req.user?._id ?? null, approvedAt: new Date(), updatedAt: new Date() },
+  });
+  if (vendor.email) {
+    sendEmail({
+      to: vendor.email,
+      subject: `${vendor.name} — Vendor Application Approved`,
+      html: `<p>Dear ${vendor.contactName || vendor.name},</p><p>Your vendor application has been <strong>approved</strong>. You are now registered as an active vendor.</p>`,
+    }).catch(() => {});
+  }
+  return returnFunction(res, 200, true, 'Vendor approved.');
+};
+
+const rejectVendor = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['rejectionReason'])) return;
+  const vendor = await findOne('vendors', { _id: new ObjectId(req.params.id) });
+  if (!vendor) return returnFunction(res, 404, false, req.locale.notFound);
+  if (vendor.status !== 'pending_approval') return returnFunction(res, 400, false, 'This vendor is not pending approval.');
+  await updateOne('vendors', { _id: vendor._id }, {
+    $set: { status: 'rejected', rejectedBy: req.user?._id ?? null, rejectedAt: new Date(), rejectionReason: req.body.rejectionReason, updatedAt: new Date() },
+  });
+  if (vendor.email) {
+    sendEmail({
+      to: vendor.email,
+      subject: `${vendor.name} — Vendor Application Update`,
+      html: `<p>Dear ${vendor.contactName || vendor.name},</p><p>Your vendor application has been <strong>rejected</strong>.</p><p>Reason: ${req.body.rejectionReason}</p>`,
+    }).catch(() => {});
+  }
+  return returnFunction(res, 200, true, 'Vendor rejected.');
 };
 
 // Only super_admin can hard-remove a vendor from the directory (rejectPurchaseRequest-
@@ -910,7 +973,7 @@ module.exports = {
   listInvoices, createInvoice, approveInvoice, rejectInvoice, markPaid,
   listPurchaseRequests, getPurchaseRequest, createPurchaseRequest, updatePurchaseRequest,
   approvePurchaseRequest, rejectPurchaseRequest,
-  listVendors, getVendor, createVendor, updateVendor, deleteVendor,
+  listVendors, getVendor, createVendor, updateVendor, deleteVendor, approveVendor, rejectVendor,
   listProcurementPolicies, getProcurementPolicy, createProcurementPolicy, updateProcurementPolicy, deleteProcurementPolicy,
   convertRequisitionToPO,
   listPurchaseOrders, getPurchaseOrder, updatePurchaseOrder, sendPurchaseOrder, acknowledgePurchaseOrder, cancelPurchaseOrder,

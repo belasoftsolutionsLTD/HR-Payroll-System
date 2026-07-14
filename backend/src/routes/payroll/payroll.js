@@ -6,6 +6,7 @@ const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
 
 const { listConcepts, createConcept, updateConcept, deleteConcept, getConcept } = require('./payrollConceptsFunctions');
 const { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation, getCompensationAuditLog } = require('./payrollCompensationsFunctions');
+const { getEmployeeLoans, listActiveLoanSummaries, createLoan, updateLoan } = require('./payrollLoansFunctions');
 const { listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult, emailPayslips, downloadP9Form } = require('./payrollCyclesFunctions');
 const { getMyPayslips, downloadPayslipPDF, getPayslip, getEmployeePayslips } = require('./payrollPayslipsFunctions');
 const { getPayrollAnalytics } = require('./payrollAnalyticsFunctions');
@@ -28,6 +29,12 @@ router.get('/compensations/:employeeId/audit-log',  hrOnly, AsyncHandler(getComp
 router.post('/compensations',                       hrOnly, AsyncHandler(addCompensation));
 router.put('/compensations/:id',                    hrOnly, AsyncHandler(updateCompensation));
 router.delete('/compensations/:id',                 hrOnly, AsyncHandler(removeCompensation));
+
+// ── Staff Loans ───────────────────────────────────────────────────────────────
+router.get('/loans/active',            hrOnly, AsyncHandler(listActiveLoanSummaries));
+router.get('/loans/:employeeId',       hrOnly, AsyncHandler(getEmployeeLoans));
+router.post('/loans',                  hrOnly, AsyncHandler(createLoan));
+router.put('/loans/:id',               hrOnly, AsyncHandler(updateLoan));
 
 // ── Payroll Cycles ────────────────────────────────────────────────────────────
 router.get('/cycles',                               hrOnly, AsyncHandler(listCycles));

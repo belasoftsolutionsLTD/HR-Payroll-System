@@ -22,6 +22,7 @@ const hrRoutes         = require('./src/routes/hr/hr');
 const employeesRoutes  = require('./src/routes/employees/employees');
 const recruitmentRoutes = require('./src/routes/recruitment/recruitment');
 const onboardingRoutes = require('./src/routes/onboarding/onboarding');
+const offboardingRoutes = require('./src/routes/offboarding/offboarding');
 const leaveRoutes      = require('./src/routes/leave/leave');
 const attendanceRoutes = require('./src/routes/attendance/attendance');
 const payrollRoutes    = require('./src/routes/payroll/payroll');
@@ -100,7 +101,8 @@ app.use('/api/public', publicRoutes);
 // ── HR Module routes (all require auth) ──────────────────────────────────────
 app.use('/api/hr',          decodeToken, getUserData, hrRoutes);
 app.use('/api/recruitment', decodeToken, getUserData, recruitmentRoutes);
-app.use('/api/hr',          decodeToken, getUserData, onboardingRoutes);
+app.use('/api/onboarding',  decodeToken, getUserData, onboardingRoutes);
+app.use('/api/offboarding', decodeToken, getUserData, offboardingRoutes);
 app.use('/api/employees',   decodeToken, getUserData, employeesRoutes);
 app.use('/api/leave',       decodeToken, getUserData, leaveRoutes);
 app.use('/api/attendance',  decodeToken, getUserData, attendanceRoutes);

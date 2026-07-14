@@ -15,6 +15,11 @@ const {
   getAttendanceReport, getAttendanceStats,
   getSettings, saveSettings, getSchedules, createSchedule, updateSchedule, deleteSchedule,
   bulkCreateShifts,
+  assignSchedule, getEmployeeScheduleAssignment,
+  getAttendanceOverview, getAttendanceSummary, getOvertimeAnalytics, getLateArrivalsAnalytics, getAbsenteeismAnalytics,
+  exportAttendanceReportCSV,
+  getPayrollFeed, markPayrollFeedProcessed,
+  bulkApproveTimesheets,
 } = require('./attendanceFunctions');
 
 const MGMT     = ['super_admin', 'hr_manager', 'department_head'];
@@ -31,12 +36,19 @@ router.post('/break-start',      allowRoles(ALL),  AsyncHandler(breakStart));
 router.post('/break-end',        allowRoles(ALL),  AsyncHandler(breakEnd));
 
 // ── Timesheets ────────────────────────────────────────────────────────────────
+// specific paths before /timesheets/:id/* routes to avoid conflicts
+router.get('/timesheets/payroll-feed',      allowRoles(['super_admin', 'hr_manager']), AsyncHandler(getPayrollFeed));
+router.post('/timesheets/payroll-feed/mark', allowRoles(['super_admin', 'hr_manager']), AsyncHandler(markPayrollFeedProcessed));
 router.get('/timesheets',        allowRoles(ALL),  AsyncHandler(getTimesheets));
 router.get('/timesheets/current',allowRoles(ALL),  AsyncHandler(getCurrentTimesheet));
 router.post('/timesheets',       allowRoles(ALL),  scopeBodyToSelf, AsyncHandler(saveTimesheet));
 router.put('/timesheets/:id/submit',  allowRoles(ALL),  AsyncHandler(submitTimesheet));
-router.put('/timesheets/:id/approve', allowRoles(MGMT), AsyncHandler(approveTimesheet));
-router.put('/timesheets/:id/reject',  allowRoles(MGMT), AsyncHandler(rejectTimesheet));
+// allowRoles(ALL) here, not MGMT — a plain "staff" role can still be someone's manager
+// via employees.managerId (no distinct manager role exists in this system). Authorization
+// is enforced inside the handler via isAuthorizedForEmployee, same convention as leave.
+router.put('/timesheets/:id/approve', allowRoles(ALL),  AsyncHandler(approveTimesheet));
+router.put('/timesheets/:id/reject',  allowRoles(ALL),  AsyncHandler(rejectTimesheet));
+router.put('/timesheets/bulk-approve', allowRoles(ALL), AsyncHandler(bulkApproveTimesheets));
 
 // ── Shifts ────────────────────────────────────────────────────────────────────
 // specific paths before :id to avoid conflicts
@@ -53,10 +65,20 @@ router.put('/shifts/:id',        allowRoles(MGMT), AsyncHandler(updateShift));
 router.delete('/shifts/:id',     allowRoles(MGMT), AsyncHandler(deleteShift));
 
 // ── HR / Management ───────────────────────────────────────────────────────────
-router.get('/team-status',       allowRoles(MGMT), AsyncHandler(getTeamStatus));
-router.get('/report',            allowRoles(MGMT), AsyncHandler(getAttendanceReport));
-router.get('/stats',             allowRoles(MGMT), AsyncHandler(getAttendanceStats));
-router.get('/alerts',            allowRoles(MGMT), AsyncHandler(getAbsenceAlerts));
+// allowRoles(ALL) — scoping (dept_head → dept, staff-as-manager → direct reports,
+// plain staff → self only) is enforced inside each handler via getScopedEmployeeIds.
+router.get('/team-status',       allowRoles(ALL), AsyncHandler(getTeamStatus));
+router.get('/report',            allowRoles(ALL), AsyncHandler(getAttendanceReport));
+router.get('/report/export',     allowRoles(ALL), AsyncHandler(exportAttendanceReportCSV));
+router.get('/stats',             allowRoles(ALL), AsyncHandler(getAttendanceStats));
+router.get('/alerts',            allowRoles(ALL), AsyncHandler(getAbsenceAlerts));
+
+// ── Analytics ──────────────────────────────────────────────────────────────────
+router.get('/analytics/overview',    allowRoles(ALL), AsyncHandler(getAttendanceOverview));
+router.get('/analytics/summary',     allowRoles(ALL), AsyncHandler(getAttendanceSummary));
+router.get('/analytics/overtime',    allowRoles(ALL), AsyncHandler(getOvertimeAnalytics));
+router.get('/analytics/late',        allowRoles(ALL), AsyncHandler(getLateArrivalsAnalytics));
+router.get('/analytics/absenteeism', allowRoles(ALL), AsyncHandler(getAbsenteeismAnalytics));
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 router.get('/settings',          allowRoles(MGMT), AsyncHandler(getSettings));
@@ -65,9 +87,11 @@ router.get('/schedules',         allowRoles(MGMT), AsyncHandler(getSchedules));
 router.post('/schedules',        allowRoles(['super_admin', 'hr_manager']), AsyncHandler(createSchedule));
 router.put('/schedules/:id',     allowRoles(['super_admin', 'hr_manager']), AsyncHandler(updateSchedule));
 router.delete('/schedules/:id',  allowRoles(['super_admin', 'hr_manager']), AsyncHandler(deleteSchedule));
+router.post('/schedules/assign', allowRoles(['super_admin', 'hr_manager']), AsyncHandler(assignSchedule));
+router.get('/schedules/employee/:employeeId', allowRoles(MGMT), AsyncHandler(getEmployeeScheduleAssignment));
 
 // ── CRUD (HR) ─────────────────────────────────────────────────────────────────
-router.get('/',                  allowRoles(MGMT), AsyncHandler(listAttendance));
+router.get('/',                  allowRoles(ALL),  AsyncHandler(listAttendance));
 router.post('/',                 allowRoles(MGMT), AsyncHandler(markAttendance));
 router.post('/bulk', allowRoles(['super_admin', 'hr_manager']), upload.single('csv'), AsyncHandler(bulkImportAttendance));
 

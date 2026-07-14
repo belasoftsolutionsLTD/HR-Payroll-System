@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"employeeId":{"$numberInt":"1"},"performedAt":{"$numberInt":"-1"}},"name":"employeeId_1_performedAt_-1","background":true}],"uuid":"884979604239436a926de26881bf0bbf","collectionName":"compensation_audit_logs","type":"collection"}
