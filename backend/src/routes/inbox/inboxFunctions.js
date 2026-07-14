@@ -158,29 +158,16 @@ const takeAction = async (req, res) => {
   if (item.referenceId && item.referenceModel) {
     try {
       if (item.type === 'leave' && item.referenceModel === 'leave_requests') {
-        const update = action === 'approved'
-          ? { status: 'approved', approvedBy: req.user._id, approvedAt: now }
-          : { status: 'rejected', rejectedBy: req.user._id, rejectedAt: now, rejectionReason: reason || '' };
-        await global.dbo.collection('leave_requests').updateOne({ _id: item.referenceId }, { $set: { ...update, updatedAt: now } });
-
-        // Notify employee of outcome
-        const leaveReq = await findOne('leave_requests', { _id: item.referenceId });
-        if (leaveReq) {
-          const empUser = await findOne('users', { employeeId: leaveReq.employeeId });
-          if (empUser) {
-            await createInboxItem({
-              recipientId: empUser._id,
-              type: 'general',
-              subType: `leave_${action}`,
-              title: `Leave request ${action}`,
-              subtitle: action === 'approved' ? 'Your leave request has been approved.' : `Your leave request was declined. ${reason || ''}`,
-              referenceId: item.referenceId,
-              referenceModel: 'leave_requests',
-              requiresAction: false,
-              triggeredBy: req.user._id,
-            });
-          }
-        }
+        // Delegates to the real leave module (approval chain, balance updates,
+        // audit log, employee notification) instead of writing to leave_requests
+        // directly — this used to bypass all of that, which was a real bug.
+        const { approveLeaveRequest, rejectLeaveRequest } = require('../leave/leaveFunctions');
+        const shimReq = { params: { id: String(item.referenceId) }, body: { comment: reason, rejectionReason: reason }, user: req.user, locale: req.locale };
+        let shimResult = null;
+        const shimRes = { status: () => shimRes, json: (payload) => { shimResult = payload; } };
+        if (action === 'approved') await approveLeaveRequest(shimReq, shimRes);
+        else await rejectLeaveRequest(shimReq, shimRes);
+        if (shimResult && !shimResult.success) return returnFunction(res, 400, false, shimResult.message);
       }
 
       if (item.type === 'expense' && item.referenceModel === 'expense_claims') {

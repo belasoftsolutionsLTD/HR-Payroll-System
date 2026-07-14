@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"isActive":{"$numberInt":"1"},"isDefault":{"$numberInt":"1"}},"name":"isActive_1_isDefault_1","background":true}],"uuid":"6e38ab6a03774c6490a70a99b69f4d7a","collectionName":"expense_policies","type":"collection"}

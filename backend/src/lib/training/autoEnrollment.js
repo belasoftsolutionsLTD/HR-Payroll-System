@@ -6,9 +6,15 @@ const { createSingleCourseEnrollment, createLearningPathEnrollment } = require('
 
 // `user` here is a full `users` document — enrollments.employeeId is always a users._id
 // (see trainingFunctions.js), so rule targeting matches against users.role/users.department.
-const matchesConditions = (user, conditions = {}) => {
+// `extra.performanceScore`, when provided, is checked against triggerConditions.performanceScoreBelow
+// — only the single-user event path (a review just got submitted) supplies this; the full
+// org-wide runRule scan does its own score filtering via aggregation instead.
+const matchesConditions = (user, conditions = {}, extra = {}) => {
   if (conditions.roles?.length && !conditions.roles.includes(user.role)) return false;
   if (conditions.departments?.length && !conditions.departments.includes(user.department)) return false;
+  if (conditions.performanceScoreBelow != null) {
+    if (extra.performanceScore == null || extra.performanceScore >= conditions.performanceScoreBelow) return false;
+  }
   return true;
 };
 
@@ -65,9 +71,13 @@ async function runRule(rule) {
     candidateUsers = employeeIds.length ? await findMany('users', { _id: { $in: employeeIds } }) : [];
     candidateUsers = candidateUsers.filter((u) => matchesConditions(u, conditions));
   } else if (rule.trigger === 'onPerformanceScore' && conditions.performanceScoreBelow != null) {
-    // Best-effort join against performance_reviews — skipped gracefully if that collection/shape differs.
-    const lowScorers = await global.dbo.collection('performance_reviews').aggregate([
-      { $sort: { createdAt: -1 } },
+    // Was querying a collection named 'performance_reviews', which has never existed —
+    // reviews live in 'reviews' (performanceFunctions.js) — so this always silently matched
+    // zero employees. Scoped to submitted manager reviews since that's the official rating,
+    // not a self- or peer-review score.
+    const lowScorers = await global.dbo.collection('reviews').aggregate([
+      { $match: { reviewType: 'manager', status: 'submitted', overallRating: { $ne: null } } },
+      { $sort: { submittedAt: -1 } },
       { $group: { _id: '$employeeId', latestScore: { $first: '$overallRating' } } },
       { $match: { latestScore: { $lt: conditions.performanceScoreBelow } } },
     ]).toArray().catch(() => []);
@@ -93,10 +103,10 @@ async function runRule(rule) {
 // Fired from a specific event (new account created, role/department changed) — only
 // evaluates active rules of the matching trigger type against the ONE affected user,
 // instead of re-scanning the whole org.
-async function evaluateRulesForUser(trigger, user) {
+async function evaluateRulesForUser(trigger, user, extra = {}) {
   const rules = await findMany('trainingAssignmentRules', { trigger, isActive: true });
   for (const rule of rules) {
-    if (!matchesConditions(user, rule.triggerConditions)) continue;
+    if (!matchesConditions(user, rule.triggerConditions, extra)) continue;
     const created = await applyRuleToUser(rule, user);
     await insertOne('ruleExecutionLogs', { ruleId: rule._id, runAt: new Date(), matched: 1, created });
   }
@@ -109,7 +119,9 @@ async function runDueScheduledAndExpiryRules() {
   for (const rule of rules) {
     if (rule.trigger === 'scheduled') {
       const recurrence = rule.triggerConditions?.scheduledRecurrence || 'monthly';
-      const intervalDays = { monthly: 30, quarterly: 90, annual: 365 }[recurrence] || 30;
+      const intervalDays = recurrence === 'custom'
+        ? (Number(rule.triggerConditions?.customIntervalDays) || 30)
+        : ({ monthly: 30, quarterly: 90, annual: 365 }[recurrence] || 30);
       const lastLogs = await findMany('ruleExecutionLogs', { ruleId: rule._id }, { sort: { runAt: -1 }, limit: 1 });
       const dueSince = lastLogs.length ? new Date(lastLogs[0].runAt.getTime() + intervalDays * 86400000) : new Date(0);
       if (new Date() < dueSince) continue;

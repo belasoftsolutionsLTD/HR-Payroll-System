@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"}],"uuid":"40177c972558477f97c39150405a0152","collectionName":"offboarding_records","type":"collection"}

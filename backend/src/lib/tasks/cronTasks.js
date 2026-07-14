@@ -2,7 +2,9 @@ const cron = require('node-cron');
 const { ObjectId } = require('mongodb');
 const { triggerTasksFromTemplate } = require('./triggerTasksFromTemplate');
 const { notifyEmployee, notifyUser } = require('../../functions/HR/notifyUser');
-const { runLeaveAccrual, runYearEndCarryForward } = require('../../routes/leave/leaveFunctions');
+const { runAccrual, runYearEndCarryOver } = require('../leave/accrualEngine');
+const { getEffectiveScheduleForEmployee } = require('../../routes/attendance/attendanceFunctions');
+const { runDueScheduledReports } = require('../../routes/reports/reportFunctions');
 
 async function dailyTaskJobs() {
   if (!global.dbo) return;
@@ -114,7 +116,7 @@ async function detectMissedClockOuts() {
 // Reset on_leave status for employees whose approved leave has ended
 async function resetOnLeaveStatus() {
   if (!global.dbo) return;
-  const todayStr = new Date().toISOString().split('T')[0];
+  const today = new Date();
 
   const onLeaveEmps = await global.dbo.collection('employees')
     .find({ status: 'on_leave' }, { projection: { _id: 1 } })
@@ -127,7 +129,7 @@ async function resetOnLeaveStatus() {
   const activeLeaves = await global.dbo.collection('leave_requests').find({
     employeeId: { $in: empIds },
     status: 'approved',
-    endDate: { $gte: todayStr },
+    endDate: { $gte: today },
   }, { projection: { employeeId: 1 } }).toArray();
 
   const stillOnLeave = new Set(activeLeaves.map(l => String(l.employeeId)));
@@ -142,37 +144,101 @@ async function resetOnLeaveStatus() {
   }
 }
 
-// Mark attendance records as 'late' for employees who clocked in after start + grace
-// Runs at 10:00 EAT (07:00 UTC) — well after any reasonable grace period
+// Flip employees.status to 'offboarding' only once their lastWorkingDay has passed
+// — NOT at initiation. Many other modules (payroll compensation runs, attendance
+// rosters, leave eligibility, performance reviews) filter on status:'active', so
+// flipping early would silently drop someone still working out their notice
+// period from payroll/attendance. "In offboarding" during the notice period is
+// tracked purely via the offboardingRecord's own status, not employees.status.
+async function flipOffboardingEmployeeStatus() {
+  if (!global.dbo) return;
+  const now = new Date();
+
+  const dueRecords = await global.dbo.collection('offboarding_records').find({
+    status: { $ne: 'completed' },
+    lastWorkingDay: { $lte: now },
+  }, { projection: { employeeId: 1 } }).toArray();
+
+  if (!dueRecords.length) return;
+  const empIds = dueRecords.map(r => r.employeeId);
+
+  const result = await global.dbo.collection('employees').updateMany(
+    { _id: { $in: empIds }, status: { $in: ['active', 'on_leave'] } },
+    { $set: { status: 'offboarding', updatedAt: now } }
+  );
+
+  if (result.modifiedCount > 0) {
+    console.log(`[CRON] Flipped ${result.modifiedCount} employee(s) to 'offboarding' status (past last working day)`);
+  }
+}
+
+// Mark attendance records as 'late' for employees who clocked in after start + grace.
+// Runs at 10:00 EAT (07:00 UTC) — well after any reasonable grace period.
+//
+// Per-employee shift start time (the same `shifts` doc clockOut already uses for its
+// overtime split) wins over the org-wide default schedule — previously this compared
+// every employee against whichever work_schedules doc happened to be first in the
+// collection, regardless of what shift they were actually assigned. Grace-period
+// minutes still fall back to the default schedule since `shifts` doesn't carry its
+// own grace value yet.
 async function markLateArrivals() {
   if (!global.dbo) return;
   const todayStr = new Date().toISOString().split('T')[0];
 
-  // Load default schedule (first enabled schedule, or hard defaults)
-  const schedule = await global.dbo.collection('work_schedules').findOne({}) || {};
-  const startTime   = schedule.startTime   || '09:00';
-  const graceMins   = Number(schedule.gracePeriod) || 15;
+  const defaultSchedule = await global.dbo.collection('work_schedules').findOne({}) || {};
+  const defaultStartTime = defaultSchedule.startTime || '09:00';
+  const defaultGraceMins = Number(defaultSchedule.gracePeriod) || 15;
 
-  // Compute late threshold as 'HH:MM' string
-  const [sh, sm] = startTime.split(':').map(Number);
-  const lateMins  = sh * 60 + sm + graceMins;
-  const lateHH    = String(Math.floor(lateMins / 60)).padStart(2, '0');
-  const lateMM    = String(lateMins % 60).padStart(2, '0');
-  const lateThreshold = `${lateHH}:${lateMM}`;
+  const toMins = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + m; };
+  const thresholdStr = (startTime, graceMins) => {
+    const total = toMins(startTime) + graceMins;
+    const hh = String(Math.floor(total / 60)).padStart(2, '0');
+    const mm = String(total % 60).padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
+  const defaultThreshold = thresholdStr(defaultStartTime, defaultGraceMins);
 
-  // Find records clocked in today with checkInTime after the threshold and still marked 'present'
-  const result = await global.dbo.collection('attendance_records').updateMany(
-    {
-      date: todayStr,
-      status: 'present',
-      checkInTime: { $gt: lateThreshold },
-      lateMarked: { $ne: true },
-    },
-    { $set: { status: 'late', lateMarked: true, updatedAt: new Date() } }
-  );
+  const candidates = await global.dbo.collection('attendance_records').find({
+    date: todayStr,
+    status: 'present',
+    lateMarked: { $ne: true },
+    checkInTime: { $exists: true, $ne: null },
+  }, { projection: { employeeId: 1, checkInTime: 1 } }).toArray();
 
-  if (result.modifiedCount > 0) {
-    console.log(`[CRON] Marked ${result.modifiedCount} employee(s) as late for ${todayStr} (threshold ${lateThreshold})`);
+  if (!candidates.length) return;
+
+  const empIds = candidates.map((c) => c.employeeId);
+  const todayShifts = await global.dbo.collection('shifts').find({
+    employeeId: { $in: empIds }, date: todayStr,
+  }, { projection: { employeeId: 1, startTime: 1 } }).toArray();
+  const shiftByEmp = Object.fromEntries(todayShifts.map((s) => [String(s.employeeId), s]));
+
+  const ops = [];
+  for (const rec of candidates) {
+    const shift = shiftByEmp[String(rec.employeeId)];
+    let threshold;
+    if (shift?.startTime) {
+      threshold = thresholdStr(shift.startTime, defaultGraceMins);
+    } else {
+      // No ad-hoc shift for today — fall back to their standing schedule assignment.
+      const assignedSchedule = await getEffectiveScheduleForEmployee(rec.employeeId, todayStr);
+      threshold = assignedSchedule
+        ? thresholdStr(assignedSchedule.startTime, Number(assignedSchedule.gracePeriod) || defaultGraceMins)
+        : defaultThreshold;
+    }
+    if (rec.checkInTime > threshold) {
+      ops.push({
+        updateOne: {
+          filter: { _id: rec._id },
+          update: { $set: { status: 'late', lateMarked: true, updatedAt: new Date() } },
+        },
+      });
+    }
+  }
+
+  if (ops.length) {
+    const result = await global.dbo.collection('attendance_records').bulkWrite(ops);
+    console.log(`[CRON] Marked ${result.modifiedCount} employee(s) as late for ${todayStr} (per-shift thresholds)`);
   }
 }
 
@@ -205,27 +271,25 @@ async function autoMarkAbsent() {
   const onLeave = await global.dbo.collection('leave_requests').find({
     employeeId: { $in: empIds },
     status: 'approved',
-    startDate: { $lte: todayStr },
-    endDate:   { $gte: todayStr },
+    startDate: { $lte: now },
+    endDate:   { $gte: now },
   }, { projection: { employeeId: 1 } }).toArray();
   const onLeaveIds = new Set(onLeave.map(l => String(l.employeeId)));
 
-  const absentIds = empIds.filter(id => !hasRecord.has(String(id)) && !onLeaveIds.has(String(id)));
+  const noRecordIds = empIds.filter(id => !hasRecord.has(String(id)));
+  const absentIds = noRecordIds.filter(id => !onLeaveIds.has(String(id)));
+  const onLeaveNoRecordIds = noRecordIds.filter(id => onLeaveIds.has(String(id)));
 
-  if (!absentIds.length) return;
+  if (!absentIds.length && !onLeaveNoRecordIds.length) return;
 
-  const absentDocs = absentIds.map(id => ({
-    employeeId: id,
-    date:       todayStr,
-    status:     'absent',
-    autoMarked: true,
-    createdAt:  now,
-    updatedAt:  now,
-  }));
+  const docs = [
+    ...absentIds.map(id => ({ employeeId: id, date: todayStr, status: 'absent', autoMarked: true, createdAt: now, updatedAt: now })),
+    ...onLeaveNoRecordIds.map(id => ({ employeeId: id, date: todayStr, status: 'onLeave', autoMarked: true, createdAt: now, updatedAt: now })),
+  ];
 
   // bulkWrite to avoid duplicates (in case of reruns)
   await global.dbo.collection('attendance_records').bulkWrite(
-    absentDocs.map(doc => ({
+    docs.map(doc => ({
       updateOne: {
         filter: { employeeId: doc.employeeId, date: todayStr },
         update: { $setOnInsert: doc },
@@ -234,7 +298,8 @@ async function autoMarkAbsent() {
     }))
   );
 
-  console.log(`[CRON] Auto-marked ${absentIds.length} employee(s) as absent for ${todayStr}`);
+  if (absentIds.length) console.log(`[CRON] Auto-marked ${absentIds.length} employee(s) as absent for ${todayStr}`);
+  if (onLeaveNoRecordIds.length) console.log(`[CRON] Auto-marked ${onLeaveNoRecordIds.length} employee(s) as onLeave for ${todayStr}`);
 }
 
 // ── Training / LMS: overdue detection + automation rule engine ────────────────
@@ -309,6 +374,12 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] On-leave reset error:', err); }
   });
 
+  // Daily at 00:10 UTC — flip employees.status to 'offboarding' once their last working day has passed
+  cron.schedule('10 0 * * *', async () => {
+    try { await flipOffboardingEmployeeStatus(); }
+    catch (err) { console.error('[CRON] Offboarding status flip error:', err); }
+  });
+
   // Every hour: detect employees who clocked in but haven't clocked out after 12h
   cron.schedule('0 * * * *', async () => {
     try { await detectMissedClockOuts(); }
@@ -318,15 +389,17 @@ function startCronJobs() {
   // 1st of each month at 01:00 UTC — monthly leave accrual (idempotent per month)
   cron.schedule('0 1 1 * *', async () => {
     try {
-      const r = await runLeaveAccrual({ body: {}, query: {} }, null);
-      console.log(`[CRON] Leave accrual ${r.accrualMonth}: ${r.processed} processed, ${r.skipped} skipped`);
+      const r = await runAccrual(null);
+      console.log(`[CRON] Leave accrual: ${r.processed} balance(s) updated`);
     } catch (err) { console.error('[CRON] Leave accrual error:', err); }
   });
 
   // Jan 1 at 02:00 UTC — year-end carry-forward for the previous year
   cron.schedule('0 2 1 1 *', async () => {
-    try { await runYearEndCarryForward({ body: {}, query: {} }, null); }
-    catch (err) { console.error('[CRON] Year-end carry-forward error:', err); }
+    try {
+      const r = await runYearEndCarryOver(null);
+      console.log(`[CRON] Year-end carry-forward: ${r.processed} balance(s) created`);
+    } catch (err) { console.error('[CRON] Year-end carry-forward error:', err); }
   });
 
   // Daily at 08:00 UTC — mark overdue training enrollments + notify
@@ -341,7 +414,13 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Training automation rule error:', err); }
   });
 
+  // Daily at 06:00 UTC — run due weekly/monthly scheduled custom reports and email them
+  cron.schedule('0 6 * * *', async () => {
+    try { await runDueScheduledReports(); }
+    catch (err) { console.error('[CRON] Scheduled report error:', err); }
+  });
+
   console.log('[CRON] All cron jobs scheduled');
 }
 
-module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules };
+module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, autoMarkAbsent, markLateArrivals, detectMissedClockOuts };

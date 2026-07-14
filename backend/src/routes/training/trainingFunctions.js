@@ -15,6 +15,8 @@ const { runRule } = require('../../lib/training/autoEnrollment');
 const COURSE_CATEGORIES = ['Compliance', 'Onboarding', 'Leadership', 'Technical', 'Soft Skills'];
 const COURSE_STATUSES = ['draft', 'published', 'archived'];
 const MODULE_TYPES = ['video', 'document', 'text', 'quiz', 'scorm', 'link'];
+const DELIVERY_METHODS = ['self_paced', 'instructor_led'];
+const SESSION_STATUSES = ['scheduled', 'completed', 'cancelled'];
 const ENROLLMENT_STATUSES = ['notStarted', 'inProgress', 'completed', 'overdue', 'waived'];
 
 // ── Courses (HR admin) ────────────────────────────────────────────────────────
@@ -38,6 +40,7 @@ const createCourse = async (req, res) => {
     targetDepartments: Array.isArray(req.body.targetDepartments) ? req.body.targetDepartments : [],
     hasCertificate: !!req.body.hasCertificate,
     certificateValidityDays: req.body.certificateValidityDays ? Number(req.body.certificateValidityDays) : null,
+    deliveryMethod: DELIVERY_METHODS.includes(req.body.deliveryMethod) ? req.body.deliveryMethod : 'self_paced',
     createdBy: new ObjectId(req.user._id),
     authors: [new ObjectId(req.user._id)],
     publishedAt: null,
@@ -105,8 +108,13 @@ const publishCourse = async (req, res) => {
   const course = await findOne('courses', { _id: new ObjectId(req.params.id) });
   if (!course) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const moduleCount = await countDocuments('courseModules', { courseId: course._id });
-  if (!moduleCount) return returnFunction(res, 400, false, 'Add at least one module before publishing.');
+  if (course.deliveryMethod === 'instructor_led') {
+    const sessionCount = await countDocuments('trainingSessions', { courseId: course._id, status: { $ne: 'cancelled' } });
+    if (!sessionCount) return returnFunction(res, 400, false, 'Schedule at least one session before publishing.');
+  } else {
+    const moduleCount = await countDocuments('courseModules', { courseId: course._id });
+    if (!moduleCount) return returnFunction(res, 400, false, 'Add at least one module before publishing.');
+  }
 
   await updateOne('courses', { _id: course._id }, { $set: { status: 'published', publishedAt: new Date(), updatedAt: new Date() } });
 
@@ -1010,9 +1018,141 @@ const sendComplianceReminder = async (req, res) => {
   return returnFunction(res, 200, true, `Reminder sent to ${uniqueIds.length} employee(s).`);
 };
 
+// Stores just the relative path under uploads/ (e.g. "training/172...-slides.pdf"), not a
+// full URL — matches the existing convention for profilePhoto/receiptFile elsewhere in
+// this app, where the frontend appends its own auth token when constructing the full URL.
+const uploadTrainingFile = async (req, res) => {
+  if (!req.file) return returnFunction(res, 400, false, 'No file uploaded, or the file type is not supported (PDF, MP4, WebM, OGG, MOV only).');
+  return returnFunction(res, 200, true, req.locale.success, {
+    fileUrl: `training/${req.file.filename}`,
+    fileName: req.file.originalname,
+  });
+};
+
+// ── Live / Instructor-led Sessions ─────────────────────────────────────────────
+// A separate concept from async modules: a scheduled meeting (Google Meet/Zoom/etc) with
+// a facilitator, a capacity, and a roster. Registering auto-creates the learner's course
+// enrollment (same collection self-paced courses use) so instructor-led training still
+// shows up in "My Training", compliance reports, and analytics without a parallel system.
+// Completion is attendance-driven (marked after the session) rather than progress-driven.
+
+const createSession = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['scheduledAt', 'durationMinutes', 'meetingLink'])) return;
+  const course = await findOne('courses', { _id: new ObjectId(req.params.id) });
+  if (!course) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const doc = {
+    courseId: course._id,
+    title: req.body.title || course.title,
+    facilitatorId: req.body.facilitatorId ? new ObjectId(req.body.facilitatorId) : null,
+    facilitatorName: req.body.facilitatorName || null,
+    scheduledAt: new Date(req.body.scheduledAt),
+    durationMinutes: Number(req.body.durationMinutes),
+    meetingLink: req.body.meetingLink,
+    capacity: req.body.capacity ? Number(req.body.capacity) : null,
+    attendeeIds: [],
+    status: 'scheduled',
+    attendance: [],
+    createdBy: new ObjectId(req.user._id),
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const result = await insertOne('trainingSessions', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+};
+
+const listCourseSessions = async (req, res) => {
+  const sessions = await findMany('trainingSessions', { courseId: new ObjectId(req.params.id) }, { sort: { scheduledAt: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, sessions);
+};
+
+const updateSession = async (req, res) => {
+  const session = await findOne('trainingSessions', { _id: new ObjectId(req.params.id) });
+  if (!session) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const update = { updatedAt: new Date() };
+  if (req.body.title !== undefined) update.title = req.body.title;
+  if (req.body.facilitatorId !== undefined) update.facilitatorId = req.body.facilitatorId ? new ObjectId(req.body.facilitatorId) : null;
+  if (req.body.facilitatorName !== undefined) update.facilitatorName = req.body.facilitatorName;
+  if (req.body.scheduledAt !== undefined) update.scheduledAt = new Date(req.body.scheduledAt);
+  if (req.body.durationMinutes !== undefined) update.durationMinutes = Number(req.body.durationMinutes);
+  if (req.body.meetingLink !== undefined) update.meetingLink = req.body.meetingLink;
+  if (req.body.capacity !== undefined) update.capacity = req.body.capacity ? Number(req.body.capacity) : null;
+  if (req.body.status !== undefined) {
+    if (!SESSION_STATUSES.includes(req.body.status)) return returnFunction(res, 400, false, `status must be one of: ${SESSION_STATUSES.join(', ')}`);
+    update.status = req.body.status;
+  }
+
+  await updateOne('trainingSessions', { _id: session._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteSession = async (req, res) => {
+  const result = await updateOne('trainingSessions', { _id: new ObjectId(req.params.id) }, { $set: { status: 'cancelled', updatedAt: new Date() } });
+  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+const registerForSession = async (req, res) => {
+  const session = await findOne('trainingSessions', { _id: new ObjectId(req.params.id) });
+  if (!session) return returnFunction(res, 404, false, req.locale.notFound);
+  if (session.status !== 'scheduled') return returnFunction(res, 400, false, 'This session is no longer open for registration.');
+
+  const employeeId = new ObjectId(req.user._id);
+  if (session.attendeeIds.some((id) => String(id) === String(employeeId))) {
+    return returnFunction(res, 409, false, 'You are already registered for this session.');
+  }
+  if (session.capacity && session.attendeeIds.length >= session.capacity) {
+    return returnFunction(res, 400, false, 'This session is full.');
+  }
+
+  await updateOne('trainingSessions', { _id: session._id }, { $push: { attendeeIds: employeeId }, $set: { updatedAt: new Date() } });
+  await createSingleCourseEnrollment({ employeeId, courseId: session.courseId, enrolledBy: employeeId, enrollmentTrigger: 'self_registered' });
+  return returnFunction(res, 200, true, 'Registered for session.');
+};
+
+const unregisterFromSession = async (req, res) => {
+  const session = await findOne('trainingSessions', { _id: new ObjectId(req.params.id) });
+  if (!session) return returnFunction(res, 404, false, req.locale.notFound);
+  await updateOne('trainingSessions', { _id: session._id }, { $pull: { attendeeIds: new ObjectId(req.user._id) }, $set: { updatedAt: new Date() } });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const markSessionAttendance = async (req, res) => {
+  const session = await findOne('trainingSessions', { _id: new ObjectId(req.params.id) });
+  if (!session) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!Array.isArray(req.body.attendance)) return returnFunction(res, 400, false, 'attendance must be an array of {employeeId, attended}.');
+
+  const attendance = req.body.attendance.map((a) => ({ employeeId: new ObjectId(a.employeeId), attended: !!a.attended }));
+  await updateOne('trainingSessions', { _id: session._id }, { $set: { attendance, status: 'completed', updatedAt: new Date() } });
+
+  for (const a of attendance) {
+    if (!a.attended) continue;
+    const enrollment = await findOne('enrollments', { employeeId: a.employeeId, courseId: session.courseId });
+    if (!enrollment || enrollment.status === 'completed') continue;
+    await updateOne('enrollments', { _id: enrollment._id }, { $set: { status: 'completed', completedAt: new Date(), progressPercentage: 100, updatedAt: new Date() } });
+    await maybeGenerateCertificate(enrollment._id);
+  }
+
+  return returnFunction(res, 200, true, 'Attendance recorded.');
+};
+
+const getMySessions = async (req, res) => {
+  const sessions = await findMany('trainingSessions', { attendeeIds: new ObjectId(req.user._id) }, { sort: { scheduledAt: 1 } });
+  const courseIds = [...new Set(sessions.map((s) => String(s.courseId)))].map((id) => new ObjectId(id));
+  const courses = courseIds.length ? await findMany('courses', { _id: { $in: courseIds } }, { projection: { title: 1 } }) : [];
+  const courseMap = Object.fromEntries(courses.map((c) => [String(c._id), c]));
+  const enriched = sessions.map((s) => ({ ...s, course: courseMap[String(s.courseId)] ?? null }));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
 module.exports = {
   COURSE_CATEGORIES, COURSE_STATUSES, MODULE_TYPES, ENROLLMENT_STATUSES, RULE_TRIGGERS,
+  DELIVERY_METHODS, SESSION_STATUSES,
   sendComplianceReminder,
+  uploadTrainingFile,
+  createSession, listCourseSessions, updateSession, deleteSession,
+  registerForSession, unregisterFromSession, markSessionAttendance, getMySessions,
   createCourse, listCourses, getCourse, updateCourse, publishCourse, archiveCourse, addCourseAuthor,
   listCatalog, getCatalogCourse, getModuleQuizForLearner,
   addModule, updateModule, deleteModule,

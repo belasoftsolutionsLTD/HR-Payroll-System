@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"}],"uuid":"84901f1aeafa4b6dbc9cb4433ebf934d","collectionName":"deduction_types","type":"collection"}

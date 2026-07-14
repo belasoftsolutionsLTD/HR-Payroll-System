@@ -18,6 +18,9 @@ const {
   createRule, listRules, updateRule, runRuleNow,
   getTrainingOverview, getComplianceReport, getCourseAnalytics, getEmployeeTrainingRecord, getLeaderboard,
   sendComplianceReminder,
+  uploadTrainingFile,
+  createSession, listCourseSessions, updateSession, deleteSession,
+  registerForSession, unregisterFromSession, markSessionAttendance, getMySessions,
 } = require('./trainingFunctions');
 
 const { SUPER_ADMIN, HR_MANAGER, ALL_ROLES } = require('../../constants/roles');
@@ -50,6 +53,19 @@ router.patch('/courses/:id',         allowRoles(HR), AsyncHandler(updateCourse))
 router.post('/courses/:id/publish',  allowRoles(HR), AsyncHandler(publishCourse));
 router.delete('/courses/:id',        allowRoles(HR), AsyncHandler(archiveCourse));
 router.post('/courses/:id/authors',  allowRoles(HR), AsyncHandler(addCourseAuthor));
+
+// ── Module content uploads (HR admin only) ────────────────────────────────────
+router.post('/upload', allowRoles(HR), upload.single('file'), AsyncHandler(uploadTrainingFile));
+
+// ── Live / Instructor-led Sessions (HR admin manages, all roles register) ─────
+router.post('/courses/:id/sessions',      allowRoles(HR), AsyncHandler(createSession));
+router.get('/courses/:id/sessions',       allowRoles(ALL_ROLES), AsyncHandler(listCourseSessions));
+router.patch('/sessions/:id',             allowRoles(HR), AsyncHandler(updateSession));
+router.delete('/sessions/:id',            allowRoles(HR), AsyncHandler(deleteSession));
+router.patch('/sessions/:id/attendance',  allowRoles(HR), AsyncHandler(markSessionAttendance));
+router.post('/sessions/:id/register',     allowRoles(ALL_ROLES), AsyncHandler(registerForSession));
+router.delete('/sessions/:id/register',   allowRoles(ALL_ROLES), AsyncHandler(unregisterFromSession));
+router.get('/my/sessions',                allowRoles(ALL_ROLES), AsyncHandler(getMySessions));
 
 // ── Modules / Quizzes (HR admin only) ─────────────────────────────────────────
 router.post('/courses/:id/modules',  allowRoles(HR), AsyncHandler(addModule));

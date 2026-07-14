@@ -17,6 +17,9 @@ async function initIndexes() {
     idx('employees', { managerId: 1 }),
     idx('employees', { fullName: 'text' }),
 
+    // ── job_history ──────────────────────────────────────────────────────────
+    idx('job_history', { employeeId: 1, effectiveDate: -1 }),
+
     // ── users ────────────────────────────────────────────────────────────────
     idx('users', { email: 1 },                    { unique: true }),
     idx('users', { employeeId: 1 },               { sparse: true }),
@@ -60,6 +63,8 @@ async function initIndexes() {
     idx('courses', { category: 1 }),
     idx('courses', { isMandatory: 1 }),
     idx('courseModules', { courseId: 1, order: 1 }),
+    idx('trainingSessions', { courseId: 1, scheduledAt: 1 }),
+    idx('trainingSessions', { attendeeIds: 1 }),
     idx('quizzes', { moduleId: 1 }),
     idx('quizzes', { courseId: 1 }),
     idx('learningPaths', { status: 1 }),
@@ -98,16 +103,34 @@ async function initIndexes() {
 
     // ── leave_balances ───────────────────────────────────────────────────────
     idx('leave_balances', { employeeId: 1, year: 1 }),
+    idx('leave_balances', { employeeId: 1, leaveTypeId: 1, year: 1 }),
 
-    // ── clock_entries ────────────────────────────────────────────────────────
-    idx('clock_entries', { employeeId: 1 }),
-    idx('clock_entries', { date: 1 }),
-    idx('clock_entries', { employeeId: 1, date: 1 }),
-    idx('clock_entries', { status: 1 }),
+    // ── leave_types / leave_accrual_policies / public_holidays / leave_blackouts / leave_audit_log ──
+    idx('leave_types', { code: 1 }),
+    idx('leave_types', { isActive: 1 }),
+    idx('leave_accrual_policies', { leaveTypeId: 1 }),
+    idx('leave_accrual_policies', { isActive: 1 }),
+    idx('public_holidays', { date: 1 }),
+    idx('leave_blackouts', { startDate: 1, endDate: 1 }),
+    idx('leave_audit_log', { leaveRequestId: 1 }),
+    idx('leave_audit_log', { employeeId: 1 }),
 
     // ── attendance_records ───────────────────────────────────────────────────
     idx('attendance_records', { employeeId: 1, date: 1 }),
-    idx('attendance_records', { department: 1, date: 1 }),
+    idx('attendance_records', { date: 1, status: 1 }),
+
+    // ── shifts / shift_applications ──────────────────────────────────────────
+    idx('shifts', { employeeId: 1, date: 1 }),
+    idx('shifts', { date: 1, isOpen: 1 }),
+    idx('shift_applications', { shiftId: 1, employeeId: 1 }),
+    idx('shift_applications', { employeeId: 1 }),
+
+    // ── timesheets ────────────────────────────────────────────────────────────
+    idx('timesheets', { employeeId: 1, weekStart: 1 }),
+    idx('timesheets', { status: 1, payrollRunId: 1 }),
+
+    // ── work_schedules / employeeShiftAssignments ────────────────────────────
+    idx('employeeShiftAssignments', { employeeId: 1, effectiveFrom: 1 }),
 
     // ── tasks ────────────────────────────────────────────────────────────────
     idx('tasks', { assignedTo: 1 }),
@@ -143,6 +166,9 @@ async function initIndexes() {
     idx('payroll_cycles', { 'period.month': 1, 'period.year': 1 }),
     idx('payroll_cycles', { payFrequency: 1 }),
     idx('payroll_cycles', { runType: 1 }),
+
+    // ── staff_loans ──────────────────────────────────────────────────────────
+    idx('staff_loans', { employeeId: 1, status: 1 }),
 
     // ── payslips ─────────────────────────────────────────────────────────────
     idx('payslips', { employeeId: 1 }),
@@ -192,15 +218,36 @@ async function initIndexes() {
     idx('expenses', { status: 1 }),
     idx('expenses', { submittedBy: 1, status: 1 }),
 
-    // ── performance_reviews ──────────────────────────────────────────────────
-    idx('performance_reviews', { employeeId: 1 }),
-    idx('performance_reviews', { cycleId: 1 }),
-    idx('performance_reviews', { status: 1 }),
+    // ── reviews ──────────────────────────────────────────────────────────────
+    // Was indexed under the wrong collection name ('performance_reviews') — the actual
+    // collection reads/writes go to 'reviews' (performanceFunctions.js), so these indexes
+    // never applied to any real query.
+    idx('reviews', { employeeId: 1 }),
+    idx('reviews', { cycleId: 1 }),
+    idx('reviews', { status: 1 }),
+
+    // ── review_cycles ────────────────────────────────────────────────────────
+    idx('review_cycles', { status: 1 }),
+    idx('review_cycles', { 'participants.employeeId': 1 }),
+
+    // ── review_templates ─────────────────────────────────────────────────────
+    idx('review_templates', { isActive: 1 }),
+
+    // ── oneOnOnes ────────────────────────────────────────────────────────────
+    idx('oneOnOnes', { managerId: 1 }),
+    idx('oneOnOnes', { employeeId: 1 }),
+    idx('oneOnOnes', { scheduledAt: -1 }),
+
+    // ── performanceImprovementPlans ──────────────────────────────────────────
+    idx('performanceImprovementPlans', { employeeId: 1 }),
+    idx('performanceImprovementPlans', { managerId: 1 }),
+    idx('performanceImprovementPlans', { status: 1 }),
 
     // ── goals ────────────────────────────────────────────────────────────────
     idx('goals', { employeeId: 1 }),
     idx('goals', { cycleId: 1 },             { sparse: true }),
     idx('goals', { status: 1 }),
+    idx('goals', { department: 1 },          { sparse: true }),
 
     // ── awards ───────────────────────────────────────────────────────────────
     idx('awards', { recipientId: 1 }),
@@ -215,6 +262,10 @@ async function initIndexes() {
     // ── messages ────────────────────────────────────────────────────────────
     idx('messages', { participants: 1 }),
     idx('messages', { createdAt: -1 }),
+
+    // ── customReports (Reports module) ──────────────────────────────────────
+    idx('customReports', { createdBy: 1 }),
+    idx('customReports', { 'schedule.nextRunAt': 1 }, { sparse: true }),
   ]);
 }
 

@@ -6,15 +6,14 @@ const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const { ALL_ROLES } = require('../../constants/roles');
 const {
-  getMyProfile, updateMyProfile, uploadMyProfilePhoto, serveMyProfilePhoto,
-  getMyLeaveBalance, getMyLeaveRequests, applyForLeave, disputeLeaveRequest, downloadLeavePdf,
-  getMyPayslips, getMyAttendance, getMyOnboardingTasks,
+  getMyProfile, updateMyProfile, getMyJobHistory, contactHR, uploadMyProfilePhoto, serveMyProfilePhoto,
+  updateMySkills, addMyCertification, deleteMyCertification, addMyEducation, deleteMyEducation,
+  getMyPayslips, getMyAttendance,
   getMyDocuments, uploadMyDocument, downloadMyDocument, deleteMyDocument,
   getMyPerformance,
   getMyAwards, getMyEvents,
   getNotificationPreference, toggleNotifications,
-  getDepartmentData, deptActOnLeave,
-  getMyOffboardingTasks, completeMyOffboardingTask,
+  getDepartmentData,
   getMyTasks,
   getMyProjects,
   getMyNotes,
@@ -32,16 +31,17 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 1
 
 router.get('/profile',            auth, AsyncHandler(getMyProfile));
 router.patch('/profile',          auth, AsyncHandler(updateMyProfile));
+router.get('/job-history',        auth, AsyncHandler(getMyJobHistory));
+router.patch('/skills',                    auth, AsyncHandler(updateMySkills));
+router.post('/certifications',             auth, AsyncHandler(addMyCertification));
+router.delete('/certifications/:certId',   auth, AsyncHandler(deleteMyCertification));
+router.post('/education',                  auth, AsyncHandler(addMyEducation));
+router.delete('/education/:eduId',         auth, AsyncHandler(deleteMyEducation));
+router.post('/contact-hr',        auth, AsyncHandler(contactHR));
 router.post('/profile/photo',     auth, upload.single('photo'), AsyncHandler(uploadMyProfilePhoto));
 router.get('/profile/photo',      auth, AsyncHandler(serveMyProfilePhoto));
-router.get('/leave/balance', auth, AsyncHandler(getMyLeaveBalance));
-router.get('/leave/requests',auth, AsyncHandler(getMyLeaveRequests));
-router.post('/leave/requests',             auth, AsyncHandler(applyForLeave));
-router.post('/leave/requests/:id/dispute', auth, AsyncHandler(disputeLeaveRequest));
-router.get('/leave/requests/:id/pdf',      auth, AsyncHandler(downloadLeavePdf));
 router.get('/payslips',      auth, AsyncHandler(getMyPayslips));
 router.get('/attendance',    auth, AsyncHandler(getMyAttendance));
-router.get('/onboarding',    auth, AsyncHandler(getMyOnboardingTasks));
 router.get('/announcements',            auth, AsyncHandler(getMyAnnouncements));
 router.patch('/announcements/:id/read', auth, AsyncHandler(markAnnouncementRead));
 
@@ -66,8 +66,7 @@ router.patch('/notifications/toggle',    auth, AsyncHandler(toggleNotifications)
 
 // Department portal (department_head and above only)
 const deptAuth = allowRoles(['super_admin', 'hr_manager', 'department_head']);
-router.get('/department',                   deptAuth, AsyncHandler(getDepartmentData));
-router.patch('/department/leave/:id',       deptAuth, AsyncHandler(deptActOnLeave));
+router.get('/department', deptAuth, AsyncHandler(getDepartmentData));
 
 // Tasks assigned to me
 router.get('/tasks', auth, AsyncHandler(getMyTasks));
@@ -77,10 +76,6 @@ router.get('/projects', auth, AsyncHandler(getMyProjects));
 
 // My HR notes (staff can read their own notes)
 router.get('/notes', auth, AsyncHandler(getMyNotes));
-
-// Offboarding (self-view for staff)
-router.get('/offboarding',                          auth, AsyncHandler(getMyOffboardingTasks));
-router.patch('/offboarding/tasks/:taskId/complete', auth, AsyncHandler(completeMyOffboardingTask));
 
 // Internal job board
 router.get('/jobs',                           auth, AsyncHandler(getOpenPositions));

@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"employeeId":{"$numberInt":"1"}},"name":"employeeId_1","background":true},{"v":{"$numberInt":"2"},"key":{"cycleId":{"$numberInt":"1"}},"name":"cycleId_1","background":true}],"uuid":"65481c68b3ae4b37831cb8e9d3ef17b4","collectionName":"payslips","type":"collection"}

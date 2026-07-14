@@ -7,10 +7,12 @@ const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../
 const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
 
 const MAX_APPLICATIONS_PER_REQUISITION = 2;
-const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
-const { notifyByRoles } = require('../../functions/HR/notifyUser');
-const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
+const { notifyHR } = require('../inbox/inboxFunctions');
 const { getEmployeePayslipRecords } = require('../payroll/payrollPayslipsFunctions');
+
+// Kenyan mobile format: 254 followed by 9 digits, Safaricom/Airtel/Telkom ranges start with 7 or 1.
+const MPESA_NUMBER_REGEX = /^254(7|1)\d{8}$/;
+const MPESA_NUMBER_ERROR = 'M-Pesa number must start with 254 and be a valid Kenyan mobile number (e.g. 254712345678).';
 
 // ── Profile ────────────────────────────────────────────────────────────────────
 const getMyProfile = async (req, res) => {
@@ -22,12 +24,27 @@ const getMyProfile = async (req, res) => {
 
 const updateMyProfile = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
-  const ALLOWED = ['phone', 'email', 'nextOfKin', 'kraPin', 'bankName', 'bankAccountNumber', 'mpesaNumber', 'paymentMethod', 'paypalEmail', 'cryptoWalletAddress', 'cryptoNetwork'];
+  const ALLOWED = [
+    'phone', 'email', 'nextOfKin', 'kraPin', 'bankName', 'bankAccountNumber', 'mpesaNumber', 'paymentMethod', 'paypalEmail', 'cryptoWalletAddress', 'cryptoNetwork',
+    'preferredName', 'gender', 'maritalStatus', 'nationality', 'passportNumber', 'passportExpiryDate', 'address', 'emergencyContacts',
+  ];
   const patch = {};
   for (const key of ALLOWED) {
     if (req.body[key] !== undefined) patch[key] = req.body[key];
   }
   if (!Object.keys(patch).length) return returnFunction(res, 400, false, 'No updatable fields provided.');
+  if (patch.passportExpiryDate) patch.passportExpiryDate = new Date(patch.passportExpiryDate);
+  if (Array.isArray(patch.emergencyContacts)) {
+    patch.emergencyContacts = patch.emergencyContacts.map(c => ({
+      id: c.id || new ObjectId().toString(),
+      name: c.name, relationship: c.relationship || null, phone: c.phone, email: c.email || null,
+    }));
+  }
+  const effectivePaymentMethod = patch.paymentMethod ?? (await findOne('employees', { _id: req.user.employeeId }, { projection: { paymentMethod: 1 } }))?.paymentMethod;
+  const effectiveMpesaNumber = patch.mpesaNumber !== undefined ? patch.mpesaNumber : undefined;
+  if (effectivePaymentMethod === 'mpesa' && effectiveMpesaNumber !== undefined && !MPESA_NUMBER_REGEX.test(String(effectiveMpesaNumber || '').trim())) {
+    return returnFunction(res, 400, false, MPESA_NUMBER_ERROR);
+  }
   patch.updatedAt = new Date();
   await updateOne('employees', { _id: req.user.employeeId }, { $set: patch });
   // Also sync email on the user account if changed
@@ -37,98 +54,88 @@ const updateMyProfile = async (req, res) => {
   return returnFunction(res, 200, true, 'Profile updated.');
 };
 
-// ── Leave ──────────────────────────────────────────────────────────────────────
-const getMyLeaveBalance = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const year = parseInt(req.query.year) || new Date().getFullYear();
-  const balance = await findOne('leave_balances', { employeeId: req.user.employeeId, year });
-  if (!balance) return returnFunction(res, 404, false, 'No leave balance for this year.');
-  return returnFunction(res, 200, true, 'OK', balance);
-};
-
-const getMyLeaveRequests = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const filter = { employeeId: req.user.employeeId };
-  if (req.query.status) filter.status = req.query.status;
-  const requests = await findMany('leave_requests', filter, { sort: { createdAt: -1 }, limit: 50 });
-  return returnFunction(res, 200, true, 'OK', requests);
-};
-
-const applyForLeave = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee record linked to your account. Contact HR.');
-  if (!validateRequiredFields(req, res, ['leaveType', 'startDate', 'endDate', 'reason'])) return;
-
-  const { leaveType, startDate, endDate, reason } = req.body;
-  if (new Date(endDate) < new Date(startDate)) {
-    return returnFunction(res, 400, false, 'Invalid leave date range. End date must be on or after the start date.');
-  }
-  const year = new Date(startDate).getFullYear();
-  const numberOfDays = calculateWorkingDays(startDate, endDate);
-  if (numberOfDays < 1) return returnFunction(res, 400, false, 'Invalid leave time range.');
-
-  const balance = await findOne('leave_balances', { employeeId: req.user.employeeId, year });
-  if (!balance) return returnFunction(res, 400, false, 'No leave balance record found for this year.');
-
-  const typeBalance = balance.balances[leaveType];
-  if (!typeBalance) return returnFunction(res, 400, false, 'Invalid leave type.');
-  if (typeBalance.remaining !== null && typeBalance.remaining < numberOfDays) {
-    return returnFunction(res, 400, false, `Insufficient ${leaveType} leave. Available: ${typeBalance.remaining} days, Requested: ${numberOfDays} days.`);
-  }
-
-  const doc = {
-    employeeId: req.user.employeeId,
-    leaveType,
-    startDate,
-    endDate,
-    numberOfDays,
-    reason,
-    status: 'pending',
-    approvedBy: null,
-    approvedAt: null,
-    comments: null,
-    createdAt: new Date(),
-  };
-  const result = await insertOne('leave_requests', doc);
-
-  // Notify HR and manager
-  const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1, department: 1 } });
-  const empName = emp?.fullName || 'An employee';
-  const inboxPayload = {
-    type: 'leave', subType: 'leave_request',
-    title: `Leave request from ${empName}`,
-    subtitle: `${leaveType} leave · ${startDate} – ${endDate} · ${numberOfDays} day${numberOfDays !== 1 ? 's' : ''}`,
-    referenceId: result.insertedId, referenceModel: 'leave_requests',
-    requiresAction: true, triggeredBy: req.user._id,
-  };
-  notifyHR(inboxPayload).catch(() => {});
-  notifyManager(req.user.employeeId, inboxPayload).catch(() => {});
-  notifyByRoles(['super_admin', 'hr_manager'], {
-    title: `Leave request from ${empName}`,
-    body: `${leaveType} leave · ${startDate} – ${endDate}`,
-    type: 'leave',
-  }).catch(() => {});
-
-  return returnFunction(res, 201, true, 'Leave request submitted.', { _id: result.insertedId, numberOfDays });
-};
-
-const disputeLeaveRequest = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const { reason } = req.body;
-  if (!reason?.trim()) return returnFunction(res, 400, false, 'A dispute reason is required.');
-
-  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
-  if (!request) return returnFunction(res, 404, false, 'Leave request not found.');
-  if (String(request.employeeId) !== String(req.user.employeeId))
-    return returnFunction(res, 403, false, 'This is not your leave request.');
-  if (request.status !== 'rejected')
-    return returnFunction(res, 400, false, 'Only rejected requests can be disputed.');
-
-  await updateOne('leave_requests', { _id: request._id }, {
-    $set: { status: 'disputed', disputeReason: reason.trim(), disputedAt: new Date() },
+// Own job history — salary-related values are always stripped, matching the same
+// "no salary history shown" rule applied to the rest of self-service.
+const getMyJobHistory = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 200, true, req.locale.success, []);
+  const history = await findMany('job_history', { employeeId: req.user.employeeId }, { sort: { effectiveDate: -1, createdAt: -1 } });
+  const sanitized = history.map(h => {
+    const { grossPay: _pg, ...previousValues } = h.previousValues || {};
+    const { grossPay: _ng, ...newValues } = h.newValues || {};
+    return { ...h, previousValues, newValues };
   });
-  return returnFunction(res, 200, true, 'Leave dispute submitted. HR will review your case.');
+  return returnFunction(res, 200, true, req.locale.success, sanitized);
 };
 
+// ── Skills, Certifications, Education (self-service) ──────────────────────────
+const updateMySkills = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  if (!Array.isArray(req.body.skills)) return returnFunction(res, 400, false, 'skills must be an array of strings.');
+  const skills = req.body.skills.map(s => String(s).trim()).filter(Boolean);
+  await updateOne('employees', { _id: req.user.employeeId }, { $set: { skills, updatedAt: new Date() } });
+  return returnFunction(res, 200, true, 'Skills updated.', skills);
+};
+
+const addMyCertification = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  if (!validateRequiredFields(req, res, ['name', 'issuingOrganization', 'issueDate'])) return;
+  const cert = {
+    id: new ObjectId().toString(),
+    name: req.body.name,
+    issuingOrganization: req.body.issuingOrganization,
+    issueDate: new Date(req.body.issueDate),
+    expiryDate: req.body.expiryDate ? new Date(req.body.expiryDate) : null,
+    fileUrl: req.body.fileUrl || null,
+  };
+  await updateOne('employees', { _id: req.user.employeeId }, { $push: { certifications: cert }, $set: { updatedAt: new Date() } });
+  return returnFunction(res, 201, true, 'Certification added.', cert);
+};
+
+const deleteMyCertification = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  await updateOne('employees', { _id: req.user.employeeId }, { $pull: { certifications: { id: req.params.certId } }, $set: { updatedAt: new Date() } });
+  return returnFunction(res, 200, true, 'Certification removed.');
+};
+
+const addMyEducation = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  if (!validateRequiredFields(req, res, ['institution', 'degree', 'fieldOfStudy', 'startYear'])) return;
+  const edu = {
+    id: new ObjectId().toString(),
+    institution: req.body.institution,
+    degree: req.body.degree,
+    fieldOfStudy: req.body.fieldOfStudy,
+    startYear: Number(req.body.startYear),
+    endYear: req.body.endYear ? Number(req.body.endYear) : null,
+  };
+  await updateOne('employees', { _id: req.user.employeeId }, { $push: { educationHistory: edu }, $set: { updatedAt: new Date() } });
+  return returnFunction(res, 201, true, 'Education entry added.', edu);
+};
+
+const deleteMyEducation = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  await updateOne('employees', { _id: req.user.employeeId }, { $pull: { educationHistory: { id: req.params.eduId } }, $set: { updatedAt: new Date() } });
+  return returnFunction(res, 200, true, 'Education entry removed.');
+};
+
+const contactHR = async (req, res) => {
+  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked to your account.');
+  if (!validateRequiredFields(req, res, ['topic'])) return;
+  const { topic, message } = req.body;
+
+  const employee = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } });
+  await notifyHR({
+    type: 'general', subType: 'staff_query',
+    title: `${employee?.fullName ?? 'A staff member'} needs help: ${topic}`,
+    subtitle: message || `Requesting HR to review/update "${topic}" on their profile.`,
+    referenceId: req.user.employeeId, referenceModel: 'employees',
+    priority: 'normal', requiresAction: true, triggeredBy: req.user._id,
+  });
+
+  return returnFunction(res, 200, true, 'HR has been notified — they will follow up with you.');
+};
+
+// ── Leave ──────────────────────────────────────────────────────────────────────
 // ── Payslips ───────────────────────────────────────────────────────────────────
 // Delegates to the single shared implementation in payrollPayslipsFunctions.js —
 // this route intentionally returns a flat array (unpaginated) to match the Staff
@@ -153,69 +160,6 @@ const getMyAttendance = async (req, res) => {
     .find(filter).sort({ date: -1 }).limit(90).toArray();
 
   return returnFunction(res, 200, true, 'OK', [{ employeeId: req.user.employeeId, records }]);
-};
-
-// ── Onboarding tasks ───────────────────────────────────────────────────────────
-const getMyOnboardingTasks = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const tasks = await findMany('onboarding_tasks', { employeeId: req.user.employeeId }, { sort: { status: 1, dueDate: 1 } });
-  return returnFunction(res, 200, true, 'OK', tasks);
-};
-
-// ── Leave PDF ──────────────────────────────────────────────────────────────────
-const downloadLeavePdf = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
-  if (!request) return returnFunction(res, 404, false, 'Leave request not found.');
-  if (String(request.employeeId) !== String(req.user.employeeId)) {
-    return returnFunction(res, 403, false, 'Access denied.');
-  }
-  const employee = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1 } });
-
-  const PDFDocument = require('pdfkit');
-  const companyName = process.env.COMPANY_NAME || 'School ERP';
-  const fmt = (d) => d ? new Date(d).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' }) : '—';
-  const STATUS_LABEL = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected', disputed: 'Disputed', partial: 'Partially Approved' };
-
-  const pdfBuffer = await new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 60 });
-    const buffers = [];
-    doc.on('data', (c) => buffers.push(c));
-    doc.on('end', () => resolve(Buffer.concat(buffers)));
-    doc.on('error', reject);
-
-    doc.fontSize(16).font('Helvetica-Bold').text(companyName, { align: 'center' });
-    doc.fontSize(12).font('Helvetica').text('LEAVE APPLICATION RECORD', { align: 'center' });
-    doc.moveDown(1);
-    doc.moveTo(60, doc.y).lineTo(535, doc.y).stroke().moveDown(0.5);
-
-    const row = (label, value) => {
-      doc.font('Helvetica-Bold').text(label + ':', { continued: true, width: 180 });
-      doc.font('Helvetica').text('  ' + (value || '—'));
-    };
-
-    row('Employee Name',  employee?.fullName);
-    row('Staff Number',   employee?.staffNumber);
-    row('Department',     employee?.department);
-    row('Designation',    employee?.designation);
-    doc.moveDown(0.5);
-    row('Leave Type',     request.leaveType ? request.leaveType.charAt(0).toUpperCase() + request.leaveType.slice(1) : '—');
-    row('Start Date',     fmt(request.startDate));
-    row('End Date',       fmt(request.endDate));
-    row('Number of Days', String(request.numberOfDays || '—'));
-    row('Status',         STATUS_LABEL[request.status] || request.status);
-    if (request.approvedDays) row('Approved Days', String(request.approvedDays));
-    row('Reason',         request.reason);
-    if (request.comments) row('HR Comments',  request.comments);
-    doc.moveDown(1);
-    doc.moveTo(60, doc.y).lineTo(535, doc.y).stroke().moveDown(0.5);
-    doc.fontSize(8).fillColor('grey').text('Generated on ' + new Date().toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' }), { align: 'right' });
-    doc.end();
-  });
-
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="leave-${request._id}.pdf"`);
-  res.send(pdfBuffer);
 };
 
 // ── Documents ──────────────────────────────────────────────────────────────────
@@ -276,16 +220,6 @@ const getDepartmentData = async (req, res) => {
 
   const empIds = employees.map(e => e._id);
 
-  // Pending leave requests
-  const leaveRequests = await findMany('leave_requests',
-    { employeeId: { $in: empIds }, status: 'pending' },
-    { sort: { createdAt: -1 }, limit: 30 }
-  );
-  const enrichedLeave = leaveRequests.map(lr => {
-    const emp = employees.find(e => String(e._id) === String(lr.employeeId));
-    return { ...lr, employeeName: emp?.fullName || null };
-  });
-
   // Today's attendance
   const today = new Date().toISOString().split('T')[0];
   const todayAttendance = await findMany('attendance_records', { employeeId: { $in: empIds }, date: today }, {});
@@ -293,40 +227,13 @@ const getDepartmentData = async (req, res) => {
   const absent    = todayAttendance.filter(r => r.status === 'absent').length;
   const onLeave   = employees.filter(e => e.status === 'on_leave').length;
 
+  // Pending leave for this department head's team now lives at GET /api/leave/requests
+  // (role-scoped automatically for department_head) — not duplicated here.
   return returnFunction(res, 200, true, 'OK', {
     department: dept,
     employees,
-    pendingLeave: enrichedLeave,
     stats: { total: employees.length, present, absent, onLeave, notMarked: employees.length - todayAttendance.length },
   });
-};
-
-const deptActOnLeave = async (req, res) => {
-  const { id } = req.params;
-  const action = req.body.action; // 'approve' | 'reject'
-  if (!['approve', 'reject'].includes(action)) return returnFunction(res, 400, false, 'Action must be approve or reject.');
-  if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee profile linked.');
-
-  const me = await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1 } });
-  if (!me?.department) return returnFunction(res, 400, false, 'No department on your profile.');
-
-  const lr = await findOne('leave_requests', { _id: new ObjectId(id) });
-  if (!lr) return returnFunction(res, 404, false, 'Leave request not found.');
-
-  const emp = await findOne('employees', { _id: lr.employeeId }, { projection: { department: 1 } });
-  if (emp?.department !== me.department) return returnFunction(res, 403, false, 'This employee is not in your department.');
-  if (lr.status !== 'pending') return returnFunction(res, 409, false, `Leave request is already ${lr.status}.`);
-
-  const newStatus = action === 'approve' ? 'approved' : 'rejected';
-  await global.dbo.collection('leave_requests').updateOne(
-    { _id: lr._id },
-    { $set: { status: newStatus, reviewedBy: new ObjectId(req.user._id), reviewedAt: new Date() } }
-  );
-  if (action === 'approve') {
-    await global.dbo.collection('employees').updateOne({ _id: lr.employeeId }, { $set: { status: 'on_leave' } });
-  }
-
-  return returnFunction(res, 200, true, action === 'approve' ? 'Leave approved.' : 'Leave rejected.');
 };
 
 // ── Performance ────────────────────────────────────────────────────────────────
@@ -415,50 +322,6 @@ const serveMyProfilePhoto = async (req, res) => {
   fs.createReadStream(filePath).pipe(res);
 };
 
-// ── Offboarding (self-view) ────────────────────────────────────────────────────
-
-const getMyOffboardingTasks = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
-  const tasks = await findMany(
-    'offboarding_tasks',
-    { employeeId: new ObjectId(String(req.user.employeeId)) },
-    { sort: { taskSection: 1, dueDate: 1 } }
-  );
-  return returnFunction(res, 200, true, 'OK', tasks);
-};
-
-const completeMyOffboardingTask = async (req, res) => {
-  if (!req.user.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
-  const task = await findOne('offboarding_tasks', { _id: new ObjectId(req.params.taskId) });
-  if (!task) return returnFunction(res, 404, false, 'Task not found.');
-  if (String(task.employeeId) !== String(req.user.employeeId))
-    return returnFunction(res, 403, false, 'Not your task.');
-
-  await updateOne(
-    'offboarding_tasks',
-    { _id: new ObjectId(req.params.taskId) },
-    { $set: { status: 'completed', completedAt: new Date(), completedBy: new ObjectId(String(req.user._id)) } }
-  );
-
-  // Notify HR when all tasks belonging to this employee are done
-  const remaining = await global.dbo.collection('offboarding_tasks').countDocuments({
-    employeeId: task.employeeId,
-    status: { $ne: 'completed' },
-  });
-  if (remaining === 0) {
-    const employee = await findOne('employees', { _id: task.employeeId }, { projection: { fullName: 1 } });
-    const hrManagers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] } }, { projection: { _id: 1 } });
-    if (employee) {
-      notifyByRoles(['super_admin', 'hr_manager'], {
-        title: 'Offboarding Complete',
-        body: `All offboarding tasks for ${employee.fullName} have been completed.`,
-        type: 'general',
-      }).catch(() => {});
-    }
-  }
-
-  return returnFunction(res, 200, true, 'Task marked complete.');
-};
 
 // ── My Projects ────────────────────────────────────────────────────────────────
 const getMyProjects = async (req, res) => {
@@ -627,15 +490,14 @@ const getMyNotes = async (req, res) => {
 };
 
 module.exports = {
-  getMyProfile, updateMyProfile, uploadMyProfilePhoto, serveMyProfilePhoto,
-  getMyLeaveBalance, getMyLeaveRequests, applyForLeave, disputeLeaveRequest, downloadLeavePdf,
-  getMyPayslips, getMyAttendance, getMyOnboardingTasks,
+  getMyProfile, updateMyProfile, getMyJobHistory, contactHR, uploadMyProfilePhoto, serveMyProfilePhoto,
+  updateMySkills, addMyCertification, deleteMyCertification, addMyEducation, deleteMyEducation,
+  getMyPayslips, getMyAttendance,
   getMyDocuments, uploadMyDocument, downloadMyDocument, deleteMyDocument,
   getMyPerformance,
   getMyAwards, getMyEvents,
   getNotificationPreference, toggleNotifications,
-  getDepartmentData, deptActOnLeave,
-  getMyOffboardingTasks, completeMyOffboardingTask,
+  getDepartmentData,
   getMyTasks,
   getMyProjects,
   getMyNotes,
