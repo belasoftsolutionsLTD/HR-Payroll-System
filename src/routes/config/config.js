@@ -5,10 +5,8 @@ const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   listDepartments, createDepartment, updateDepartment, deleteDepartment,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
-  listAllowances,  createAllowance,  updateAllowance,  deleteAllowance,
   listFixedAllowances, createFixedAllowance, updateFixedAllowance, deleteFixedAllowance,
   listDeductions,  createDeduction,  updateDeduction,  deleteDeduction,
-  listLeaveTypes,  createLeaveType,  updateLeaveType,  deleteLeaveType,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,
   listJdTemplates,  createJdTemplate,  updateJdTemplate,  deleteJdTemplate, serveJdTemplate,
@@ -39,29 +37,19 @@ router.post('/job-groups',        allowRoles(ROLES), AsyncHandler(createJobGroup
 router.put('/job-groups/:id',     allowRoles(ROLES), AsyncHandler(updateJobGroup));
 router.delete('/job-groups/:id',  allowRoles(ROLES), AsyncHandler(deleteJobGroup));
 
-// Allowances (job-group linked)
-router.get('/allowances',         allowRoles(ROLES), AsyncHandler(listAllowances));
-router.post('/allowances',        allowRoles(ROLES), AsyncHandler(createAllowance));
-router.put('/allowances/:id',     allowRoles(ROLES), AsyncHandler(updateAllowance));
-router.delete('/allowances/:id',  allowRoles(ROLES), AsyncHandler(deleteAllowance));
-
-// Fixed Allowances (standalone)
+// Allowances — job-group-scoped, applied automatically during payroll runs (see
+// payrollCyclesFunctions.js). Collection name (fixed_allowances) kept unchanged;
+// only the label was ever "Fixed Allowances".
 router.get('/fixed-allowances',         allowRoles(ROLES), AsyncHandler(listFixedAllowances));
 router.post('/fixed-allowances',        allowRoles(ROLES), AsyncHandler(createFixedAllowance));
 router.put('/fixed-allowances/:id',     allowRoles(ROLES), AsyncHandler(updateFixedAllowance));
 router.delete('/fixed-allowances/:id',  allowRoles(ROLES), AsyncHandler(deleteFixedAllowance));
 
-// Deductions
+// Deductions — job-group-scoped, applied automatically during payroll runs.
 router.get('/deductions',         allowRoles(ROLES), AsyncHandler(listDeductions));
 router.post('/deductions',        allowRoles(ROLES), AsyncHandler(createDeduction));
 router.put('/deductions/:id',     allowRoles(ROLES), AsyncHandler(updateDeduction));
 router.delete('/deductions/:id',  allowRoles(ROLES), AsyncHandler(deleteDeduction));
-
-// Leave Types
-router.get('/leave-types',        allowRoles(ROLES), AsyncHandler(listLeaveTypes));
-router.post('/leave-types',       allowRoles(ROLES), AsyncHandler(createLeaveType));
-router.put('/leave-types/:id',    allowRoles(ROLES), AsyncHandler(updateLeaveType));
-router.delete('/leave-types/:id', allowRoles(ROLES), AsyncHandler(deleteLeaveType));
 
 // Communication Settings
 router.get('/communication-settings',   allowRoles(ROLES), AsyncHandler(getCommunicationSettings));

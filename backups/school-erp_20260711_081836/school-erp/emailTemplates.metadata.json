@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"trigger":{"$numberInt":"1"}},"name":"trigger_1","background":true}],"uuid":"421e68c3c303410d91f83aae2a7b6198","collectionName":"emailTemplates","type":"collection"}

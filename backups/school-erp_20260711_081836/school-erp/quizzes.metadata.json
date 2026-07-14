@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"courseId":{"$numberInt":"1"}},"name":"courseId_1","background":true},{"v":{"$numberInt":"2"},"key":{"moduleId":{"$numberInt":"1"}},"name":"moduleId_1","background":true}],"uuid":"2c1ab1bbc2c7486691055d2eca99208f","collectionName":"quizzes","type":"collection"}

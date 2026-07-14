@@ -76,13 +76,8 @@ const updateJobGroup = async (req, res) => {
 
 const deleteJobGroup = makeDelete('job_groups');
 
-// ── Allowances (job-group linked) ─────────────────────────────────────────────
-const listAllowances  = makeList('allowances');
-const createAllowance = makeCreate('allowances', ['name', 'amount']);
-const updateAllowance = makeUpdate('allowances');
-const deleteAllowance = makeDelete('allowances');
-
-// ── Fixed Allowances (standalone, not per job group) ─────────────────────────
+// ── Allowances (job-group linked, applied automatically during payroll runs —
+// see payrollCyclesFunctions.js. Collection name kept as fixed_allowances.) ──
 const listFixedAllowances  = makeList('fixed_allowances');
 const createFixedAllowance = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'amount'])) return;
@@ -93,6 +88,8 @@ const createFixedAllowance = async (req, res) => {
     amount: Number(req.body.amount),
     description: req.body.description || '',
     isEnabled: req.body.isEnabled !== false,
+    isTaxable: req.body.isTaxable !== false,
+    appearsOnPayslip: req.body.appearsOnPayslip !== false,
     jobGroupIds: Array.isArray(req.body.jobGroupIds) ? req.body.jobGroupIds : [],
     createdAt: new Date(), updatedAt: new Date(),
   };
@@ -123,12 +120,6 @@ const createDeduction = async (req, res) => {
 };
 const updateDeduction = makeUpdate('deduction_types');
 const deleteDeduction = makeDelete('deduction_types');
-
-// ── Leave Types ───────────────────────────────────────────────────────────────
-const listLeaveTypes  = makeList('leave_types');
-const createLeaveType = makeCreate('leave_types', ['name', 'defaultDays']);
-const updateLeaveType = makeUpdate('leave_types');
-const deleteLeaveType = makeDelete('leave_types');
 
 // ── Designations (linked to departments) ─────────────────────────────────────
 const listDesignations = async (req, res) => {
@@ -267,10 +258,8 @@ const updateCommunicationSettings = async (req, res) => {
 module.exports = {
   listDepartments, createDepartment, updateDepartment, deleteDepartment,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
-  listAllowances,  createAllowance,  updateAllowance,  deleteAllowance,
   listFixedAllowances, createFixedAllowance, updateFixedAllowance, deleteFixedAllowance,
   listDeductions,  createDeduction,  updateDeduction,  deleteDeduction,
-  listLeaveTypes,  createLeaveType,  updateLeaveType,  deleteLeaveType,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,
   listJdTemplates,  createJdTemplate,  updateJdTemplate,  deleteJdTemplate, serveJdTemplate,

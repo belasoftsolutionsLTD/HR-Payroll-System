@@ -1,86 +1,101 @@
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
-const { scopeBodyToSelf } = require('../../middleware/ScopeMiddleware');
+const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
 const {
-  getLeaveBalances, listLeaveRequests, createLeaveRequest,
-  approveLeaveRequest, rejectLeaveRequest, deleteLeaveRequest,
-  revokeLeaveRequest, resolveDispute, getLeaveCalendar, getLeaveConflicts,
-  getMyBalances, getCalendarEntries, getTodayAbsences, getUpcomingLeaves,
-  cancelLeaveRequest, getLeaveRequest, exportLeaveRequests, adjustLeaveBalance,
-  listPolicies, createPolicy, getPolicy, updatePolicy, deletePolicy, setDefaultPolicy,
-  listHolidays, addHoliday, deleteHoliday, getLeaveAnalytics,
-  runLeaveAccrual,
+  createLeaveType, listLeaveTypes, getLeaveType, updateLeaveType, deleteLeaveType,
+  createPublicHoliday, listPublicHolidays, updatePublicHoliday, deletePublicHoliday,
+  createAccrualPolicy, listAccrualPolicies, getAccrualPolicy, updateAccrualPolicy, deleteAccrualPolicy,
+  runAccrualPolicies, runYearEndCarryForward,
+  getLeaveBalances, getEmployeeLeaveBalances, adjustLeaveBalance,
+  listLeaveRequests, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
+  approveLeaveRequest, rejectLeaveRequest, cancelLeaveRequest,
+  revokeLeaveRequest, disputeLeaveRequest, resolveDispute,
+  getLeaveCalendar, getPayrollFeed, markPayrollFeedProcessed, getLeaveAnalytics,
   listBlackouts, addBlackout, deleteBlackout,
-  getLeaveConfig, updateLeaveConfig,
-  runYearEndCarryForward,
+  getMyLeaveTypeOptions, getMyBalances, getMyRequests, getMyRequestDetail, uploadMyAttachment, getMyCalendar,
 } = require('./leaveFunctions');
 
-const ALL  = ['super_admin', 'hr_manager', 'department_head', 'staff'];
-const MGMT = ['super_admin', 'hr_manager', 'department_head'];
-const HR   = ['super_admin', 'hr_manager'];
+const hrOnly = allowRoles(HR_ROLES);
+const mgmtOnly = allowRoles(MGMT_ROLES);
+const allRoles = allowRoles(ALL_ROLES);
 
-// ── Specific named routes BEFORE any /:param catch-alls ──────────────────────
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
+    filename: (req, file, cb) => cb(null, `leave-attachment-${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
-// Balances
-router.get('/balances/me',               allowRoles(ALL),  AsyncHandler(getMyBalances));
-router.post('/balances/adjust',          allowRoles(HR),   AsyncHandler(adjustLeaveBalance));
-router.get('/balances/:employeeId',      allowRoles(MGMT), AsyncHandler(getLeaveBalances));
+// ── Leave Types — HR only ───────────────────────────────────────────────────────
+router.post('/types',       hrOnly, AsyncHandler(createLeaveType));
+router.get('/types',        hrOnly, AsyncHandler(listLeaveTypes));
+router.get('/types/:id',    hrOnly, AsyncHandler(getLeaveType));
+router.patch('/types/:id',  hrOnly, AsyncHandler(updateLeaveType));
+router.delete('/types/:id', hrOnly, AsyncHandler(deleteLeaveType));
 
-// Requests — named sub-routes first
-router.get('/requests/export',           allowRoles(MGMT), AsyncHandler(exportLeaveRequests));
-router.get('/requests',                  allowRoles(ALL),  AsyncHandler(listLeaveRequests));
-router.post('/requests',                 allowRoles(ALL),  scopeBodyToSelf, AsyncHandler(createLeaveRequest));
-router.get('/requests/:id',              allowRoles(ALL),  AsyncHandler(getLeaveRequest));
-router.put('/requests/:id/approve',      allowRoles(MGMT), AsyncHandler(approveLeaveRequest));
-router.put('/requests/:id/decline',      allowRoles(MGMT), AsyncHandler(rejectLeaveRequest));
-router.put('/requests/:id/cancel',       allowRoles(ALL),  AsyncHandler(cancelLeaveRequest));
-router.put('/requests/:id/revoke',       allowRoles(MGMT), AsyncHandler(revokeLeaveRequest));
-router.put('/requests/:id/resolve-dispute', allowRoles(HR), AsyncHandler(resolveDispute));
-router.delete('/requests/:id',           allowRoles(HR),   AsyncHandler(deleteLeaveRequest));
-// Legacy PATCH (backwards compat with existing frontend)
-router.patch('/requests/:id/approve',         allowRoles(MGMT), AsyncHandler(approveLeaveRequest));
-router.patch('/requests/:id/reject',          allowRoles(MGMT), AsyncHandler(rejectLeaveRequest));
-router.patch('/requests/:id/revoke',          allowRoles(MGMT), AsyncHandler(revokeLeaveRequest));
-router.patch('/requests/:id/resolve-dispute', allowRoles(HR),   AsyncHandler(resolveDispute));
+// ── Accrual Policies — HR only ──────────────────────────────────────────────────
+router.post('/accrual-policies',       hrOnly, AsyncHandler(createAccrualPolicy));
+router.get('/accrual-policies',        hrOnly, AsyncHandler(listAccrualPolicies));
+router.post('/accrual-policies/run',   hrOnly, AsyncHandler(runAccrualPolicies));
+router.get('/accrual-policies/:id',    hrOnly, AsyncHandler(getAccrualPolicy));
+router.patch('/accrual-policies/:id',  hrOnly, AsyncHandler(updateAccrualPolicy));
+router.delete('/accrual-policies/:id', hrOnly, AsyncHandler(deleteAccrualPolicy));
+router.post('/year-end/carry-forward', hrOnly, AsyncHandler(runYearEndCarryForward));
 
-// Calendar & overview
-router.get('/calendar/entries',          allowRoles(ALL),  AsyncHandler(getCalendarEntries));
-router.get('/calendar',                  allowRoles(ALL),  AsyncHandler(getLeaveCalendar));
-router.get('/conflicts',                 allowRoles(ALL),  AsyncHandler(getLeaveConflicts));
-router.get('/today-absences',            allowRoles(MGMT), AsyncHandler(getTodayAbsences));
-router.get('/upcoming',                  allowRoles(ALL),  AsyncHandler(getUpcomingLeaves));
+// ── Employee self-service (own record only) — declared before /requests/:id ───
+router.get('/my/leave-types',           allRoles, AsyncHandler(getMyLeaveTypeOptions));
+router.get('/my/balances',              allRoles, AsyncHandler(getMyBalances));
+router.get('/my/requests',              allRoles, AsyncHandler(getMyRequests));
+router.get('/my/requests/:id',          allRoles, AsyncHandler(getMyRequestDetail));
+router.post('/my/requests',             allRoles, AsyncHandler(createLeaveRequest));
+router.patch('/my/requests/:id',        allRoles, AsyncHandler(updateMyDraftRequest));
+router.delete('/my/requests/:id',       allRoles, AsyncHandler(cancelLeaveRequest));
+router.post('/my/requests/:id/attachment', allRoles, upload.single('file'), AsyncHandler(uploadMyAttachment));
+router.post('/my/requests/:id/dispute', allRoles, AsyncHandler(disputeLeaveRequest));
+router.get('/my/calendar',              allRoles, AsyncHandler(getMyCalendar));
 
-// Policies
-router.get('/policies',                  allowRoles(HR),   AsyncHandler(listPolicies));
-router.post('/policies',                 allowRoles(HR),   AsyncHandler(createPolicy));
-router.get('/policies/:id',              allowRoles(HR),   AsyncHandler(getPolicy));
-router.put('/policies/:id',              allowRoles(HR),   AsyncHandler(updatePolicy));
-router.delete('/policies/:id',           allowRoles(HR),   AsyncHandler(deletePolicy));
-router.post('/policies/:id/set-default', allowRoles(HR),   AsyncHandler(setDefaultPolicy));
+// ── Leave Balances — scoped by role ─────────────────────────────────────────────
+router.get('/balances',              allRoles, AsyncHandler(getLeaveBalances));
+router.patch('/balances/:id/adjust', hrOnly, AsyncHandler(adjustLeaveBalance));
+// scoping (including staff-role managers via employees.managerId) is enforced inside the handler
+router.get('/balances/:employeeId',  allRoles, AsyncHandler(getEmployeeLeaveBalances));
 
-// Public holidays
-router.get('/holidays',                  allowRoles(ALL),  AsyncHandler(listHolidays));
-router.post('/holidays',                 allowRoles(HR),   AsyncHandler(addHoliday));
-router.delete('/holidays/:id',           allowRoles(HR),   AsyncHandler(deleteHoliday));
+// ── Leave Requests — HR/manager views, role-scoped inside handlers ─────────────
+router.get('/requests',                    allRoles, AsyncHandler(listLeaveRequests));
+router.get('/requests/:id',                allRoles, AsyncHandler(getLeaveRequest));
+// approve/reject use allRoles at the route level because a Level 1 approver is
+// often a plain "staff" user acting as a manager via employees.managerId — the
+// fine-grained check (current approval step's approverId, or HR override) lives
+// inside approveLeaveRequest/rejectLeaveRequest themselves.
+router.patch('/requests/:id/approve',      allRoles, AsyncHandler(approveLeaveRequest));
+router.patch('/requests/:id/reject',       allRoles, AsyncHandler(rejectLeaveRequest));
+router.patch('/requests/:id/cancel',       allRoles, AsyncHandler(cancelLeaveRequest));
+router.patch('/requests/:id/revoke',       hrOnly, AsyncHandler(revokeLeaveRequest));
+router.patch('/requests/:id/resolve-dispute', hrOnly, AsyncHandler(resolveDispute));
 
-// Analytics
-router.get('/analytics',                 allowRoles(MGMT), AsyncHandler(getLeaveAnalytics));
+// ── Public Holidays — HR manages, all roles can view ────────────────────────────
+router.post('/public-holidays',       hrOnly, AsyncHandler(createPublicHoliday));
+router.get('/public-holidays',        allRoles, AsyncHandler(listPublicHolidays));
+router.patch('/public-holidays/:id',  hrOnly, AsyncHandler(updatePublicHoliday));
+router.delete('/public-holidays/:id', hrOnly, AsyncHandler(deletePublicHoliday));
 
-// Monthly accrual (HR-only, safe to call multiple times — idempotent per month)
-router.post('/accrual/run',              allowRoles(HR),   AsyncHandler(runLeaveAccrual));
+// ── Blackout Periods — bonus feature, HR manages ────────────────────────────────
+router.get('/blackouts',        allRoles, AsyncHandler(listBlackouts));
+router.post('/blackouts',       hrOnly, AsyncHandler(addBlackout));
+router.delete('/blackouts/:id', hrOnly, AsyncHandler(deleteBlackout));
 
-// Blackout periods
-router.get('/blackouts',                 allowRoles(ALL),  AsyncHandler(listBlackouts));
-router.post('/blackouts',                allowRoles(HR),   AsyncHandler(addBlackout));
-router.delete('/blackouts/:id',          allowRoles(HR),   AsyncHandler(deleteBlackout));
+// ── Team Calendar — scoped by role ──────────────────────────────────────────────
+router.get('/calendar', allRoles, AsyncHandler(getLeaveCalendar));
 
-// Leave config (min notice days per leave type, etc.)
-router.get('/config',                    allowRoles(ALL),  AsyncHandler(getLeaveConfig));
-router.patch('/config',                  allowRoles(HR),   AsyncHandler(updateLeaveConfig));
+// ── Payroll Integration ──────────────────────────────────────────────────────────
+router.get('/payroll-feed',       hrOnly, AsyncHandler(getPayrollFeed));
+router.post('/payroll-feed/mark', hrOnly, AsyncHandler(markPayrollFeedProcessed));
 
-// Year-end carry-forward
-router.post('/year-end/carry-forward',   allowRoles(HR),   AsyncHandler(runYearEndCarryForward));
+// ── Analytics — scoped by role ──────────────────────────────────────────────────
+router.get('/analytics', mgmtOnly, AsyncHandler(getLeaveAnalytics));
 
 module.exports = router;

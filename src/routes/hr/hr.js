@@ -3,7 +3,6 @@ const router = express.Router();
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
-  getDashboard,
   getOrgChart, getAllDocuments,
   getNotifications, markNotificationRead, markAllNotificationsRead,
 } = require('./hrFunctions');
@@ -11,9 +10,6 @@ const {
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
 
 // Job requisitions now live in the recruitment module — see /api/recruitment/requisitions
-
-// Dashboard
-router.get('/dashboard', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getDashboard));
 
 // Org Chart
 router.get('/org-chart', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), AsyncHandler(getOrgChart));

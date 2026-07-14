@@ -28,6 +28,10 @@ const getUserData = AsyncHandler(async (req, res, next) => {
     return returnFunction(res, 401, false, (req.locale || {}).unauthorized || 'Unauthorized.');
   }
 
+  if (user.isActive === false) {
+    return returnFunction(res, 403, false, 'Your account has been deactivated. Contact HR.');
+  }
+
   // Attach full user including employeeId and mustResetPassword for downstream middleware
   req.user = {
     ...user,

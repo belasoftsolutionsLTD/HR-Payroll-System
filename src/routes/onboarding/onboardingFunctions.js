@@ -1,506 +1,548 @@
 const { ObjectId } = require('mongodb');
-const path = require('path');
-const fs   = require('fs');
+const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
-const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
+const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
-const { notifyHR } = require('../inbox/inboxFunctions');
-const { getOpenSpendItems } = require('../../lib/spend/clearanceCheck');
+const { initiateOnboarding, notifyStakeholder } = require('../../lib/onboarding/autoAssignTasks');
 
-// ── Templates ──────────────────────────────────────────────────────────────────
+const HR_ROLE_LIST = ['super_admin', 'hr_manager'];
+const isHR = (req) => HR_ROLE_LIST.includes(req.user?.role);
+
+// A task counts as overdue for display purposes if it isn't finished and its due
+// date has passed — computed at read time rather than stored, so it's always
+// correct without a cron job (same idiom as the old getOverdueTasks endpoint).
+const withComputedStatus = (task) => {
+  if (task.status === 'completed') return task;
+  const isOverdue = task.dueDate && new Date(task.dueDate) < new Date();
+  return isOverdue ? { ...task, status: 'overdue' } : task;
+};
+
+const computeProgress = (record) => {
+  const allTasks = (record.taskLists || []).flatMap(l => l.tasks || []);
+  const total = allTasks.length;
+  const completed = allTasks.filter(t => t.status === 'completed').length;
+  const progressPercentage = total ? Math.round((completed / total) * 100) : 0;
+  const taskLists = (record.taskLists || []).map(l => ({ ...l, tasks: (l.tasks || []).map(withComputedStatus) }));
+  return { ...record, taskLists, progressPercentage };
+};
+
+const enrichEmployee = async (record) => {
+  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } });
+  return { ...record, employee: employee || null };
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TEMPLATES
+// ══════════════════════════════════════════════════════════════════════════════
+
 const listTemplates = async (req, res) => {
-  const templates = await findMany('onboarding_templates', {}, { sort: { order: 1, name: 1 } });
+  const templates = await findMany('onboarding_templates', {}, { sort: { name: 1 } });
   return returnFunction(res, 200, true, req.locale.success, templates);
 };
 
+const getTemplate = async (req, res) => {
+  const template = await findOne('onboarding_templates', { _id: new ObjectId(req.params.id) });
+  if (!template) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.success, template);
+};
+
+const withGeneratedIds = (taskLists = []) => taskLists.map(list => ({
+  id: list.id || crypto.randomUUID(),
+  name: list.name,
+  assignedTo: list.assignedTo,
+  tasks: (list.tasks || []).map(t => ({
+    id: t.id || crypto.randomUUID(),
+    title: t.title,
+    description: t.description || '',
+    dueOffsetDays: Number(t.dueOffsetDays) || 0,
+    isRequired: t.isRequired !== false,
+    requiresDocument: !!t.requiresDocument,
+    documentTemplateId: t.documentTemplateId || null,
+    resourceUrl: t.resourceUrl || null,
+  })),
+}));
+
+// HR attaches a reference file (e.g. employee handbook PDF) to a task template —
+// the resulting URL is stored on the task and copied onto every instantiated
+// record's task by initiateOnboarding, so the new hire can view/download it.
+const uploadTemplateResource = async (req, res) => {
+  if (!req.file) return returnFunction(res, 400, false, 'A file is required.');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { fileUrl: `/uploads/${req.file.filename}` });
+};
+
 const createTemplate = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['title'])) return;
-  const { title, description, department, daysToComplete } = req.body;
+  if (!validateRequiredFields(req, res, ['name'])) return;
+  const { name, description, targetRoles, targetDepartments, welcomeMessage, firstDayDetails, taskLists, meetTheTeam } = req.body;
   const doc = {
-    title: title.trim(),
-    description: description?.trim() || '',
-    department: department || 'All',
-    daysToComplete: parseInt(daysToComplete) || 7,
+    name: name.trim(),
+    description: description || '',
+    targetRoles: targetRoles || [],
+    targetDepartments: targetDepartments || [],
+    welcomeMessage: welcomeMessage || '',
+    firstDayDetails: firstDayDetails || { location: '', reportingTime: '', whatToBring: '', additionalNotes: '' },
+    taskLists: withGeneratedIds(taskLists),
+    meetTheTeam: (meetTheTeam || []).map(m => ({ employeeId: new ObjectId(m.employeeId), note: m.note || '' })),
+    createdBy: req.user?._id || null,
     createdAt: new Date(),
+    updatedAt: new Date(),
   };
   const result = await insertOne('onboarding_templates', doc);
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
 const updateTemplate = async (req, res) => {
-  const { title, description, department, daysToComplete } = req.body;
-  const update = {};
-  if (title !== undefined)          update.title          = title.trim();
-  if (description !== undefined)    update.description    = description.trim();
-  if (department !== undefined)     update.department     = department;
-  if (daysToComplete !== undefined) update.daysToComplete = parseInt(daysToComplete) || 7;
-  if (!Object.keys(update).length)  return returnFunction(res, 400, false, 'Nothing to update.');
-  await updateOne('onboarding_templates', { _id: new ObjectId(req.params.id) }, { $set: update });
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully || 'Updated.');
+  const existing = await findOne('onboarding_templates', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  const { name, description, targetRoles, targetDepartments, welcomeMessage, firstDayDetails, taskLists, meetTheTeam } = req.body;
+  const update = { updatedAt: new Date() };
+  if (name !== undefined)              update.name = name.trim();
+  if (description !== undefined)       update.description = description;
+  if (targetRoles !== undefined)       update.targetRoles = targetRoles;
+  if (targetDepartments !== undefined) update.targetDepartments = targetDepartments;
+  if (welcomeMessage !== undefined)    update.welcomeMessage = welcomeMessage;
+  if (firstDayDetails !== undefined)   update.firstDayDetails = firstDayDetails;
+  if (taskLists !== undefined)         update.taskLists = withGeneratedIds(taskLists);
+  if (meetTheTeam !== undefined)       update.meetTheTeam = meetTheTeam.map(m => ({ employeeId: new ObjectId(m.employeeId), note: m.note || '' }));
+  await updateOne('onboarding_templates', { _id: existing._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteTemplate = async (req, res) => {
-  await global.dbo.collection('onboarding_templates').deleteOne({ _id: new ObjectId(req.params.id) });
-  return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted.');
+  const existing = await findOne('onboarding_templates', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  await deleteOne('onboarding_templates', { _id: existing._id });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
-// ── Assign default template tasks to an employee ───────────────────────────────
-const assignDefaultTasks = async (employeeId, hireDate) => {
-  const templates = await findMany('onboarding_templates', {});
-  if (!templates.length) return;
+// ══════════════════════════════════════════════════════════════════════════════
+//  RECORDS
+// ══════════════════════════════════════════════════════════════════════════════
 
-  const base = hireDate ? new Date(hireDate) : new Date();
-  const tasks = templates.map((t) => {
-    const due = new Date(base);
-    due.setDate(due.getDate() + (t.daysToComplete || 7));
-    return {
-      employeeId: new ObjectId(employeeId),
-      taskTitle: t.title,
-      description: t.description || '',
-      assignedDepartment: t.department || 'HR',
-      dueDate: due.toISOString().slice(0, 10),
-      status: 'pending',
-      templateId: t._id,
-      createdAt: new Date(),
-    };
+const createRecord = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['employeeId', 'templateId', 'startDate'])) return;
+  const { employeeId, templateId, startDate } = req.body;
+
+  const activeExisting = await findOne('onboarding_records', {
+    employeeId: new ObjectId(employeeId),
+    status: { $in: ['preboarding', 'active', 'stalled'] },
+  });
+  if (activeExisting) return returnFunction(res, 409, false, 'This employee already has an active onboarding record.');
+
+  let record;
+  try {
+    record = await initiateOnboarding(employeeId, templateId, startDate, req.user?._id);
+  } catch (err) {
+    return returnFunction(res, 400, false, err.message || 'Could not start onboarding.');
+  }
+  return returnFunction(res, 201, true, 'Onboarding started.', { _id: record._id });
+};
+
+const listRecords = async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+  if (req.query.startFrom || req.query.startTo) {
+    filter.startDate = {};
+    if (req.query.startFrom) filter.startDate.$gte = new Date(req.query.startFrom);
+    if (req.query.startTo)   filter.startDate.$lte = new Date(req.query.startTo);
+  }
+
+  const [total, records] = await Promise.all([
+    countDocuments('onboarding_records', filter),
+    findMany('onboarding_records', filter, { skip, limit, sort: { createdAt: -1 } }),
+  ]);
+
+  let enriched = await Promise.all(records.map(r => enrichEmployee(computeProgress(r))));
+  if (req.query.department) {
+    enriched = enriched.filter(r => r.employee?.department === req.query.department);
+  }
+  // Stalled = active, no task completed/updated in the last 7 days
+  const staleCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  enriched = enriched.map(r => {
+    if (r.status !== 'active') return r;
+    const lastActivity = new Date(r.updatedAt || r.createdAt);
+    return lastActivity < staleCutoff ? { ...r, status: 'stalled' } : r;
   });
 
-  if (tasks.length) {
-    await global.dbo.collection('onboarding_tasks').insertMany(tasks);
-  }
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
-// ── Add a single task to an employee ──────────────────────────────────────────
-const addEmployeeTask = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['taskTitle', 'dueDate'])) return;
-  const { taskTitle, description, assignedDepartment, dueDate } = req.body;
-  const doc = {
-    employeeId: new ObjectId(req.params.employeeId),
-    taskTitle: taskTitle.trim(),
-    description: description?.trim() || '',
-    assignedDepartment: assignedDepartment || 'HR',
-    dueDate,
-    status: 'pending',
-    templateId: null,
-    createdAt: new Date(),
-  };
-  const result = await insertOne('onboarding_tasks', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+const getRecord = async (req, res) => {
+  const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+  const enriched = await enrichEmployee(computeProgress(record));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-// ── HTTP handler: assign template tasks to an employee ─────────────────────────
-const assignDefaultTasksHandler = async (req, res) => {
-  const employee = await findOne('employees', { _id: new ObjectId(req.params.employeeId) });
-  if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
-
-  // Prevent double onboarding — check for existing active tasks or details record
-  const existingTasks = await countDocuments('onboarding_tasks', {
-    employeeId: employee._id, status: { $ne: 'completed' },
-  });
-  const existingDetails = await findOne('onboarding_details', { employeeId: employee._id });
-  if (existingTasks > 0 || existingDetails) {
-    return returnFunction(res, 409, false, `${employee.fullName} is already in onboarding. Remove them first before restarting.`);
-  }
-
-  const { jobTitle, grossPay, startDate, jobGroupId, designationId, jdTemplateId, jdType, probationMonths } = req.body;
-
-  // Update employee record with confirmed offer details
-  const empUpdate = { updatedAt: new Date() };
-  if (jobTitle)   empUpdate.designation = jobTitle.trim();
-  if (grossPay)   empUpdate.grossPay    = parseFloat(grossPay);
-  if (startDate)  empUpdate.dateOfHire  = startDate;
-  if (jobGroupId) empUpdate.jobGroupId  = jobGroupId;
-  if (Object.keys(empUpdate).length > 1) {
-    await updateOne('employees', { _id: employee._id }, { $set: empUpdate });
-  }
-
-  // Compute probation end date
-  const probMonths = parseInt(probationMonths) || 0;
-  let probationEndDate = null;
-  if (probMonths > 0 && startDate) {
-    const d = new Date(startDate);
-    d.setMonth(d.getMonth() + probMonths);
-    probationEndDate = d.toISOString().slice(0, 10);
-  }
-
-  // Build details patch (existingDetails is null here — 409 guard above blocks any existing record)
-  const detailsPatch = {
-    employeeId:          employee._id,
-    jobTitle:            jobTitle?.trim()  || employee.designation || '',
-    grossPay:            grossPay          ? parseFloat(grossPay)  : (employee.grossPay || 0),
-    startDate:           startDate         || employee.dateOfHire  || '',
-    jobGroupId:          jobGroupId        || '',
-    designationId:       designationId     || null,
-    jdType:              jdType            || (req.file ? 'custom' : null),
-    jdTemplateId:        (jdType === 'template' && jdTemplateId) ? jdTemplateId : null,
-    jdPdfPath:           req.file ? req.file.path         : null,
-    jdPdfOriginalName:   req.file ? req.file.originalname : null,
-    probationMonths:     probMonths,
-    probationEndDate,
-    updatedAt:           new Date(),
-  };
-
-  await global.dbo.collection('onboarding_details').updateOne(
-    { employeeId: employee._id },
-    { $set: detailsPatch, $setOnInsert: { createdAt: new Date() } },
-    { upsert: true }
-  );
-
-  // Remove any existing pending template tasks (avoid duplicates on re-assign)
-  await global.dbo.collection('onboarding_tasks').deleteMany({
-    employeeId: employee._id,
-    status: 'pending',
-    templateId: { $ne: null },
-  });
-
-  await assignDefaultTasks(employee._id, startDate || employee.dateOfHire);
-  return returnFunction(res, 200, true, 'Onboarding started.');
-};
-
-// ── List employees with in-progress onboarding ────────────────────────────────
-const listOnboarding = async (req, res) => {
-  // 1. Employees with tasks (standard case)
-  const taskGroups = await global.dbo.collection('onboarding_tasks').aggregate([
-    { $group: {
-      _id: '$employeeId',
-      total:     { $sum: 1 },
-      completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
-    }},
-    { $match: { $expr: { $lt: ['$completed', '$total'] } } },
-  ]).toArray();
-
-  const taskEmployeeIds = new Set(taskGroups.map(e => String(e._id)));
-
-  // 2. Employees started via onboarding_details but with no tasks yet
-  const detailRecords = await global.dbo.collection('onboarding_details').find({}).toArray();
-  const tasklessEmployees = detailRecords
-    .filter(d => !taskEmployeeIds.has(String(d.employeeId)))
-    .map(d => ({ _id: d.employeeId, total: 0, completed: 0 }));
-
-  const all = [...taskGroups, ...tasklessEmployees];
-
-  const result = await Promise.all(all.map(async (e) => {
-    const employee = await findOne('employees', { _id: e._id }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } });
-    if (!employee) return null;
-    return {
-      employee,
-      total:      e.total,
-      completed:  e.completed,
-      percentage: e.total ? Math.round((e.completed / e.total) * 100) : 0,
-    };
-  }));
-
-  return returnFunction(res, 200, true, req.locale.success, result.filter(Boolean));
-};
-
-const getEmployeeOnboarding = async (req, res) => {
-  const tasks = await findMany('onboarding_tasks',
-    { employeeId: new ObjectId(req.params.employeeId) },
-    { sort: { status: 1, dueDate: 1 } }
-  );
-  return returnFunction(res, 200, true, req.locale.success, tasks);
-};
-
-const getOnboardingDetails = async (req, res) => {
-  const details = await findOne('onboarding_details', { employeeId: new ObjectId(req.params.employeeId) });
-  if (!details) return returnFunction(res, 200, true, req.locale.success, {});
-
-  let jobGroupName   = '';
-  let designationName = '';
-
-  if (details.jobGroupId) {
-    try {
-      const jg = await findOne('job_groups', { _id: new ObjectId(details.jobGroupId) });
-      jobGroupName = jg?.name || '';
-    } catch (_) {}
-  }
-
-  if (details.designationId) {
-    try {
-      const desig = await findOne('designations', { _id: new ObjectId(details.designationId) });
-      designationName = desig?.name || '';
-    } catch (_) {}
-  }
-
-  return returnFunction(res, 200, true, req.locale.success, { ...details, jobGroupName, designationName });
-};
-
-const serveJdPdf = async (req, res) => {
-  const details = await findOne('onboarding_details', { employeeId: new ObjectId(req.params.employeeId) });
-  if (!details) return returnFunction(res, 404, false, 'No onboarding record found.');
-
-  // Template JD: stream from the template's stored PDF
-  if (details.jdType === 'template' && details.jdTemplateId) {
-    try {
-      const template = await findOne('jd_templates', { _id: new ObjectId(details.jdTemplateId) });
-      if (template?.pdfPath) {
-        const tplPath = path.resolve(template.pdfPath);
-        if (fs.existsSync(tplPath)) {
-          res.setHeader('Content-Type', 'application/pdf');
-          res.setHeader('Content-Disposition', `inline; filename="${template.pdfOriginalName || template.name + '.pdf'}"`);
-          return fs.createReadStream(tplPath).pipe(res);
-        }
-      }
-    } catch (_) {}
-  }
-
-  // Custom uploaded PDF
-  if (!details.jdPdfPath) return returnFunction(res, 404, false, 'No JD PDF for this employee.');
-  const filePath = path.resolve(details.jdPdfPath);
-  if (!fs.existsSync(filePath)) return returnFunction(res, 404, false, 'File not found on server.');
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="${details.jdPdfOriginalName || 'job-description.pdf'}"`);
-  fs.createReadStream(filePath).pipe(res);
-};
-
-const updateTask = async (req, res) => {
-  const { taskTitle, assignedDepartment, dueDate, description, status } = req.body;
-  const VALID_STATUSES = ['pending', 'in_progress', 'completed'];
-  const update = {};
-  if (taskTitle !== undefined)          update.taskTitle          = taskTitle.trim();
-  if (assignedDepartment !== undefined) update.assignedDepartment = assignedDepartment;
-  if (dueDate !== undefined)            update.dueDate            = dueDate;
-  if (description !== undefined)        update.description        = description.trim();
-  if (status !== undefined) {
-    if (!VALID_STATUSES.includes(status)) return returnFunction(res, 400, false, 'Invalid status.');
-    update.status = status;
-    if (status === 'completed') update.completedAt = new Date();
-    if (status !== 'completed') update.completedAt = null;
-  }
-  if (!Object.keys(update).length) return returnFunction(res, 400, false, 'Nothing to update.');
-  await updateOne('onboarding_tasks', { _id: new ObjectId(req.params.taskId) }, { $set: update });
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully || 'Updated.');
-};
-
-const deleteTask = async (req, res) => {
-  await global.dbo.collection('onboarding_tasks').deleteOne({ _id: new ObjectId(req.params.taskId) });
-  return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted.');
-};
-
-const clearEmployeeOnboarding = async (req, res) => {
-  const employee = await findOne('employees', { _id: new ObjectId(req.params.employeeId) });
-  if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
-  await global.dbo.collection('onboarding_tasks').deleteMany({ employeeId: new ObjectId(req.params.employeeId) });
-  await global.dbo.collection('onboarding_details').deleteOne({ employeeId: new ObjectId(req.params.employeeId) });
-  return returnFunction(res, 200, true, 'Onboarding record removed.');
-};
-
-const completeTask = async (req, res) => {
-  const task = await findOne('onboarding_tasks', { _id: new ObjectId(req.params.taskId) });
-  if (!task) return returnFunction(res, 404, false, req.locale.notFound);
-
-  const isHR = ['super_admin', 'hr_manager', 'department_head'].includes(req.user?.role);
-  if (!isHR && String(task.employeeId) !== String(req.user?.employeeId)) {
-    return returnFunction(res, 403, false, 'Forbidden.');
-  }
-
-  await updateOne('onboarding_tasks',
-    { _id: new ObjectId(req.params.taskId) },
-    { $set: { status: 'completed', completedAt: new Date(), completedBy: req.user?._id ? new ObjectId(req.user._id) : null } }
-  );
-
-  // Notify HR when all tasks are done
-  const remaining = await countDocuments('onboarding_tasks', { employeeId: task.employeeId, status: { $ne: 'completed' } });
-  if (remaining === 0) {
-    const employee = await findOne('employees', { _id: task.employeeId }, { projection: { fullName: 1 } });
+const finalizeIfComplete = async (record) => {
+  const progressed = computeProgress(record);
+  const requiredTasks = progressed.taskLists.flatMap(l => l.tasks).filter(t => t.isRequired);
+  const allRequiredDone = requiredTasks.length > 0 && requiredTasks.every(t => t.status === 'completed');
+  if (allRequiredDone && record.status !== 'completed') {
+    const now = new Date();
+    await updateOne('onboarding_records', { _id: record._id }, { $set: { status: 'completed', completedAt: now, updatedAt: now } });
+    const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1 } });
     if (employee) {
-      notifyHR({
-        type: 'onboarding', subType: 'onboarding_complete',
-        title: 'Onboarding Complete',
-        subtitle: `All onboarding tasks for ${employee.fullName} have been completed.`,
-        referenceId: task.employeeId, referenceModel: 'employees',
-        requiresAction: false, triggeredBy: req.user?._id,
-      }).catch(() => {});
       notifyByRoles(['super_admin', 'hr_manager'], {
         title: 'Onboarding Complete',
-        body: `All onboarding tasks for ${employee.fullName} have been completed.`,
+        body: `All required onboarding tasks for ${employee.fullName} have been completed.`,
         type: 'onboarding',
       }).catch(() => {});
     }
+    return true;
   }
+  return false;
+};
 
+// HR updates a task's status — body: { taskListId, taskId, status, notes }
+const updateRecordTask = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['taskListId', 'taskId', 'status'])) return;
+  const { taskListId, taskId, status, notes } = req.body;
+  const VALID = ['pending', 'inProgress', 'completed'];
+  if (!VALID.includes(status)) return returnFunction(res, 400, false, 'Invalid status.');
+
+  const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const now = new Date();
+  const setFields = {
+    'taskLists.$[list].tasks.$[task].status': status,
+    'taskLists.$[list].tasks.$[task].completedAt': status === 'completed' ? now : null,
+    'taskLists.$[list].tasks.$[task].completedBy': status === 'completed' ? (req.user?._id ? new ObjectId(req.user._id) : null) : null,
+    updatedAt: now,
+  };
+  if (notes !== undefined) setFields['taskLists.$[list].tasks.$[task].notes'] = notes;
+
+  await global.dbo.collection('onboarding_records').updateOne(
+    { _id: record._id },
+    { $set: setFields },
+    { arrayFilters: [{ 'list.id': taskListId }, { 'task.id': taskId }] }
+  );
+
+  const updated = await findOne('onboarding_records', { _id: record._id });
+  await finalizeIfComplete(updated);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
-// ── Offboarding ───────────────────────────────────────────────────────────────
+// HR adds a one-off custom task directly to an already-initiated record — unlike
+// editing a template (which only affects records created afterward), this only
+// affects this specific employee's record.
+const addRecordTask = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['title', 'assignedTo'])) return;
+  const VALID_ASSIGNEES = ['hr', 'it', 'manager', 'newHire', 'finance'];
+  const { title, description, dueDate, isRequired, assignedTo, taskListId, requiresDocument } = req.body;
+  if (!VALID_ASSIGNEES.includes(assignedTo)) return returnFunction(res, 400, false, 'Invalid assignedTo.');
+  // Any assignee can require a document now: the newHire themselves can upload via
+  // /my/document for their own tasks, and HR can upload on behalf of any other
+  // assignee's task via uploadRecordDocument.
 
-const DEFAULT_OFFBOARDING_TASKS = [
-  { taskTitle: 'Submit resignation letter',      taskSection: 'before_last_day', assignedDepartment: 'Employee', daysFromNow: -14 },
-  { taskTitle: 'Complete knowledge transfer doc', taskSection: 'before_last_day', assignedDepartment: 'Employee', daysFromNow: -7  },
-  { taskTitle: 'Schedule handover meetings',      taskSection: 'before_last_day', assignedDepartment: 'Manager',  daysFromNow: -5  },
-  { taskTitle: 'Return company devices',          taskSection: 'before_last_day', assignedDepartment: 'IT',       daysFromNow: -1  },
-  { taskTitle: 'Exit interview completed',        taskSection: 'last_day',        assignedDepartment: 'HR',       daysFromNow: 0   },
-  { taskTitle: 'Revoke email access',             taskSection: 'last_day',        assignedDepartment: 'IT',       daysFromNow: 0   },
-  { taskTitle: 'Revoke system & platform access', taskSection: 'last_day',        assignedDepartment: 'IT',       daysFromNow: 0   },
-  { taskTitle: 'Process final payslip',           taskSection: 'last_day',        assignedDepartment: 'HR',       daysFromNow: 0   },
-  { taskTitle: 'Clear outstanding expense claims and purchase requests', taskSection: 'last_day', assignedDepartment: 'Finance', taskType: 'spend_clearance', daysFromNow: 0 },
-  { taskTitle: 'Issue reference letter',          taskSection: 'after_departure', assignedDepartment: 'HR',       daysFromNow: 7   },
-  { taskTitle: 'Send alumni network invite',      taskSection: 'after_departure', assignedDepartment: 'HR',       daysFromNow: 14  },
-];
+  const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
 
-const startOffboarding = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['employeeId'])) return;
-  const empId = new ObjectId(req.body.employeeId);
-  const employee = await findOne('employees', { _id: empId });
-  if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
+  const now = new Date();
+  const newTask = {
+    id: crypto.randomUUID(),
+    title, description: description || '',
+    dueDate: dueDate ? new Date(dueDate) : now,
+    isRequired: isRequired !== false,
+    status: 'pending', completedBy: null, completedAt: null,
+    requiresDocument: !!requiresDocument, documentId: null, notes: null, resourceUrl: null,
+  };
 
-  const existing = await countDocuments('offboarding_tasks', { employeeId: empId, status: 'pending' });
-  if (existing > 0) return returnFunction(res, 409, false, `${employee.fullName} is already in offboarding.`);
+  const explicitList = taskListId ? record.taskLists.find(l => l.id === taskListId) : null;
+  const matchingList = explicitList || record.taskLists.find(l => l.assignedTo === assignedTo);
 
-  const lastDay = req.body.lastDay ? new Date(req.body.lastDay) : new Date();
-  const tasks = DEFAULT_OFFBOARDING_TASKS.map(t => {
-    const due = new Date(lastDay);
-    due.setDate(due.getDate() + t.daysFromNow);
-    return {
-      employeeId: empId,
-      taskTitle: t.taskTitle,
-      taskSection: t.taskSection,
-      assignedDepartment: t.assignedDepartment,
-      taskType: t.taskType || null,
-      dueDate: due.toISOString().slice(0, 10),
-      status: 'pending',
-      createdAt: new Date(),
-    };
-  });
-  await global.dbo.collection('offboarding_tasks').insertMany(tasks);
-
-  if (req.body.lastDay) {
-    await updateOne('employees', { _id: empId }, { $set: { contractEndDate: new Date(req.body.lastDay), updatedAt: new Date() } });
+  if (matchingList) {
+    await global.dbo.collection('onboarding_records').updateOne(
+      { _id: record._id, 'taskLists.id': matchingList.id },
+      { $push: { 'taskLists.$.tasks': newTask }, $set: { updatedAt: now } }
+    );
+  } else {
+    const newList = { id: crypto.randomUUID(), name: 'Additional Tasks', assignedTo, tasks: [newTask] };
+    await global.dbo.collection('onboarding_records').updateOne(
+      { _id: record._id },
+      { $push: { taskLists: newList }, $set: { updatedAt: now } }
+    );
   }
 
-  return returnFunction(res, 201, true, 'Offboarding started.');
+  // A completed record with a new pending required task is no longer actually complete
+  if (record.status === 'completed' && newTask.isRequired) {
+    await updateOne('onboarding_records', { _id: record._id }, { $set: { status: 'active', completedAt: null, updatedAt: now } });
+  }
+
+  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1 } });
+  notifyStakeholder(assignedTo, record.employeeId, {
+    title: `Onboarding: ${employee?.fullName ?? 'Employee'}`,
+    body: `New task added: "${title}"`,
+    type: 'onboarding',
+  }).catch(() => {});
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { taskId: newTask.id });
 };
 
-const listOffboarding = async (req, res) => {
-  const groups = await global.dbo.collection('offboarding_tasks').aggregate([
-    { $group: {
-      _id: '$employeeId',
-      total:     { $sum: 1 },
-      completed: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
-    } },
-  ]).toArray();
+const updateWelcome = async (req, res) => {
+  const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+  const { welcomeMessage, firstDayDetails } = req.body;
+  const update = { updatedAt: new Date() };
+  if (welcomeMessage !== undefined)  update.welcomeMessage = welcomeMessage;
+  if (firstDayDetails !== undefined) update.firstDayDetails = firstDayDetails;
+  await updateOne('onboarding_records', { _id: record._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
 
-  const result = await Promise.all(groups.map(async (g) => {
-    const employee = await findOne('employees', { _id: g._id }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, contractEndDate: 1 } });
-    if (!employee) return null;
-    return {
-      employee,
-      total:      g.total,
-      completed:  g.completed,
-      percentage: g.total ? Math.round((g.completed / g.total) * 100) : 0,
-    };
+// ══════════════════════════════════════════════════════════════════════════════
+//  ANALYTICS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const getAnalytics = async (req, res) => {
+  const records = await findMany('onboarding_records', {}, {});
+  const empIds = [...new Set(records.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const employees = await findMany('employees', { _id: { $in: empIds } }, { projection: { department: 1 } });
+  const deptById = Object.fromEntries(employees.map(e => [String(e._id), e.department]));
+
+  const templates = await findMany('onboarding_templates', {}, { projection: { name: 1 } });
+  const templateNameById = Object.fromEntries(templates.map(t => [String(t._id), t.name]));
+
+  // Avg completion time (days) by department and by template — completed records only
+  const completed = records.filter(r => r.status === 'completed' && r.completedAt);
+  const daysFor = (r) => (new Date(r.completedAt) - new Date(r.startDate)) / (1000 * 60 * 60 * 24);
+
+  const byDept = {};
+  for (const r of completed) {
+    const dept = deptById[String(r.employeeId)] || 'Unknown';
+    if (!byDept[dept]) byDept[dept] = { totalDays: 0, count: 0 };
+    byDept[dept].totalDays += daysFor(r);
+    byDept[dept].count += 1;
+  }
+  const avgCompletionDaysByDepartment = Object.entries(byDept).map(([department, v]) => ({
+    department, avgDays: Math.round((v.totalDays / v.count) * 10) / 10, count: v.count,
   }));
 
-  return returnFunction(res, 200, true, req.locale.success, result.filter(Boolean));
-};
-
-const getEmployeeOffboarding = async (req, res) => {
-  const tasks = await findMany('offboarding_tasks',
-    { employeeId: new ObjectId(req.params.employeeId) },
-    { sort: { taskSection: 1, dueDate: 1 } }
-  );
-  return returnFunction(res, 200, true, req.locale.success, tasks);
-};
-
-// Lets the frontend show exactly what's blocking spend clearance before HR even
-// attempts to complete that task.
-const getEmployeeSpendClearance = async (req, res) => {
-  const result = await getOpenSpendItems(new ObjectId(req.params.employeeId));
-  return returnFunction(res, 200, true, req.locale.success, result);
-};
-
-const completeOffboardingTask = async (req, res) => {
-  const task = await findOne('offboarding_tasks', { _id: new ObjectId(req.params.taskId) });
-  if (!task) return returnFunction(res, 404, false, req.locale.notFound);
-
-  const isHR = ['super_admin', 'hr_manager', 'department_head'].includes(req.user?.role);
-  if (!isHR && String(task.employeeId) !== String(req.user?.employeeId)) {
-    return returnFunction(res, 403, false, 'Forbidden.');
+  const byTemplate = {};
+  for (const r of completed) {
+    const key = String(r.templateId);
+    if (!byTemplate[key]) byTemplate[key] = { totalDays: 0, count: 0 };
+    byTemplate[key].totalDays += daysFor(r);
+    byTemplate[key].count += 1;
   }
+  const avgCompletionDaysByTemplate = Object.entries(byTemplate).map(([templateId, v]) => ({
+    templateId, templateName: templateNameById[templateId] || 'Unknown', avgDays: Math.round((v.totalDays / v.count) * 10) / 10, count: v.count,
+  }));
 
-  // The spend-clearance task can't be marked complete while the employee still has
-  // an unresolved expense claim or purchase request — offboarding must not finish
-  // with open financial exposure.
-  if (task.taskType === 'spend_clearance') {
-    const { hasOpenItems, openClaims, openRequests } = await getOpenSpendItems(task.employeeId);
-    if (hasOpenItems) {
-      return returnFunction(res, 400, false,
-        `Cannot clear: ${openClaims.length} expense claim(s) and ${openRequests.length} purchase request(s) are still open. Approve or reject them first.`);
+  // Task completion rate by stakeholder type
+  const byStakeholder = {};
+  for (const r of records) {
+    for (const list of r.taskLists || []) {
+      if (!byStakeholder[list.assignedTo]) byStakeholder[list.assignedTo] = { total: 0, completed: 0 };
+      byStakeholder[list.assignedTo].total += list.tasks.length;
+      byStakeholder[list.assignedTo].completed += list.tasks.filter(t => t.status === 'completed').length;
     }
   }
+  const taskCompletionRateByStakeholder = Object.entries(byStakeholder).map(([assignedTo, v]) => ({
+    assignedTo, total: v.total, completed: v.completed, rate: v.total ? Math.round((v.completed / v.total) * 100) : 0,
+  }));
 
-  await updateOne(
-    'offboarding_tasks',
-    { _id: new ObjectId(req.params.taskId) },
-    { $set: { status: 'completed', completedAt: new Date(), completedBy: req.user?._id ? new ObjectId(req.user._id) : null } }
+  // Stalled = active, no activity in 7+ days
+  const staleCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const stalledEmployees = await Promise.all(
+    records.filter(r => r.status === 'active' && new Date(r.updatedAt || r.createdAt) < staleCutoff)
+      .map(async r => {
+        const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, department: 1 } });
+        return { employeeId: String(r.employeeId), fullName: emp?.fullName || 'Unknown', department: emp?.department || 'Unknown', daysSinceActivity: Math.floor((Date.now() - new Date(r.updatedAt || r.createdAt)) / (1000 * 60 * 60 * 24)) };
+      })
+  );
+
+  // New hires by month (last 12 months)
+  const monthBuckets = [];
+  const cursor = new Date(); cursor.setDate(1);
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(cursor.getFullYear(), cursor.getMonth() - i, 1);
+    monthBuckets.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, count: 0 });
+  }
+  const bucketMap = Object.fromEntries(monthBuckets.map(b => [b.key, b]));
+  for (const r of records) {
+    const d = new Date(r.startDate);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (bucketMap[key]) bucketMap[key].count += 1;
+  }
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    avgCompletionDaysByDepartment,
+    avgCompletionDaysByTemplate,
+    taskCompletionRateByStakeholder,
+    stalledEmployees,
+    newHiresByMonth: monthBuckets,
+  });
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  EMPLOYEE SELF-SERVICE (own record only — always scoped to req.user.employeeId)
+// ══════════════════════════════════════════════════════════════════════════════
+
+const getMyOnboarding = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, null);
+  const record = await findOne('onboarding_records', { employeeId: new ObjectId(req.user.employeeId) }, { sort: { createdAt: -1 } });
+  if (!record) return returnFunction(res, 200, true, req.locale.success, null);
+
+  const progressed = computeProgress(record);
+  // Employees only ever see their own ("newHire") task list — never HR/IT/manager/finance lists.
+  const myTaskList = progressed.taskLists.filter(l => l.assignedTo === 'newHire');
+
+  const meetTheTeam = await Promise.all((progressed.meetTheTeam || []).map(async (m) => {
+    const person = await findOne('employees', { _id: m.employeeId }, { projection: { fullName: 1, designation: 1, department: 1 } });
+    return { ...m, employee: person || null };
+  }));
+
+  return returnFunction(res, 200, true, req.locale.success, { ...progressed, taskLists: myTaskList, meetTheTeam });
+};
+
+const updateMyTask = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
+  const { taskId } = req.params;
+
+  const record = await findOne('onboarding_records', {
+    employeeId: new ObjectId(req.user.employeeId),
+    'taskLists.tasks.id': taskId,
+  });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+
+  // Employees may only complete tasks from their own ("newHire") list.
+  const owningList = record.taskLists.find(l => l.tasks.some(t => t.id === taskId));
+  if (!owningList || owningList.assignedTo !== 'newHire') {
+    return returnFunction(res, 403, false, 'You cannot update this task.');
+  }
+
+  const now = new Date();
+  await global.dbo.collection('onboarding_records').updateOne(
+    { _id: record._id },
+    {
+      $set: {
+        'taskLists.$[list].tasks.$[task].status': 'completed',
+        'taskLists.$[list].tasks.$[task].completedAt': now,
+        'taskLists.$[list].tasks.$[task].completedBy': req.user?._id ? new ObjectId(req.user._id) : null,
+        updatedAt: now,
+      },
+    },
+    { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': taskId }] }
+  );
+
+  const updated = await findOne('onboarding_records', { _id: record._id });
+  await finalizeIfComplete(updated);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const uploadMyDocument = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
+  if (!validateRequiredFields(req, res, ['taskId'])) return;
+  if (!req.file) return returnFunction(res, 400, false, 'A file is required.');
+
+  const record = await findOne('onboarding_records', {
+    employeeId: new ObjectId(req.user.employeeId),
+    'taskLists.tasks.id': req.body.taskId,
+  });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const owningList = record.taskLists.find(l => l.tasks.some(t => t.id === req.body.taskId));
+  const task = owningList?.tasks.find(t => t.id === req.body.taskId);
+  if (!owningList || owningList.assignedTo !== 'newHire' || !task) {
+    return returnFunction(res, 403, false, 'You cannot upload a document for this task.');
+  }
+
+  const docResult = await insertOne('onboarding_documents', {
+    employeeId: new ObjectId(req.user.employeeId),
+    recordId: record._id,
+    recordType: 'onboarding',
+    taskId: req.body.taskId,
+    name: task.title,
+    type: 'upload',
+    fileUrl: `/uploads/${req.file.filename}`,
+    signedAt: null,
+    signedBy: null,
+    status: 'uploaded',
+    uploadedAt: new Date(),
+    createdAt: new Date(),
+  });
+
+  await global.dbo.collection('onboarding_records').updateOne(
+    { _id: record._id },
+    { $set: { 'taskLists.$[list].tasks.$[task].documentId': docResult.insertedId, updatedAt: new Date() } },
+    { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': req.body.taskId }] }
+  );
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.insertedId });
+};
+
+// HR uploads a document on behalf of any task, regardless of assignee — unlike
+// uploadMyDocument (self-service, newHire-list only), this lets HR fulfil a
+// requiresDocument task assigned to hr/it/manager/finance, since those
+// stakeholders have no dedicated portal of their own to upload through.
+const uploadRecordDocument = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['taskId'])) return;
+  if (!req.file) return returnFunction(res, 400, false, 'A file is required.');
+
+  const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const owningList = record.taskLists.find(l => l.tasks.some(t => t.id === req.body.taskId));
+  const task = owningList?.tasks.find(t => t.id === req.body.taskId);
+  if (!owningList || !task) return returnFunction(res, 404, false, 'Task not found on this record.');
+
+  const docResult = await insertOne('onboarding_documents', {
+    employeeId: record.employeeId,
+    recordId: record._id,
+    recordType: 'onboarding',
+    taskId: req.body.taskId,
+    name: task.title,
+    type: 'upload',
+    fileUrl: `/uploads/${req.file.filename}`,
+    signedAt: null,
+    signedBy: null,
+    status: 'uploaded',
+    uploadedAt: new Date(),
+    createdAt: new Date(),
+  });
+
+  await global.dbo.collection('onboarding_records').updateOne(
+    { _id: record._id },
+    { $set: { 'taskLists.$[list].tasks.$[task].documentId': docResult.insertedId, updatedAt: new Date() } },
+    { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': req.body.taskId }] }
+  );
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.insertedId });
+};
+
+const updateMeetTheTeam = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
+  const record = await findOne('onboarding_records', { employeeId: new ObjectId(req.user.employeeId) }, { sort: { createdAt: -1 } });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+
+  await global.dbo.collection('onboarding_records').updateOne(
+    { _id: record._id, 'meetTheTeam.employeeId': new ObjectId(req.params.personId) },
+    { $set: { 'meetTheTeam.$.met': true, updatedAt: new Date() } }
   );
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
-const addOffboardingTask = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['taskTitle', 'dueDate'])) return;
-  const doc = {
-    employeeId: new ObjectId(req.params.employeeId),
-    taskTitle: req.body.taskTitle.trim(),
-    taskSection: req.body.taskSection || 'before_last_day',
-    assignedDepartment: req.body.assignedDepartment || 'HR',
-    dueDate: req.body.dueDate,
-    status: 'pending',
-    createdAt: new Date(),
-  };
-  const result = await insertOne('offboarding_tasks', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+// ── Documents (HR view — supports the Record Detail "Documents" tab) ──────────
+
+const listRecordDocuments = async (req, res) => {
+  const docs = await findMany('onboarding_documents', { recordId: new ObjectId(req.params.id), recordType: 'onboarding' }, { sort: { createdAt: -1 } });
+  return returnFunction(res, 200, true, req.locale.success, docs);
 };
 
-const clearEmployeeOffboarding = async (req, res) => {
-  await global.dbo.collection('offboarding_tasks').deleteMany({ employeeId: new ObjectId(req.params.employeeId) });
-  return returnFunction(res, 200, true, 'Offboarding record removed.');
-};
-
-// ── Overdue Tasks ─────────────────────────────────────────────────────────────
-// Returns all incomplete onboarding tasks whose due date has passed.
-// Also sends in-app notifications to HR (once per run, fire-and-forget).
-
-const getOverdueTasks = async (req, res) => {
-  const today = new Date().toISOString().slice(0, 10);
-
-  const overdue = await findMany('onboarding_tasks', {
-    status: { $ne: 'completed' },
-    dueDate: { $lt: today, $ne: null },
-  }, { sort: { dueDate: 1 } });
-
-  if (!overdue.length) return returnFunction(res, 200, true, 'No overdue tasks.', []);
-
-  // Enrich with employee names
-  const empIds = [...new Set(overdue.map(t => String(t.employeeId)))];
-  const employees = await findMany('employees', { _id: { $in: empIds.map(id => new ObjectId(id)) } }, { projection: { fullName: 1 } });
-  const empMap = Object.fromEntries(employees.map(e => [String(e._id), e]));
-
-  const enriched = overdue.map(t => ({
-    ...t,
-    employee: empMap[String(t.employeeId)] ?? null,
-    daysOverdue: Math.floor((new Date(today) - new Date(t.dueDate)) / (1000 * 60 * 60 * 24)),
-  }));
-
-  // Notify HR about overdue tasks (fire-and-forget)
-  if (enriched.length) {
-    notifyByRoles(['super_admin', 'hr_manager'], {
-      title: `${enriched.length} Overdue Onboarding Task(s)`,
-      body: `${enriched.length} onboarding task(s) are past their due date and need attention.`,
-      type: 'onboarding',
-    }).catch(() => {});
-  }
-
-  return returnFunction(res, 200, true, 'Overdue tasks fetched', enriched);
+const verifyDocument = async (req, res) => {
+  const doc = await findOne('onboarding_documents', { _id: new ObjectId(req.params.id) });
+  if (!doc) return returnFunction(res, 404, false, req.locale.notFound);
+  await updateOne('onboarding_documents', { _id: doc._id }, { $set: { status: 'verified' } });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 module.exports = {
-  listTemplates, createTemplate, updateTemplate, deleteTemplate,
-  addEmployeeTask, updateTask, deleteTask, assignDefaultTasksHandler, assignDefaultTasks,
-  listOnboarding, getEmployeeOnboarding, getOnboardingDetails, completeTask, clearEmployeeOnboarding,
-  serveJdPdf,
-  startOffboarding, listOffboarding, getEmployeeOffboarding, completeOffboardingTask, addOffboardingTask, clearEmployeeOffboarding,
-  getEmployeeSpendClearance,
-  getOverdueTasks,
+  listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, uploadTemplateResource,
+  createRecord, listRecords, getRecord, updateRecordTask, addRecordTask, updateWelcome,
+  getMyOnboarding, updateMyTask, uploadMyDocument, uploadRecordDocument, updateMeetTheTeam,
+  listRecordDocuments, verifyDocument, getAnalytics,
+  computeProgress, enrichEmployee, isHR,
 };

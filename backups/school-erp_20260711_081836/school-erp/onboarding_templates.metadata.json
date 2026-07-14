@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"}],"uuid":"4a791ae3c09d4d35abb0d87ac4fe9a56","collectionName":"onboarding_templates","type":"collection"}

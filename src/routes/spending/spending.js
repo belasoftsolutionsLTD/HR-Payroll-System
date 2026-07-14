@@ -1,5 +1,6 @@
 const express = require('express');
 const router  = express.Router();
+const multer  = require('multer');
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
@@ -9,7 +10,7 @@ const {
   listInvoices, createInvoice, approveInvoice, rejectInvoice, markPaid,
   listPurchaseRequests, getPurchaseRequest, createPurchaseRequest, updatePurchaseRequest,
   approvePurchaseRequest, rejectPurchaseRequest,
-  listVendors, getVendor, createVendor, updateVendor, deleteVendor,
+  listVendors, getVendor, createVendor, updateVendor, deleteVendor, approveVendor, rejectVendor,
   listProcurementPolicies, getProcurementPolicy, createProcurementPolicy, updateProcurementPolicy, deleteProcurementPolicy,
   convertRequisitionToPO,
   listPurchaseOrders, getPurchaseOrder, updatePurchaseOrder, sendPurchaseOrder, acknowledgePurchaseOrder, cancelPurchaseOrder,
@@ -21,6 +22,25 @@ const {
 const hrOnly    = allowRoles(HR_ROLES);
 const deptHeadUp = allowRoles([...MGMT_ROLES]); // super_admin/hr_manager/department_head
 const allRoles  = allowRoles(ALL_ROLES);
+
+// diskStorage + timestamp-prefixed-original-filename, matching the convention used
+// elsewhere in the app (expenses.js, training.js, employees.js).
+const vendorDocUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+    cb(allowed.includes(file.mimetype) ? null : new Error('Only JPEG, PNG, WebP and PDF files are allowed.'), allowed.includes(file.mimetype));
+  },
+});
+const vendorDocFields = vendorDocUpload.fields([
+  { name: 'kraPinCertificate', maxCount: 1 },
+  { name: 'registrationCertificate', maxCount: 1 },
+  { name: 'businessPermit', maxCount: 1 },
+]);
 
 // ── Corporate Cards ───────────────────────────────────────────────────────────
 router.get('/cards',     hrOnly,   AsyncHandler(listCards));
@@ -43,10 +63,12 @@ router.put('/invoices/:id/pay',     hrOnly, AsyncHandler(markPaid));
 
 // ── Procurement — Vendors (all roles can view to select on a PR; HR manages) ──
 router.get('/procurement/vendors',        allRoles, AsyncHandler(listVendors));
-router.post('/procurement/vendors',       hrOnly,   AsyncHandler(createVendor));
+router.post('/procurement/vendors',       hrOnly,   vendorDocFields, AsyncHandler(createVendor));
 router.get('/procurement/vendors/:id',    allRoles, AsyncHandler(getVendor));
 router.patch('/procurement/vendors/:id',  hrOnly,   AsyncHandler(updateVendor));
 router.delete('/procurement/vendors/:id', hrOnly,   AsyncHandler(deleteVendor));
+router.patch('/procurement/vendors/:id/approve', hrOnly, AsyncHandler(approveVendor));
+router.patch('/procurement/vendors/:id/reject',  hrOnly, AsyncHandler(rejectVendor));
 
 // ── Procurement — Policies (HR only) ──────────────────────────────────────────
 router.get('/procurement/policies',        hrOnly, AsyncHandler(listProcurementPolicies));

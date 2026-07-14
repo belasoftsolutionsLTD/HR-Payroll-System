@@ -93,7 +93,7 @@ const generatePayslipFromResult = (employee, result, cycle) => {
     if (leave.length > 0) {
       sectionHeader(doc, 'LEAVE TAKEN', '#38bdf8');
       for (const l of leave) {
-        const label = `${l.leaveType.charAt(0).toUpperCase()}${l.leaveType.slice(1)} Leave (${l.days} day${l.days === 1 ? '' : 's'})`;
+        const label = `${l.leaveType} (${l.days} day${l.days === 1 ? '' : 's'})`;
         row(doc, label, l.amount > 0 ? `-${fmt(l.amount, cur)}` : 'Paid');
       }
       doc.moveDown(0.5);
@@ -123,7 +123,12 @@ const generatePayslipFromResult = (employee, result, cycle) => {
     }
 
     // ── Other deductions (loans, advances, voluntary) ─────────────────────────
-    const otherDeds = (result.deductions ?? []).map((d) => ({ name: d.conceptName, amount: d.amount }));
+    const otherDeds = (result.deductions ?? []).map((d) => ({
+      name: d.source === 'loan'
+        ? `${d.conceptName} (${d.balanceAfter > 0 ? `Balance: ${fmt(d.balanceAfter, cur)} remaining` : 'Fully repaid'})`
+        : d.conceptName,
+      amount: d.amount,
+    }));
 
     if (otherDeds.length > 0) {
       sectionHeader(doc, 'OTHER DEDUCTIONS', '#ef4444');

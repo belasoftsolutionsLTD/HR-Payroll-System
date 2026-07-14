@@ -1,253 +1,578 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { calculateWorkingDaysDB } = require('../../functions/HR/leaveCalculator');
-const { notifyEmployee } = require('../../functions/HR/notifyUser');
-const { createInboxItem, notifyHR, notifyManager } = require('../inbox/inboxFunctions');
+const { findMany, findOne, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
+const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
+const { calculateLeaveDays } = require('../../lib/leave/dayCalculator');
+const { resolveApprovalChain } = require('../../lib/leave/approvalChain');
+const { checkEligibility, checkMinNotice, checkMaxConsecutive, checkOverlap, checkTeamOverlap } = require('../../lib/leave/eligibilityCheck');
+const { runAccrual, runYearEndCarryOver } = require('../../lib/leave/accrualEngine');
+const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
 
-const getLeaveBalances = async (req, res) => {
-  const year = parseInt(req.query.year) || new Date().getFullYear();
-  const balance = await findOne('leave_balances', { employeeId: new ObjectId(req.params.employeeId), year });
-  if (!balance) return returnFunction(res, 404, false, req.locale.notFound);
-  return returnFunction(res, 200, true, req.locale.success, balance);
+const HR_ROLE_LIST = [SUPER_ADMIN, HR_MANAGER];
+const isHR = (req) => HR_ROLE_LIST.includes(req.user?.role);
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Shared helpers
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Resolves which employeeIds a given user is allowed to see across the
+// role-scoped list/calendar/analytics endpoints. Returns null for "no
+// restriction" (HR/super_admin see everyone).
+const getScopedEmployeeIds = async (user) => {
+  if (HR_ROLE_LIST.includes(user.role)) return null;
+  if (user.role === DEPT_HEAD) {
+    if (!user.department) return [];
+    const emps = await findMany('employees', { department: user.department }, { projection: { _id: 1 } });
+    return emps.map(e => e._id);
+  }
+  // staff acting as a manager (has direct reports) sees those + themselves;
+  // otherwise this scope is empty (they should use /my/* instead).
+  if (!user.employeeId) return [];
+  const directReports = await findMany('employees', { managerId: new ObjectId(user.employeeId) }, { projection: { _id: 1 } });
+  const ids = directReports.map(e => e._id);
+  ids.push(new ObjectId(user.employeeId));
+  return ids;
 };
 
-const listLeaveRequests = async (req, res) => {
-  const role = req.user.role;
-  const filter = {};
+const enrichRequest = async (request) => {
+  const [employee, leaveType] = await Promise.all([
+    findOne('employees', { _id: request.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } }),
+    findOne('leave_types', { _id: request.leaveTypeId }, { projection: { name: 1, code: 1, color: 1, isPaid: 1 } }),
+  ]);
+  return { ...request, employee: employee || null, leaveType: leaveType || null };
+};
 
-  if (role === 'staff') {
-    const emp = await findOne('employees', { _id: req.user.employeeId });
-    if (emp) filter.employeeId = emp._id;
+const enrichBalance = async (balance) => {
+  const leaveType = await findOne('leave_types', { _id: balance.leaveTypeId }, { projection: { name: 1, code: 1, color: 1, isPaid: 1 } });
+  return { ...balance, leaveType: leaveType || null };
+};
+
+const recomputeClosing = async (employeeId, leaveTypeId, year) => {
+  const bal = await findOne('leave_balances', { employeeId: new ObjectId(employeeId), leaveTypeId: new ObjectId(leaveTypeId), year });
+  if (!bal) return null;
+  const closingBalance = bal.openingBalance + bal.accrued + bal.carriedOver - bal.used - bal.pending;
+  await updateOne('leave_balances', { _id: bal._id }, { $set: { closingBalance, updatedAt: new Date() } });
+  return closingBalance;
+};
+
+const logAudit = async ({ leaveRequestId, employeeId, action, performedBy, performedByName, previousValue, newValue, comment }) => {
+  await insertOne('leave_audit_log', {
+    leaveRequestId: leaveRequestId ? new ObjectId(leaveRequestId) : null,
+    employeeId: new ObjectId(employeeId),
+    action, performedBy: performedBy ? new ObjectId(performedBy) : null, performedByName: performedByName || null,
+    previousValue: previousValue ?? null, newValue: newValue ?? null, comment: comment || null,
+    timestamp: new Date(),
+  });
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Leave Types — HR only
+// ══════════════════════════════════════════════════════════════════════════════
+
+const createLeaveType = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'code'])) return;
+  const {
+    name, description, isPaid, isCarryOverAllowed, maxCarryOverDays, carryOverExpiryMonths,
+    requiresApproval, requiresAttachment, minNoticeDays, maxConsecutiveDays, eligibilityMonths,
+    countPublicHolidays, color, appliesTo,
+  } = req.body;
+  const doc = {
+    name: name.trim(), code: req.body.code.trim().toUpperCase(), description: description || '',
+    isPaid: isPaid !== false, isCarryOverAllowed: !!isCarryOverAllowed,
+    maxCarryOverDays: maxCarryOverDays != null ? Number(maxCarryOverDays) : null,
+    carryOverExpiryMonths: carryOverExpiryMonths != null ? Number(carryOverExpiryMonths) : null,
+    requiresApproval: requiresApproval !== false, requiresAttachment: !!requiresAttachment,
+    minNoticeDays: minNoticeDays != null ? Number(minNoticeDays) : null,
+    maxConsecutiveDays: maxConsecutiveDays != null ? Number(maxConsecutiveDays) : null,
+    eligibilityMonths: eligibilityMonths != null ? Number(eligibilityMonths) : null,
+    countPublicHolidays: !!countPublicHolidays, color: color || '#3b82f6', isActive: true,
+    appliesTo: appliesTo || {}, createdBy: req.user?._id || null, createdAt: new Date(), updatedAt: new Date(),
+  };
+  const result = await insertOne('leave_types', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const listLeaveTypes = async (req, res) => {
+  const types = await findMany('leave_types', {}, { sort: { name: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, types);
+};
+
+const getLeaveType = async (req, res) => {
+  const type = await findOne('leave_types', { _id: new ObjectId(req.params.id) });
+  if (!type) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.success, type);
+};
+
+const updateLeaveType = async (req, res) => {
+  const existing = await findOne('leave_types', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  const ALLOWED = [
+    'name', 'description', 'isPaid', 'isCarryOverAllowed', 'maxCarryOverDays', 'carryOverExpiryMonths',
+    'requiresApproval', 'requiresAttachment', 'minNoticeDays', 'maxConsecutiveDays', 'eligibilityMonths',
+    'countPublicHolidays', 'color', 'appliesTo', 'isActive',
+  ];
+  const update = { updatedAt: new Date() };
+  for (const key of ALLOWED) if (req.body[key] !== undefined) update[key] = req.body[key];
+  if (req.body.code !== undefined) update.code = req.body.code.trim().toUpperCase();
+  await updateOne('leave_types', { _id: existing._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteLeaveType = async (req, res) => {
+  const existing = await findOne('leave_types', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  await updateOne('leave_types', { _id: existing._id }, { $set: { isActive: false, updatedAt: new Date() } });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Public Holidays — HR manages, all roles can view
+// ══════════════════════════════════════════════════════════════════════════════
+
+const createPublicHoliday = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'date'])) return;
+  const { name, date, isRecurringAnnually, appliesTo } = req.body;
+  const doc = {
+    name: name.trim(), date: new Date(date).toISOString().split('T')[0],
+    isRecurringAnnually: !!isRecurringAnnually, appliesTo: appliesTo || [],
+    createdBy: req.user?._id || null, createdAt: new Date(),
+  };
+  const result = await insertOne('public_holidays', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const listPublicHolidays = async (req, res) => {
+  const filter = {};
+  if (req.query.year) {
+    filter.date = { $gte: `${req.query.year}-01-01`, $lte: `${req.query.year}-12-31` };
+  }
+  const holidays = await findMany('public_holidays', filter, { sort: { date: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, holidays);
+};
+
+const updatePublicHoliday = async (req, res) => {
+  const existing = await findOne('public_holidays', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  const update = {};
+  if (req.body.name !== undefined) update.name = req.body.name.trim();
+  if (req.body.date !== undefined) update.date = new Date(req.body.date).toISOString().split('T')[0];
+  if (req.body.isRecurringAnnually !== undefined) update.isRecurringAnnually = !!req.body.isRecurringAnnually;
+  if (req.body.appliesTo !== undefined) update.appliesTo = req.body.appliesTo;
+  await updateOne('public_holidays', { _id: existing._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deletePublicHoliday = async (req, res) => {
+  const existing = await findOne('public_holidays', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  await deleteOne('public_holidays', { _id: existing._id });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Accrual Policies — HR only
+// ══════════════════════════════════════════════════════════════════════════════
+
+const createAccrualPolicy = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'leaveTypeId', 'accrualFrequency', 'accrualAmount', 'maxAnnualEntitlement'])) return;
+  const { name, leaveTypeId, accrualFrequency, accrualAmount, maxAnnualEntitlement, appliesTo } = req.body;
+  const doc = {
+    name: name.trim(), leaveTypeId: new ObjectId(leaveTypeId), accrualFrequency,
+    accrualAmount: Number(accrualAmount), maxAnnualEntitlement: Number(maxAnnualEntitlement),
+    appliesTo: appliesTo || {}, isActive: true, createdBy: req.user?._id || null, createdAt: new Date(),
+  };
+  const result = await insertOne('leave_accrual_policies', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const listAccrualPolicies = async (req, res) => {
+  const policies = await findMany('leave_accrual_policies', {}, { sort: { createdAt: -1 } });
+  const enriched = await Promise.all(policies.map(async p => ({
+    ...p, leaveType: await findOne('leave_types', { _id: p.leaveTypeId }, { projection: { name: 1, code: 1 } }),
+  })));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+const getAccrualPolicy = async (req, res) => {
+  const policy = await findOne('leave_accrual_policies', { _id: new ObjectId(req.params.id) });
+  if (!policy) return returnFunction(res, 404, false, req.locale.notFound);
+  return returnFunction(res, 200, true, req.locale.success, policy);
+};
+
+const updateAccrualPolicy = async (req, res) => {
+  const existing = await findOne('leave_accrual_policies', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  const update = {};
+  const { name, leaveTypeId, accrualFrequency, accrualAmount, maxAnnualEntitlement, appliesTo, isActive } = req.body;
+  if (name !== undefined) update.name = name.trim();
+  if (leaveTypeId !== undefined) update.leaveTypeId = new ObjectId(leaveTypeId);
+  if (accrualFrequency !== undefined) update.accrualFrequency = accrualFrequency;
+  if (accrualAmount !== undefined) update.accrualAmount = Number(accrualAmount);
+  if (maxAnnualEntitlement !== undefined) update.maxAnnualEntitlement = Number(maxAnnualEntitlement);
+  if (appliesTo !== undefined) update.appliesTo = appliesTo;
+  if (isActive !== undefined) update.isActive = isActive;
+  await updateOne('leave_accrual_policies', { _id: existing._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteAccrualPolicy = async (req, res) => {
+  const existing = await findOne('leave_accrual_policies', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  await deleteOne('leave_accrual_policies', { _id: existing._id });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+const runAccrualPolicies = async (req, res) => {
+  const result = await runAccrual(req.user?._id || null);
+  return returnFunction(res, 200, true, `Accrual run complete. ${result.processed} balance(s) updated.`, result);
+};
+
+const runYearEndCarryForward = async (req, res) => {
+  const result = await runYearEndCarryOver(req.user?._id || null);
+  return returnFunction(res, 200, true, `Carry-over run complete. ${result.processed} balance(s) created.`, result);
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Leave Balances
+// ══════════════════════════════════════════════════════════════════════════════
+
+const getLeaveBalances = async (req, res) => {
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  const filter = {};
+  if (scopedIds !== null) filter.employeeId = { $in: scopedIds };
+  if (req.query.year) filter.year = Number(req.query.year);
+  const balances = await findMany('leave_balances', filter);
+  const enriched = await Promise.all(balances.map(async (b) => {
+    const withType = await enrichBalance(b);
+    const employee = await findOne('employees', { _id: b.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+    return { ...withType, employee: employee || null };
+  }));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+const getEmployeeLeaveBalances = async (req, res) => {
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  if (scopedIds !== null && !scopedIds.some(id => String(id) === req.params.employeeId)) {
+    return returnFunction(res, 403, false, 'You cannot view this employee\'s leave balances.');
+  }
+  const year = req.query.year ? Number(req.query.year) : new Date().getFullYear();
+  const balances = await findMany('leave_balances', { employeeId: new ObjectId(req.params.employeeId), year });
+  const enriched = await Promise.all(balances.map(enrichBalance));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
+
+const adjustLeaveBalance = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['employeeId', 'leaveTypeId', 'amount', 'reason'])) return;
+  const { employeeId, leaveTypeId, amount, reason } = req.body;
+  const year = req.body.year ? Number(req.body.year) : new Date().getFullYear();
+  const numAmount = Number(amount);
+  if (!numAmount) return returnFunction(res, 400, false, 'Amount must not be zero.');
+
+  let balance = await findOne('leave_balances', { employeeId: new ObjectId(employeeId), leaveTypeId: new ObjectId(leaveTypeId), year });
+  if (!balance) {
+    const { insertedId } = await insertOne('leave_balances', {
+      employeeId: new ObjectId(employeeId), leaveTypeId: new ObjectId(leaveTypeId), year,
+      openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, carryOverExpiry: null,
+      closingBalance: 0, lastAccrualDate: null, updatedAt: new Date(),
+    });
+    balance = { _id: insertedId, openingBalance: 0 };
   }
 
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.employeeId && role !== 'staff') filter.employeeId = new ObjectId(req.query.employeeId);
-  if (req.query.leaveType) filter.leaveType = req.query.leaveType;
+  const previousOpening = balance.openingBalance;
+  await updateOne('leave_balances', { _id: balance._id }, { $inc: { openingBalance: numAmount }, $set: { updatedAt: new Date() } });
+  const closingBalance = await recomputeClosing(employeeId, leaveTypeId, year);
 
+  await logAudit({
+    employeeId, action: 'balanceAdjusted', performedBy: req.user?._id, performedByName: req.user?.name,
+    previousValue: { openingBalance: previousOpening }, newValue: { openingBalance: previousOpening + numAmount }, comment: reason,
+  });
+
+  return returnFunction(res, 200, true, 'Balance adjusted.', { closingBalance });
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Leave Requests
+// ══════════════════════════════════════════════════════════════════════════════
+
+const listLeaveRequests = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const [total, records] = await Promise.all([
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  const filter = {};
+  if (scopedIds !== null) filter.employeeId = { $in: scopedIds };
+  if (req.query.employeeId) {
+    if (scopedIds !== null && !scopedIds.some(id => String(id) === String(req.query.employeeId))) {
+      filter.employeeId = { $in: [] };
+    } else {
+      filter.employeeId = new ObjectId(req.query.employeeId);
+    }
+  }
+  if (req.query.status) filter.status = req.query.status;
+  if (req.query.leaveTypeId) filter.leaveTypeId = new ObjectId(req.query.leaveTypeId);
+  if (req.query.startDate || req.query.endDate) {
+    filter.startDate = {};
+    if (req.query.startDate) filter.startDate.$gte = new Date(req.query.startDate);
+    if (req.query.endDate) filter.startDate.$lte = new Date(req.query.endDate);
+  }
+
+  const [total, requests] = await Promise.all([
     countDocuments('leave_requests', filter),
     findMany('leave_requests', filter, { skip, limit, sort: { createdAt: -1 } }),
   ]);
+  let enriched = await Promise.all(requests.map(enrichRequest));
 
-  // Batch-load employees for HR view (avoids N+1)
-  const empIds = [...new Set(records.map(r => r.employeeId))];
-  const emps = await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-  const empMap = Object.fromEntries(emps.map(e => [String(e._id), e]));
-  const enriched = records.map(r => ({ ...r, employee: empMap[String(r.employeeId)] ?? null }));
+  if (req.query.department) enriched = enriched.filter(r => r.employee?.department === req.query.department);
+  if (req.query.search) {
+    const q = req.query.search.toLowerCase();
+    enriched = enriched.filter(r => r.employee?.fullName.toLowerCase().includes(q));
+  }
 
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
+const getLeaveRequest = async (req, res) => {
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  if (scopedIds !== null && !scopedIds.some(id => String(id) === String(request.employeeId))) {
+    return returnFunction(res, 403, false, 'You cannot view this leave request.');
+  }
+  const enriched = await enrichRequest(request);
+  const auditLog = await findMany('leave_audit_log', { leaveRequestId: request._id }, { sort: { timestamp: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, { ...enriched, auditLog });
+};
+
 const createLeaveRequest = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['employeeId', 'leaveType', 'startDate', 'endDate', 'reason'])) return;
-  if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
-    return returnFunction(res, 400, false, 'Invalid leave date range. End date must be on or after the start date.');
+  if (!validateRequiredFields(req, res, ['leaveTypeId', 'startDate', 'endDate'])) return;
+  const employeeId = req.user?.employeeId;
+  if (!employeeId) return returnFunction(res, 403, false, 'No employee record linked to your account.');
+
+  const { leaveTypeId, startDate, endDate, halfDay, reason, attachmentUrl } = req.body;
+  const [employee, leaveType] = await Promise.all([
+    findOne('employees', { _id: new ObjectId(employeeId) }),
+    findOne('leave_types', { _id: new ObjectId(leaveTypeId) }),
+  ]);
+  if (!employee) return returnFunction(res, 404, false, 'Employee record not found.');
+  if (!leaveType || !leaveType.isActive) return returnFunction(res, 404, false, 'Leave type not found or inactive.');
+  if (leaveType.requiresAttachment && !attachmentUrl) return returnFunction(res, 400, false, `${leaveType.name} requires a supporting attachment.`);
+
+  const eligibility = checkEligibility(employee, leaveType);
+  if (!eligibility.eligible) return returnFunction(res, 400, false, eligibility.message);
+
+  const notice = checkMinNotice(leaveType, startDate);
+  if (!notice.ok) return returnFunction(res, 400, false, notice.message);
+
+  const overlap = await checkOverlap(employeeId, startDate, endDate);
+  if (overlap) return returnFunction(res, 409, false, 'You already have a leave request for this period.');
+
+  const totalDays = await calculateLeaveDays({ startDate, endDate, countPublicHolidays: leaveType.countPublicHolidays, halfDay });
+  if (totalDays <= 0) return returnFunction(res, 400, false, 'Selected dates contain no working days.');
+
+  const maxConsecutive = checkMaxConsecutive(leaveType, totalDays);
+  if (!maxConsecutive.ok) return returnFunction(res, 400, false, maxConsecutive.message);
+
+  const year = new Date(startDate).getFullYear();
+  const balance = await findOne('leave_balances', { employeeId: employee._id, leaveTypeId: leaveType._id, year });
+  if (!balance) return returnFunction(res, 400, false, `No ${leaveType.name} balance record found for ${year}. Contact HR.`);
+  if (totalDays > balance.closingBalance) {
+    return returnFunction(res, 400, false, `Insufficient balance: ${balance.closingBalance} day(s) remaining, ${totalDays} requested.`);
   }
 
-  const year = new Date(req.body.startDate).getFullYear();
-  const isHalfDay = req.body.isHalfDay === true || req.body.isHalfDay === 'true';
-  let numberOfDays = await calculateWorkingDaysDB(req.body.startDate, req.body.endDate);
-  if (numberOfDays < 1) return returnFunction(res, 400, false, 'Invalid leave time range.');
-  if (isHalfDay) numberOfDays = 0.5;
+  const teamOverlap = await checkTeamOverlap(employee.department, startDate, endDate, employee._id);
 
-  const balance = await findOne('leave_balances', { employeeId: new ObjectId(req.body.employeeId), year });
-  if (!balance) return returnFunction(res, 400, false, 'No leave balance record found for this employee.');
+  const approvalChain = leaveType.requiresApproval ? await resolveApprovalChain(employee, totalDays) : [];
+  const status = approvalChain.length ? 'pending' : 'approved';
 
-  const typeBalance = balance.balances[req.body.leaveType];
-  if (!typeBalance) return returnFunction(res, 400, false, 'Invalid leave type.');
-  if (typeBalance.remaining !== null && typeBalance.remaining < numberOfDays) {
-    return returnFunction(res, 400, false, `Insufficient ${req.body.leaveType} leave balance. Available: ${typeBalance.remaining} days, Requested: ${numberOfDays} days.`);
-  }
-
-  // Block overlapping pending/approved requests
-  const overlap = await findOne('leave_requests', {
-    employeeId: new ObjectId(req.body.employeeId),
-    status: { $in: ['pending', 'approved'] },
-    startDate: { $lte: req.body.endDate },
-    endDate:   { $gte: req.body.startDate },
-  });
-  if (overlap) return returnFunction(res, 400, false, 'A leave request already exists for overlapping dates.');
-
-  // Check blackout periods
-  const blackout = await global.dbo.collection('leave_blackouts').findOne({
-    startDate: { $lte: req.body.endDate },
-    endDate:   { $gte: req.body.startDate },
-    $or: [{ leaveTypes: { $size: 0 } }, { leaveTypes: req.body.leaveType }],
-  });
-  if (blackout) {
-    return returnFunction(res, 400, false, `Leave cannot be requested during the "${blackout.name}" blackout period (${blackout.startDate} – ${blackout.endDate}).`);
-  }
-
-  // Check minimum notice period
-  const leaveConfig = await findOne('leave_config', { _id: 'global' });
-  const minNotice = leaveConfig?.minNoticeDays?.[req.body.leaveType] ?? 0;
-  if (minNotice > 0) {
-    const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0);
-    const startD = new Date(req.body.startDate);
-    const daysNotice = Math.ceil((startD - todayDate) / (1000 * 60 * 60 * 24));
-    if (daysNotice < minNotice) {
-      return returnFunction(res, 400, false, `${req.body.leaveType} leave requires at least ${minNotice} day${minNotice !== 1 ? 's' : ''} advance notice (${daysNotice} day${daysNotice !== 1 ? 's' : ''} given).`);
-    }
-  }
-
+  const now = new Date();
   const doc = {
-    employeeId: new ObjectId(req.body.employeeId),
-    leaveType: req.body.leaveType,
-    startDate: req.body.startDate,
-    endDate: req.body.endDate,
-    numberOfDays,
-    isHalfDay: isHalfDay || false,
-    halfDayPeriod: isHalfDay ? (req.body.halfDayPeriod || 'morning') : null,
-    reason: req.body.reason,
-    status: 'pending',
-    approvedBy: null,
-    approvedAt: null,
-    comments: null,
-    createdAt: new Date(),
+    employeeId: employee._id, leaveTypeId: leaveType._id,
+    startDate: new Date(startDate), endDate: new Date(endDate), totalDays,
+    halfDay: halfDay || null, reason: reason || '', attachmentUrl: attachmentUrl || null,
+    status, approvalChain, currentApprovalLevel: approvalChain.length ? 1 : 0,
+    rejectionReason: null, cancelledAt: null, cancelledBy: null,
+    revokedAt: null, revokedBy: null, disputeReason: null, disputeResolvedAt: null, disputeResolvedBy: null,
+    payrollRunId: null, createdAt: now, updatedAt: now,
   };
-
   const result = await insertOne('leave_requests', doc);
 
-  // Inbox: notify manager + HR that a leave request was submitted
-  const emp = await findOne('employees', { _id: doc.employeeId }, { projection: { fullName: 1, department: 1 } });
-  const empName = emp?.fullName || 'An employee';
-  const inboxPayload = {
-    type: 'leave', subType: 'leave_request',
-    title: `Leave request from ${empName}`,
-    subtitle: `${req.body.leaveType} leave · ${req.body.startDate} – ${req.body.endDate} · ${numberOfDays} day${numberOfDays !== 1 ? 's' : ''}`,
-    referenceId: result.insertedId, referenceModel: 'leave_requests',
-    requiresAction: true, triggeredBy: req.user._id,
-  };
-  await Promise.all([
-    notifyManager(doc.employeeId, inboxPayload),
-    notifyHR(inboxPayload),
-  ]);
+  await updateOne('leave_balances', { _id: balance._id }, { $inc: { pending: totalDays }, $set: { updatedAt: now } });
+  await recomputeClosing(employee._id, leaveType._id, year);
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, numberOfDays });
+  await logAudit({ leaveRequestId: result.insertedId, employeeId: employee._id, action: 'submitted', performedBy: req.user._id, performedByName: employee.fullName, newValue: { status, totalDays } });
+
+  if (approvalChain.length) {
+    const firstApprover = approvalChain[0];
+    notifyEmployee(employee._id, { title: 'Leave Request Submitted', body: `Your ${leaveType.name} request (${totalDays} day(s)) is pending approval.`, type: 'leave' }).catch(() => {});
+    notifyManager(employee._id, {
+      type: 'leave', subType: 'leave_request', title: `Leave request: ${employee.fullName}`,
+      subtitle: `${leaveType.name} · ${totalDays} day(s) · ${new Date(startDate).toDateString()} - ${new Date(endDate).toDateString()}`,
+      referenceId: result.insertedId, referenceModel: 'leave_requests', requiresAction: true,
+    }).catch(() => {});
+  } else {
+    notifyEmployee(employee._id, { title: 'Leave Request Approved', body: `Your ${leaveType.name} request was auto-approved (no approval required for this leave type).`, type: 'leave' }).catch(() => {});
+  }
+
+  return returnFunction(res, 201, true, 'Leave request submitted.', {
+    _id: result.insertedId, totalDays, status, approvalChain,
+    teamOverlapWarning: teamOverlap.warn ? `${teamOverlap.count} other employee(s) from your department are already off during this period.` : null,
+  });
+};
+
+const updateMyDraftRequest = async (req, res) => {
+  const employeeId = req.user?.employeeId;
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id), employeeId: new ObjectId(employeeId) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  if (request.status !== 'draft') return returnFunction(res, 400, false, 'Only draft requests can be edited.');
+  const ALLOWED = ['leaveTypeId', 'startDate', 'endDate', 'halfDay', 'reason', 'attachmentUrl'];
+  const update = { updatedAt: new Date() };
+  for (const key of ALLOWED) if (req.body[key] !== undefined) update[key] = req.body[key];
+  await updateOne('leave_requests', { _id: request._id }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+// Restores balance (pending -= totalDays) — shared by reject/cancel/revoke.
+const restorePendingBalance = async (request) => {
+  const year = new Date(request.startDate).getFullYear();
+  await global.dbo.collection('leave_balances').updateOne(
+    { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+    { $inc: { pending: -request.totalDays }, $set: { updatedAt: new Date() } }
+  );
+  await recomputeClosing(request.employeeId, request.leaveTypeId, year);
 };
 
 const approveLeaveRequest = async (req, res) => {
   const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
-  if (request.status !== 'pending') return returnFunction(res, 400, false, 'Request is no longer pending.');
+  if (request.status !== 'pending') return returnFunction(res, 400, false, 'This request is not pending.');
 
-  await updateOne('leave_requests', { _id: request._id }, {
-    $set: { status: 'approved', approvedBy: new ObjectId(req.user._id), approvedAt: new Date(), comments: req.body.comments || null },
-  });
+  const currentStep = request.approvalChain.find(c => c.level === request.currentApprovalLevel);
+  const authorized = isHR(req) || (currentStep && String(currentStep.approverId) === String(req.user._id));
+  if (!authorized) return returnFunction(res, 403, false, 'You are not authorized to approve this request at its current level.');
 
-  notifyEmployee(request.employeeId, {
-    type: 'leave',
-    title: 'Leave Approved ✓',
-    body: `Your ${request.leaveType} leave from ${request.startDate} to ${request.endDate} (${request.numberOfDays} day${request.numberOfDays !== 1 ? 's' : ''}) has been approved.`,
-    link: '/staff-portal',
-  }).catch(() => {});
+  const now = new Date();
+  const updatedChain = request.approvalChain.map(c => c.level === request.currentApprovalLevel
+    ? { ...c, status: 'approved', actedAt: now, comment: req.body.comment || null }
+    : c);
+  const nextLevel = updatedChain.find(c => c.level === request.currentApprovalLevel + 1);
 
-  // Deduct from leave_balances
-  const year = new Date(request.startDate).getFullYear();
-  const path = `balances.${request.leaveType}`;
-  await updateOne('leave_balances', { employeeId: request.employeeId, year }, {
-    $inc: { [`${path}.used`]: request.numberOfDays, [`${path}.remaining`]: -request.numberOfDays },
-  });
-
-  // Set employee status to on_leave
-  const today = new Date().toISOString().slice(0, 10);
-  if (request.startDate <= today && today <= request.endDate) {
-    await updateOne('employees', { _id: request.employeeId }, { $set: { status: 'on_leave', updatedAt: new Date() } });
-  }
-
-  // Inbox: notify employee of approval
-  const empUserApprove = await findOne('users', { employeeId: request.employeeId });
-  if (empUserApprove) {
-    await createInboxItem({
-      recipientId: empUserApprove._id, type: 'general', subType: 'leave_approved',
-      title: 'Leave request approved ✓',
-      subtitle: `Your ${request.leaveType} leave (${request.startDate} – ${request.endDate}) has been approved.`,
-      referenceId: request._id, referenceModel: 'leave_requests',
-      requiresAction: false, triggeredBy: req.user._id,
+  if (nextLevel) {
+    await updateOne('leave_requests', { _id: request._id }, {
+      $set: { approvalChain: updatedChain, currentApprovalLevel: nextLevel.level, updatedAt: now },
     });
+    notifyEmployee(request.employeeId, { title: 'Leave Request Update', body: 'Your leave request was approved at one level and is now awaiting the next approver.', type: 'leave' }).catch(() => {});
+    await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'approved', performedBy: req.user._id, performedByName: req.user.name, comment: `Level ${request.currentApprovalLevel} approved` });
+    return returnFunction(res, 200, true, 'Approved at this level. Awaiting next approver.');
   }
+
+  const year = new Date(request.startDate).getFullYear();
+  await updateOne('leave_requests', { _id: request._id }, { $set: { approvalChain: updatedChain, status: 'approved', updatedAt: now } });
+  await global.dbo.collection('leave_balances').updateOne(
+    { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+    { $inc: { pending: -request.totalDays, used: request.totalDays }, $set: { updatedAt: now } }
+  );
+  await recomputeClosing(request.employeeId, request.leaveTypeId, year);
+
+  const today = new Date();
+  if (new Date(request.startDate) <= today && today <= new Date(request.endDate)) {
+    await updateOne('employees', { _id: request.employeeId }, { $set: { status: 'on_leave', updatedAt: now } });
+  }
+
+  await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'approved', performedBy: req.user._id, performedByName: req.user.name, comment: 'Final approval' });
+  notifyEmployee(request.employeeId, { title: 'Leave Request Approved', body: 'Your leave request has been fully approved.', type: 'leave' }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Leave request approved.');
 };
 
 const rejectLeaveRequest = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['rejectionReason'])) return;
   const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
-  if (request.status !== 'pending') return returnFunction(res, 400, false, 'Request is no longer pending.');
+  if (request.status !== 'pending') return returnFunction(res, 400, false, 'This request is not pending.');
 
+  const currentStep = request.approvalChain.find(c => c.level === request.currentApprovalLevel);
+  const authorized = isHR(req) || (currentStep && String(currentStep.approverId) === String(req.user._id));
+  if (!authorized) return returnFunction(res, 403, false, 'You are not authorized to reject this request at its current level.');
+
+  const now = new Date();
+  const updatedChain = request.approvalChain.map(c => c.level === request.currentApprovalLevel
+    ? { ...c, status: 'rejected', actedAt: now, comment: req.body.rejectionReason }
+    : c);
   await updateOne('leave_requests', { _id: request._id }, {
-    $set: { status: 'rejected', approvedBy: new ObjectId(req.user._id), approvedAt: new Date(), comments: req.body.comments || null },
+    $set: { approvalChain: updatedChain, status: 'rejected', rejectionReason: req.body.rejectionReason, updatedAt: now },
   });
+  await restorePendingBalance(request);
 
-  notifyEmployee(request.employeeId, {
-    type: 'leave',
-    title: 'Leave Request Declined',
-    body: `Your ${request.leaveType} leave from ${request.startDate} to ${request.endDate} was not approved.${req.body.comments ? ` Reason: ${req.body.comments}` : ''}`,
-    link: '/staff-portal',
-  }).catch(() => {});
-
-  // Inbox: notify employee of rejection
-  const empUserReject = await findOne('users', { employeeId: request.employeeId });
-  if (empUserReject) {
-    await createInboxItem({
-      recipientId: empUserReject._id, type: 'general', subType: 'leave_declined',
-      title: 'Leave request declined',
-      subtitle: `Your ${request.leaveType} leave (${request.startDate} – ${request.endDate}) was not approved.`,
-      referenceId: request._id, referenceModel: 'leave_requests',
-      requiresAction: false, triggeredBy: req.user._id,
-    });
-  }
+  await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'rejected', performedBy: req.user._id, performedByName: req.user.name, comment: req.body.rejectionReason });
+  notifyEmployee(request.employeeId, { title: 'Leave Request Rejected', body: req.body.rejectionReason, type: 'leave' }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Leave request rejected.');
 };
 
-const deleteLeaveRequest = async (req, res) => {
+const cancelLeaveRequest = async (req, res) => {
   const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
 
-  // If approved, restore the leave balance before deleting
-  if (request.status === 'approved') {
-    const year = new Date(request.startDate).getFullYear();
-    const path = `balances.${request.leaveType}`;
-    await updateOne('leave_balances', { employeeId: request.employeeId, year }, {
-      $inc: { [`${path}.used`]: -request.numberOfDays, [`${path}.remaining`]: request.numberOfDays },
-    });
+  const isOwner = String(request.employeeId) === String(req.user.employeeId);
+  if (!isHR(req) && !isOwner) return returnFunction(res, 403, false, 'You cannot cancel this request.');
+  if (isOwner && !isHR(req) && request.status !== 'pending' && request.status !== 'draft') {
+    return returnFunction(res, 400, false, 'Only pending or draft requests can be cancelled.');
+  }
+  if (!['pending', 'draft', 'approved'].includes(request.status)) {
+    return returnFunction(res, 400, false, 'This request cannot be cancelled.');
   }
 
-  await global.dbo.collection('leave_requests').deleteOne({ _id: request._id });
-  return returnFunction(res, 200, true, 'Leave request deleted.');
+  const now = new Date();
+  await updateOne('leave_requests', { _id: request._id }, {
+    $set: { status: 'cancelled', cancelledAt: now, cancelledBy: req.user._id, updatedAt: now },
+  });
+
+  if (request.status === 'pending') {
+    await restorePendingBalance(request);
+  } else if (request.status === 'approved') {
+    const year = new Date(request.startDate).getFullYear();
+    await global.dbo.collection('leave_balances').updateOne(
+      { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+      { $inc: { used: -request.totalDays }, $set: { updatedAt: now } }
+    );
+    await recomputeClosing(request.employeeId, request.leaveTypeId, year);
+  }
+
+  await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'cancelled', performedBy: req.user._id, performedByName: req.user.name });
+  return returnFunction(res, 200, true, 'Leave request cancelled.');
 };
+
+// ── Bonus features ported from the old system ─────────────────────────────────
 
 const revokeLeaveRequest = async (req, res) => {
   const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
   if (request.status !== 'approved') return returnFunction(res, 400, false, 'Only approved requests can be revoked.');
 
-  await updateOne('leave_requests', { _id: request._id }, {
-    $set: { status: 'rejected', comments: req.body.comments || 'Revoked by HR', approvedBy: new ObjectId(req.user._id), approvedAt: new Date() },
-  });
-
-  // Restore leave balance
+  const now = new Date();
+  await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'cancelled', revokedAt: now, revokedBy: req.user._id, updatedAt: now } });
   const year = new Date(request.startDate).getFullYear();
-  const path = `balances.${request.leaveType}`;
-  await updateOne('leave_balances', { employeeId: request.employeeId, year }, {
-    $inc: { [`${path}.used`]: -request.numberOfDays, [`${path}.remaining`]: request.numberOfDays },
-  });
+  await global.dbo.collection('leave_balances').updateOne(
+    { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+    { $inc: { used: -request.totalDays }, $set: { updatedAt: now } }
+  );
+  await recomputeClosing(request.employeeId, request.leaveTypeId, year);
 
-  // Restore employee status if currently on_leave
-  await updateOne('employees', { _id: request.employeeId, status: 'on_leave' }, { $set: { status: 'active', updatedAt: new Date() } });
+  await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'revoked', performedBy: req.user._id, performedByName: req.user.name });
+  notifyEmployee(request.employeeId, { title: 'Leave Approval Revoked', body: 'Your previously approved leave has been revoked by HR.', type: 'leave' }).catch(() => {});
+  return returnFunction(res, 200, true, 'Leave request revoked.');
+};
 
-  notifyEmployee(request.employeeId, {
-    type: 'leave',
-    title: 'Leave Revoked',
-    body: `Your ${request.leaveType} leave (${request.startDate} – ${request.endDate}) has been revoked.${req.body.comments ? ` Reason: ${req.body.comments}` : ''}`,
-    link: '/staff-portal',
-  }).catch(() => {});
+const disputeLeaveRequest = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['disputeReason'])) return;
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id), employeeId: new ObjectId(req.user.employeeId) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  if (request.status !== 'rejected') return returnFunction(res, 400, false, 'Only rejected requests can be disputed.');
 
-  return returnFunction(res, 200, true, 'Leave revoked.');
+  await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'disputed', disputeReason: req.body.disputeReason, updatedAt: new Date() } });
+  await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'disputed', performedBy: req.user._id, performedByName: req.user.name, comment: req.body.disputeReason });
+  notifyHR({ type: 'leave', subType: 'leave_dispute', title: 'Leave Rejection Disputed', subtitle: req.body.disputeReason, referenceId: request._id, referenceModel: 'leave_requests', requiresAction: true }).catch(() => {});
+  return returnFunction(res, 200, true, 'Dispute submitted. HR will review.');
 };
 
 const resolveDispute = async (req, res) => {
@@ -256,583 +581,231 @@ const resolveDispute = async (req, res) => {
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
   if (request.status !== 'disputed') return returnFunction(res, 400, false, 'Request is not disputed.');
 
-  const newStatus = req.body.resolution === 'approve' ? 'approved' : 'rejected';
-
-  await updateOne('leave_requests', { _id: request._id }, {
-    $set: { status: newStatus, comments: req.body.comments || null, disputeResolvedAt: new Date(), disputeResolvedBy: new ObjectId(req.user._id) },
-  });
-
-  if (newStatus === 'approved') {
+  const now = new Date();
+  const { resolution, comment } = req.body;
+  if (resolution === 'overturned') {
+    const updatedChain = request.approvalChain.map(c => ({ ...c, status: 'approved', actedAt: now }));
+    await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'approved', approvalChain: updatedChain, disputeResolvedAt: now, disputeResolvedBy: req.user._id, updatedAt: now } });
     const year = new Date(request.startDate).getFullYear();
-    const path = `balances.${request.leaveType}`;
-    await updateOne('leave_balances', { employeeId: request.employeeId, year }, {
-      $inc: { [`${path}.used`]: request.numberOfDays, [`${path}.remaining`]: -request.numberOfDays },
-    });
+    await global.dbo.collection('leave_balances').updateOne(
+      { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+      { $inc: { used: request.totalDays }, $set: { updatedAt: now } }
+    );
+    await recomputeClosing(request.employeeId, request.leaveTypeId, year);
+  } else {
+    await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'rejected', disputeResolvedAt: now, disputeResolvedBy: req.user._id, updatedAt: now } });
   }
 
-  notifyEmployee(request.employeeId, {
-    type: 'leave',
-    title: newStatus === 'approved' ? 'Dispute Resolved – Approved ✓' : 'Dispute Resolved – Declined',
-    body: `Your leave dispute has been reviewed and ${newStatus}.${req.body.comments ? ` Note: ${req.body.comments}` : ''}`,
-    link: '/staff-portal',
-  }).catch(() => {});
-
-  return returnFunction(res, 200, true, `Dispute resolved as ${newStatus}.`);
+  await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'disputeResolved', performedBy: req.user._id, performedByName: req.user.name, comment: `${resolution}: ${comment || ''}` });
+  notifyEmployee(request.employeeId, { title: 'Leave Dispute Resolved', body: `Your dispute was ${resolution}.`, type: 'leave' }).catch(() => {});
+  return returnFunction(res, 200, true, 'Dispute resolved.');
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Team Calendar
+// ══════════════════════════════════════════════════════════════════════════════
 
 const getLeaveCalendar = async (req, res) => {
-  const month = parseInt(req.query.month) || new Date().getMonth() + 1;
-  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  const filter = { status: 'approved' };
+  if (scopedIds !== null) filter.employeeId = { $in: scopedIds };
+  if (req.query.startDate) filter.endDate = { $gte: new Date(req.query.startDate) };
+  if (req.query.endDate) filter.startDate = { $lte: new Date(req.query.endDate) };
+  if (req.query.leaveTypeId) filter.leaveTypeId = new ObjectId(req.query.leaveTypeId);
 
-  const start = `${year}-${String(month).padStart(2, '0')}-01`;
-  const end = `${year}-${String(month).padStart(2, '0')}-31`;
-
-  const requests = await findMany('leave_requests', {
-    status: 'approved',
-    startDate: { $lte: end },
-    endDate: { $gte: start },
-  });
-
-  // Batch-load employees then group by department
-  const calEmpIds = [...new Set(requests.map(r => r.employeeId))];
-  const calEmps = await findMany('employees', { _id: { $in: calEmpIds } }, { projection: { fullName: 1, department: 1 } });
-  const calEmpMap = Object.fromEntries(calEmps.map(e => [String(e._id), e]));
-  const grouped = {};
-  for (const r of requests) {
-    const emp = calEmpMap[String(r.employeeId)];
-    if (!emp) continue;
-    if (!grouped[emp.department]) grouped[emp.department] = [];
-    grouped[emp.department].push({ ...r, employee: emp });
-  }
-
-  return returnFunction(res, 200, true, req.locale.success, grouped);
-};
-
-const getLeaveConflicts = async (req, res) => {
-  const { department, startDate, endDate } = req.query;
-  if (!department || !startDate || !endDate) return returnFunction(res, 400, false, req.locale.missingRequiredFields);
-
-  const deptEmployees = await findMany('employees', { department }, { projection: { _id: 1, fullName: 1 } });
-  const ids = deptEmployees.map((e) => e._id);
-
-  const conflicts = await findMany('leave_requests', {
-    employeeId: { $in: ids },
-    status: 'approved',
-    startDate: { $lte: endDate },
-    endDate: { $gte: startDate },
-  });
-
-  const enriched = await Promise.all(conflicts.map(async (c) => {
-    const emp = deptEmployees.find((e) => String(e._id) === String(c.employeeId));
-    return { ...c, employee: emp };
-  }));
+  let requests = await findMany('leave_requests', filter);
+  let enriched = await Promise.all(requests.map(enrichRequest));
+  if (req.query.departmentId) enriched = enriched.filter(r => r.employee?.department === req.query.departmentId);
 
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-// ── New: current user's own balances in array format ─────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  Payroll Integration
+// ══════════════════════════════════════════════════════════════════════════════
 
-const getMyBalances = async (req, res) => {
-  const year = parseInt(req.query.year) || new Date().getFullYear();
-  const empId = req.user.employeeId;
-  if (!empId) return returnFunction(res, 200, true, req.locale.success, []);
-
-  const record = await findOne('leave_balances', { employeeId: empId, year });
-  if (!record) return returnFunction(res, 200, true, req.locale.success, []);
-
-  const TYPE_COLORS = {
-    annual: '#6366f1', sick: '#3b82f6', maternity: '#8b5cf6',
-    paternity: '#06b6d4', unpaid: '#64748b', compassionate: '#f59e0b',
-    study: '#10b981', emergency: '#ef4444',
-  };
-  const TYPE_LABELS = {
-    annual: 'Annual Leave', sick: 'Sick Leave', maternity: 'Maternity Leave',
-    paternity: 'Paternity Leave', unpaid: 'Unpaid Leave',
-    compassionate: 'Compassionate Leave', study: 'Study Leave', emergency: 'Emergency Leave',
-  };
-
-  const balances = Object.entries(record.balances || {}).map(([type, b]) => ({
-    leaveType: type,
-    leaveTypeName: TYPE_LABELS[type] ?? (type.charAt(0).toUpperCase() + type.slice(1) + ' Leave'),
-    totalDays:     b.allocated ?? b.total ?? 0,
-    usedDays:      b.used ?? 0,
-    pendingDays:   b.pending ?? 0,
-    remainingDays: b.remaining ?? ((b.allocated ?? b.total ?? 0) - (b.used ?? 0)),
-    color:         TYPE_COLORS[type] ?? '#6366f1',
-  }));
-
-  return returnFunction(res, 200, true, req.locale.success, balances);
-};
-
-// ── Calendar for date range ───────────────────────────────────────────────────
-
-const getCalendarEntries = async (req, res) => {
-  const from = req.query.from || new Date().toISOString().split('T')[0].slice(0, 7) + '-01';
-  const to   = req.query.to   || new Date().toISOString().split('T')[0].slice(0, 7) + '-31';
-  const dept = req.query.dept;
-
-  const filter = {
-    status: 'approved',
-    startDate: { $lte: to },
-    endDate: { $gte: from },
-  };
-
-  if (dept) {
-    const deptEmps = await findMany('employees', { department: dept }, { projection: { _id: 1 } });
-    filter.employeeId = { $in: deptEmps.map(e => e._id) };
-  }
-
-  const requests = await findMany('leave_requests', filter, { sort: { startDate: 1 } });
-  const holidays = await findMany('public_holidays', { date: { $gte: from, $lte: to } }, { sort: { date: 1 } });
-
-  const calEntEmpIds = [...new Set(requests.map(r => r.employeeId))];
-  const calEntEmps = await findMany('employees', { _id: { $in: calEntEmpIds } }, { projection: { fullName: 1, department: 1 } });
-  const calEntEmpMap = Object.fromEntries(calEntEmps.map(e => [String(e._id), e]));
-  const enriched = requests.map(r => ({ ...r, employee: calEntEmpMap[String(r.employeeId)] ?? null }));
-
-  return returnFunction(res, 200, true, req.locale.success, { leaves: enriched, holidays });
-};
-
-// ── Today's absences ──────────────────────────────────────────────────────────
-
-const getTodayAbsences = async (req, res) => {
-  const today = new Date().toISOString().split('T')[0];
-  const onLeave = await findMany('leave_requests', {
-    status: 'approved',
-    startDate: { $lte: today },
-    endDate:   { $gte: today },
-  });
-
-  const absEmpIds = [...new Set(onLeave.map(r => r.employeeId))];
-  const absEmps = await findMany('employees', { _id: { $in: absEmpIds } }, { projection: { fullName: 1, department: 1, designation: 1 } });
-  const absEmpMap = Object.fromEntries(absEmps.map(e => [String(e._id), e]));
-  const enriched = onLeave.map(r => ({ ...r, employee: absEmpMap[String(r.employeeId)] ?? null }));
-
+const getPayrollFeed = async (req, res) => {
+  const requests = await findMany('leave_requests', { status: 'approved', payrollRunId: null });
+  const enriched = await Promise.all(requests.map(enrichRequest));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-// ── Upcoming leaves (next N days) ─────────────────────────────────────────────
-
-const getUpcomingLeaves = async (req, res) => {
-  const days = Math.min(parseInt(req.query.days) || 30, 90);
-  const today = new Date().toISOString().split('T')[0];
-  const future = new Date(); future.setDate(future.getDate() + days);
-  const to = future.toISOString().split('T')[0];
-
-  const requests = await findMany('leave_requests', {
-    status: { $in: ['approved', 'pending'] },
-    startDate: { $gt: today, $lte: to },
-  }, { sort: { startDate: 1 }, limit: 20 });
-
-  const upEmpIds = [...new Set(requests.map(r => r.employeeId))];
-  const upEmps = await findMany('employees', { _id: { $in: upEmpIds } }, { projection: { fullName: 1, department: 1 } });
-  const upEmpMap = Object.fromEntries(upEmps.map(e => [String(e._id), e]));
-  const enriched = requests.map(r => ({ ...r, employee: upEmpMap[String(r.employeeId)] ?? null }));
-
-  return returnFunction(res, 200, true, req.locale.success, enriched);
-};
-
-// ── Cancel own request (employee) ─────────────────────────────────────────────
-
-const cancelLeaveRequest = async (req, res) => {
-  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
-  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
-
-  const empId = req.user.employeeId;
-  if (empId && String(request.employeeId) !== String(empId)) {
-    return returnFunction(res, 403, false, 'You can only cancel your own requests.');
-  }
-  if (!['pending', 'approved'].includes(request.status)) {
-    return returnFunction(res, 400, false, 'Cannot cancel a request that is already ' + request.status);
-  }
-
-  // Restore balance if it was approved
-  if (request.status === 'approved') {
-    const year = new Date(request.startDate).getFullYear();
-    const path = `balances.${request.leaveType}`;
-    await updateOne('leave_balances', { employeeId: request.employeeId, year }, {
-      $inc: { [`${path}.used`]: -(request.numberOfDays || request.totalDays || 0),
-               [`${path}.remaining`]: (request.numberOfDays || request.totalDays || 0) },
-    });
-  }
-
-  await updateOne('leave_requests', { _id: request._id }, {
-    $set: { status: 'cancelled', cancelledAt: new Date(), cancelledBy: new ObjectId(req.user._id) },
-  });
-
-  return returnFunction(res, 200, true, 'Leave request cancelled.');
-};
-
-// ── Single request by ID ──────────────────────────────────────────────────────
-
-const getLeaveRequest = async (req, res) => {
-  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
-  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
-  if (req.user.role === 'staff' && req.user.employeeId && String(request.employeeId) !== String(req.user.employeeId)) {
-    return returnFunction(res, 403, false, 'You can only view your own leave requests.');
-  }
-  const emp = await findOne('employees', { _id: request.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } });
-  let approver = null;
-  if (request.approvedBy) approver = await findOne('users', { _id: new ObjectId(request.approvedBy) }, { projection: { name: 1 } });
-  return returnFunction(res, 200, true, req.locale.success, { ...request, employee: emp, approverName: approver?.name });
-};
-
-// ── Export CSV ────────────────────────────────────────────────────────────────
-
-const exportLeaveRequests = async (req, res) => {
-  const filter = {};
-  if (req.query.status)     filter.status     = req.query.status;
-  if (req.query.leaveType)  filter.leaveType  = req.query.leaveType;
-  if (req.query.from && req.query.to) filter.startDate = { $gte: req.query.from, $lte: req.query.to };
-
-  const records = await findMany('leave_requests', filter, { sort: { createdAt: -1 }, limit: 5000 });
-  const expEmpIds = [...new Set(records.map(r => r.employeeId))];
-  const expEmps = await findMany('employees', { _id: { $in: expEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-  const expEmpMap = Object.fromEntries(expEmps.map(e => [String(e._id), e]));
-  const enriched = records.map(r => ({ ...r, employee: expEmpMap[String(r.employeeId)] ?? null }));
-
-  const header = 'Employee,Staff No,Department,Leave Type,From,To,Days,Status,Submitted On\n';
-  const rows = enriched.map(r =>
-    [r.employee?.fullName, r.employee?.staffNumber, r.employee?.department,
-     r.leaveType, r.startDate, r.endDate,
-     r.numberOfDays ?? r.totalDays, r.status,
-     new Date(r.createdAt).toLocaleDateString('en-KE')].join(',')
-  ).join('\n');
-
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename="leave-requests.csv"');
-  return res.send(header + rows);
-};
-
-// ── Leave balance adjustment (admin) ─────────────────────────────────────────
-
-const adjustLeaveBalance = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['employeeId', 'leaveType', 'adjustment'])) return;
-  const year = parseInt(req.body.year) || new Date().getFullYear();
-  const path = `balances.${req.body.leaveType}`;
-  await global.dbo.collection('leave_balances').updateOne(
-    { employeeId: new ObjectId(req.body.employeeId), year },
-    { $inc: { [`${path}.remaining`]: Number(req.body.adjustment) }, $set: { updatedAt: new Date() } }
+const markPayrollFeedProcessed = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['requestIds', 'payrollRunId'])) return;
+  const { requestIds, payrollRunId } = req.body;
+  await global.dbo.collection('leave_requests').updateMany(
+    { _id: { $in: requestIds.map(id => new ObjectId(id)) } },
+    { $set: { payrollRunId: new ObjectId(payrollRunId), updatedAt: new Date() } }
   );
-  return returnFunction(res, 200, true, 'Balance adjusted.');
+  return returnFunction(res, 200, true, 'Leave records marked as processed for this payroll run.');
 };
 
-// ── Policies ──────────────────────────────────────────────────────────────────
-
-const listPolicies = async (req, res) => {
-  const policies = await findMany('leave_policies', {}, { sort: { createdAt: -1 } });
-  return returnFunction(res, 200, true, req.locale.success, policies);
-};
-
-const createPolicy = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['name'])) return;
-  const { ObjectId: ObjId } = require('mongodb');
-  const doc = {
-    name:          req.body.name,
-    description:   req.body.description || '',
-    isDefault:     req.body.isDefault || false,
-    countries:     req.body.countries || [],
-    leaveTypes:    (req.body.leaveTypes || []).map(lt => ({ ...lt, _id: new ObjId() })),
-    approvalChain: req.body.approvalChain || { approverType: 'manager', escalateAfterDays: 3 },
-    assignedTo:    req.body.assignedTo || { type: 'all' },
-    createdBy:     new ObjId(req.user._id),
-    createdAt:     new Date(),
-    updatedAt:     new Date(),
-  };
-  if (doc.isDefault) await global.dbo.collection('leave_policies').updateMany({}, { $set: { isDefault: false } });
-  const result = await insertOne('leave_policies', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
-};
-
-const getPolicy = async (req, res) => {
-  const policy = await findOne('leave_policies', { _id: new ObjectId(req.params.id) });
-  if (!policy) return returnFunction(res, 404, false, req.locale.notFound);
-  return returnFunction(res, 200, true, req.locale.success, policy);
-};
-
-const updatePolicy = async (req, res) => {
-  const update = { ...req.body, updatedAt: new Date() };
-  delete update._id;
-  if (update.isDefault) await global.dbo.collection('leave_policies').updateMany({}, { $set: { isDefault: false } });
-  await updateOne('leave_policies', { _id: new ObjectId(req.params.id) }, { $set: update });
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
-};
-
-const deletePolicy = async (req, res) => {
-  await global.dbo.collection('leave_policies').deleteOne({ _id: new ObjectId(req.params.id) });
-  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
-};
-
-const setDefaultPolicy = async (req, res) => {
-  await global.dbo.collection('leave_policies').updateMany({}, { $set: { isDefault: false } });
-  await updateOne('leave_policies', { _id: new ObjectId(req.params.id) }, { $set: { isDefault: true } });
-  return returnFunction(res, 200, true, 'Policy set as default.');
-};
-
-// ── Public holidays ───────────────────────────────────────────────────────────
-
-const listHolidays = async (req, res) => {
-  const year = req.query.year || new Date().getFullYear();
-  const filter = { date: { $gte: `${year}-01-01`, $lte: `${year}-12-31` } };
-  const holidays = await findMany('public_holidays', filter, { sort: { date: 1 } });
-  return returnFunction(res, 200, true, req.locale.success, holidays);
-};
-
-const addHoliday = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['name', 'date'])) return;
-  const doc = { name: req.body.name, date: req.body.date, country: req.body.country || 'KE', isRecurring: req.body.isRecurring || false, createdAt: new Date() };
-  const result = await insertOne('public_holidays', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
-};
-
-const deleteHoliday = async (req, res) => {
-  await global.dbo.collection('public_holidays').deleteOne({ _id: new ObjectId(req.params.id) });
-  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
-};
-
-// ── Analytics ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  Analytics — role scoped
+// ══════════════════════════════════════════════════════════════════════════════
 
 const getLeaveAnalytics = async (req, res) => {
-  const year = parseInt(req.query.year) || new Date().getFullYear();
-  const from = `${year}-01-01`;
-  const to   = `${year}-12-31`;
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  const filter = {};
+  if (scopedIds !== null) filter.employeeId = { $in: scopedIds };
+  const requests = await findMany('leave_requests', filter);
+  const leaveTypes = await findMany('leave_types', {});
+  const typeById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t]));
 
-  const [allRequests, employees] = await Promise.all([
-    findMany('leave_requests', { status: 'approved', startDate: { $gte: from }, endDate: { $lte: to } }),
-    findMany('employees', { status: 'active' }, { projection: { _id: 1, fullName: 1, department: 1 } }),
-  ]);
+  const now = new Date();
+  const byMonth = {};
+  const cursor = new Date(now.getFullYear(), now.getMonth(), 1);
+  for (let i = 11; i >= 0; i--) {
+    const d = new Date(cursor.getFullYear(), cursor.getMonth() - i, 1);
+    byMonth[`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`] = 0;
+  }
+  const approved = requests.filter(r => r.status === 'approved');
+  for (const r of approved) {
+    const d = new Date(r.startDate);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (byMonth[key] !== undefined) byMonth[key] += r.totalDays;
+  }
 
-  const totalDays = allRequests.reduce((s, r) => s + (r.numberOfDays || r.totalDays || 0), 0);
-  const avgDays   = employees.length > 0 ? Math.round((totalDays / employees.length) * 10) / 10 : 0;
-
-  // By type
   const byType = {};
-  for (const r of allRequests) {
-    const t = r.leaveType;
-    byType[t] = (byType[t] || 0) + (r.numberOfDays || r.totalDays || 0);
+  for (const r of approved) {
+    const key = String(r.leaveTypeId);
+    byType[key] = (byType[key] || 0) + r.totalDays;
   }
-  const mostUsedType = Object.entries(byType).sort((a, b) => b[1] - a[1])[0];
+  const leaveTypeBreakdown = Object.entries(byType).map(([id, days]) => ({ leaveTypeId: id, name: typeById[id]?.name || 'Unknown', days }));
 
-  // By month
-  const byMonth = Array(12).fill(0);
-  for (const r of allRequests) {
-    const m = new Date(r.startDate).getMonth();
-    if (m >= 0 && m < 12) byMonth[m] += (r.numberOfDays || r.totalDays || 0);
-  }
-
-  // By department
   const byDept = {};
-  for (const r of allRequests) {
-    const emp = employees.find(e => String(e._id) === String(r.employeeId));
-    if (!emp?.department) continue;
-    byDept[emp.department] = (byDept[emp.department] || 0) + (r.numberOfDays || r.totalDays || 0);
+  const employeeIds = [...new Set(approved.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const employees = await findMany('employees', { _id: { $in: employeeIds } }, { projection: { department: 1 } });
+  const deptById = Object.fromEntries(employees.map(e => [String(e._id), e.department]));
+  for (const r of approved) {
+    const dept = deptById[String(r.employeeId)] || 'Unknown';
+    byDept[dept] = (byDept[dept] || 0) + r.totalDays;
   }
 
-  // Employees with zero days
-  const empIdsWithLeave = new Set(allRequests.map(r => String(r.employeeId)));
-  const zeroCount = employees.filter(e => !empIdsWithLeave.has(String(e._id))).length;
-
-  // Top employees
-  const byEmp = {};
-  for (const r of allRequests) {
-    const k = String(r.employeeId);
-    byEmp[k] = (byEmp[k] || 0) + (r.numberOfDays || r.totalDays || 0);
+  const byEmployee = {};
+  for (const r of approved) {
+    const key = String(r.employeeId);
+    byEmployee[key] = (byEmployee[key] || 0) + r.totalDays;
   }
-  const topEmp = await Promise.all(
-    Object.entries(byEmp).sort((a, b) => b[1] - a[1]).slice(0, 10)
-      .map(async ([id, days]) => {
-        const emp = employees.find(e => String(e._id) === id);
-        return { employee: emp, days };
-      })
+  const topEmployees = await Promise.all(
+    Object.entries(byEmployee).sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(async ([id, days]) => ({ employeeId: id, days, employee: await findOne('employees', { _id: new ObjectId(id) }, { projection: { fullName: 1, department: 1 } }) }))
   );
 
+  const pending = requests.filter(r => r.status === 'pending');
+  const pendingAging = pending.map(r => ({ _id: r._id, daysWaiting: Math.floor((now - new Date(r.createdAt)) / 86400000) }));
+
+  const allBalances = await findMany('leave_balances', filter.employeeId ? { employeeId: filter.employeeId } : {});
+  const leaveLiabilityDays = allBalances.reduce((sum, b) => sum + Math.max(0, b.closingBalance), 0);
+
   return returnFunction(res, 200, true, req.locale.success, {
-    totalDays, avgDays, mostUsedType: mostUsedType ? { type: mostUsedType[0], days: mostUsedType[1] } : null,
-    zeroCount, byType, byMonth, byDept, topEmployees: topEmp,
+    absenceTrendByMonth: Object.entries(byMonth).map(([month, days]) => ({ month, days })),
+    leaveTypeBreakdown,
+    departmentAbsence: Object.entries(byDept).map(([department, days]) => ({ department, days })),
+    topLeaveTakers: topEmployees,
+    leaveLiabilityDays,
+    pendingRequestsAging: pendingAging,
+    totalRequests: requests.length,
+    pendingCount: pending.length,
   });
 };
 
-// ── Monthly Leave Accrual ─────────────────────────────────────────────────────
-// Kenya statutory annual leave = 21 days → accrual = 21/12 = 1.75 days/month.
-// Run on the 1st of each month (or via cron). Idempotent: tracks last accrual month.
-
-const runLeaveAccrual = async (req, res) => {
-  const now   = new Date();
-  const year  = now.getFullYear();
-  const month = now.getMonth() + 1; // 1-12
-  const accrualKey = `${year}-${String(month).padStart(2, '0')}`;
-  const ACCRUAL_AMOUNT = parseFloat(process.env.LEAVE_ACCRUAL_DAYS || '1.75');
-
-  const activeEmployees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
-  let processed = 0, skipped = 0;
-
-  for (const emp of activeEmployees) {
-    const balance = await findOne('leave_balances', { employeeId: emp._id, year });
-    if (!balance) { skipped++; continue; }
-
-    // Idempotency: skip if already accrued this month
-    if ((balance.lastAccrualMonth || '') === accrualKey) { skipped++; continue; }
-
-    const current = balance.balances?.annual || { allocated: 0, used: 0, remaining: 0 };
-    const newAllocated = parseFloat(((current.allocated || 0) + ACCRUAL_AMOUNT).toFixed(2));
-    const newRemaining = parseFloat(((current.remaining || 0) + ACCRUAL_AMOUNT).toFixed(2));
-
-    await updateOne('leave_balances', { _id: balance._id }, {
-      $set: {
-        'balances.annual.allocated': newAllocated,
-        'balances.annual.remaining': newRemaining,
-        lastAccrualMonth: accrualKey,
-        updatedAt: new Date(),
-      },
-    });
-    processed++;
-  }
-
-  const result = { accrualMonth: accrualKey, accrualAmount: ACCRUAL_AMOUNT, processed, skipped };
-  if (!res) return result; // called from cron — no HTTP response
-  return returnFunction(res, 200, true, `Accrual complete. Processed: ${processed}, Skipped: ${skipped}.`, result);
-};
-
-// ── Blackout periods ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  Blackout Periods — bonus feature ported from old system, HR manages
+// ══════════════════════════════════════════════════════════════════════════════
 
 const listBlackouts = async (req, res) => {
-  const year = req.query.year || new Date().getFullYear();
-  const blackouts = await findMany('leave_blackouts', {
-    $or: [
-      { startDate: { $gte: `${year}-01-01`, $lte: `${year}-12-31` } },
-      { endDate:   { $gte: `${year}-01-01`, $lte: `${year}-12-31` } },
-    ],
-  }, { sort: { startDate: 1 } });
+  const blackouts = await findMany('leave_blackouts', {}, { sort: { startDate: 1 } });
   return returnFunction(res, 200, true, req.locale.success, blackouts);
 };
 
 const addBlackout = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'startDate', 'endDate'])) return;
-  if (req.body.endDate < req.body.startDate) {
-    return returnFunction(res, 400, false, 'End date must be on or after start date.');
-  }
-  const doc = {
-    name:       req.body.name,
-    startDate:  req.body.startDate,
-    endDate:    req.body.endDate,
-    leaveTypes: req.body.leaveTypes || [],        // [] = all leave types blocked
-    reason:     req.body.reason || '',
-    createdBy:  new ObjectId(req.user._id),
-    createdAt:  new Date(),
-  };
-  const result = await insertOne('leave_blackouts', doc);
+  const { name, startDate, endDate, departments } = req.body;
+  const result = await insertOne('leave_blackouts', {
+    name: name.trim(), startDate: new Date(startDate), endDate: new Date(endDate),
+    departments: departments || [], createdBy: req.user?._id || null, createdAt: new Date(),
+  });
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
 const deleteBlackout = async (req, res) => {
-  await global.dbo.collection('leave_blackouts').deleteOne({ _id: new ObjectId(req.params.id) });
+  const existing = await findOne('leave_blackouts', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  await deleteOne('leave_blackouts', { _id: existing._id });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
-// ── Leave configuration (min notice days, etc.) ───────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  Employee Self-Service — always scoped to req.user.employeeId
+// ══════════════════════════════════════════════════════════════════════════════
 
-const getLeaveConfig = async (req, res) => {
-  const config = await findOne('leave_config', { _id: 'global' }) ?? { _id: 'global', minNoticeDays: {} };
-  return returnFunction(res, 200, true, req.locale.success, config);
+// Self-service leave-type picker for the apply flow — same active-type data as
+// listLeaveTypes but reachable by any authenticated employee (that route is HR-only).
+const getMyLeaveTypeOptions = async (req, res) => {
+  const types = await findMany('leave_types', { isActive: true }, { sort: { name: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, types);
 };
 
-const updateLeaveConfig = async (req, res) => {
-  const update = { ...req.body, updatedAt: new Date() };
-  delete update._id;
-  await global.dbo.collection('leave_config').updateOne(
-    { _id: 'global' },
-    { $set: update },
-    { upsert: true },
-  );
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+const getMyBalances = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, []);
+  const year = req.query.year ? Number(req.query.year) : new Date().getFullYear();
+  const balances = await findMany('leave_balances', { employeeId: new ObjectId(req.user.employeeId), year });
+  const enriched = await Promise.all(balances.map(enrichBalance));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-// ── Year-end carry-forward ────────────────────────────────────────────────────
-// Reads carryover settings from the default policy and carries remaining
-// annual/other leave days into the next year's balance. Idempotent.
+const getMyRequests = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, []);
+  const filter = { employeeId: new ObjectId(req.user.employeeId) };
+  if (req.query.status) filter.status = req.query.status;
+  const requests = await findMany('leave_requests', filter, { sort: { createdAt: -1 } });
+  const enriched = await Promise.all(requests.map(enrichRequest));
+  return returnFunction(res, 200, true, req.locale.success, enriched);
+};
 
-const runYearEndCarryForward = async (req, res) => {
-  const now      = new Date();
-  const fromYear = parseInt(req.body?.year) || now.getFullYear() - 1;
-  const toYear   = fromYear + 1;
+const getMyRequestDetail = async (req, res) => {
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id), employeeId: new ObjectId(req.user.employeeId) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  const enriched = await enrichRequest(request);
+  const auditLog = await findMany('leave_audit_log', { leaveRequestId: request._id }, { sort: { timestamp: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, { ...enriched, auditLog });
+};
 
-  // Resolve carryover settings from the default policy
-  const policy = await findOne('leave_policies', { isDefault: true });
-  const KNOWN_KEYS = {
-    'annual leave': 'annual', 'sick leave': 'sick', 'maternity leave': 'maternity',
-    'paternity leave': 'paternity', 'unpaid leave': 'unpaid',
-    'compassionate leave': 'compassionate', 'study leave': 'study', 'emergency leave': 'emergency',
-  };
-  const carrySettings = {};
-  for (const pt of policy?.leaveTypes ?? []) {
-    const key = KNOWN_KEYS[pt.name.toLowerCase()];
-    if (key) carrySettings[key] = { type: pt.carryoverType, max: pt.carryoverMax ?? 0 };
-  }
-  const getCarryAmount = (type, remaining) => {
-    const s = carrySettings[type];
-    if (!s || s.type === 'none' || !remaining) return 0;
-    if (s.type === 'unlimited') return Math.max(0, remaining);
-    if (s.type === 'limited')   return Math.min(Math.max(0, remaining), s.max);
-    return 0;
-  };
+const uploadMyAttachment = async (req, res) => {
+  if (!req.file) return returnFunction(res, 400, false, 'A file is required.');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { attachmentUrl: `/uploads/${req.file.filename}` });
+};
 
-  const defaultBalances = {
-    annual:        { allocated: 21,   used: 0, remaining: 21 },
-    sick:          { allocated: 30,   used: 0, remaining: 30 },
-    maternity:     { allocated: 90,   used: 0, remaining: 90 },
-    paternity:     { allocated: 14,   used: 0, remaining: 14 },
-    unpaid:        { allocated: null, used: 0, remaining: null },
-    compassionate: { allocated: 3,    used: 0, remaining: 3 },
-    study:         { allocated: 5,    used: 0, remaining: 5 },
-    emergency:     { allocated: 3,    used: 0, remaining: 3 },
-  };
+const getMyCalendar = async (req, res) => {
+  if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, { mine: [], team: [] });
+  const employee = await findOne('employees', { _id: new ObjectId(req.user.employeeId) }, { projection: { department: 1 } });
+  const mine = await findMany('leave_requests', { employeeId: new ObjectId(req.user.employeeId), status: { $in: ['pending', 'approved'] } });
 
-  const employees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
-  let processed = 0, carried = 0;
-
-  for (const emp of employees) {
-    const fromBalance = await findOne('leave_balances', { employeeId: emp._id, year: fromYear });
-    if (!fromBalance) continue;
-
-    // Ensure next-year balance exists
-    let toBalance = await findOne('leave_balances', { employeeId: emp._id, year: toYear });
-    if (!toBalance) {
-      await insertOne('leave_balances', { employeeId: emp._id, year: toYear, balances: defaultBalances });
-      toBalance = await findOne('leave_balances', { employeeId: emp._id, year: toYear });
-    }
-
-    // Apply carry-forward increments
-    const $inc = {};
-    for (const [type, b] of Object.entries(fromBalance.balances || {})) {
-      const carry = getCarryAmount(type, b.remaining);
-      if (carry > 0 && toBalance.balances?.[type]) {
-        $inc[`balances.${type}.allocated`] = carry;
-        $inc[`balances.${type}.remaining`] = carry;
-        carried += carry;
-      }
-    }
-    if (Object.keys($inc).length > 0) {
-      await updateOne('leave_balances', { employeeId: emp._id, year: toYear }, { $inc, $set: { updatedAt: new Date() } });
-    }
-    processed++;
+  let team = [];
+  if (employee?.department) {
+    const deptEmployees = await findMany('employees', { department: employee.department, _id: { $ne: new ObjectId(req.user.employeeId) } }, { projection: { _id: 1 } });
+    team = await findMany('leave_requests', { employeeId: { $in: deptEmployees.map(e => e._id) }, status: 'approved' });
   }
 
-  const result = { fromYear, toYear, processed, totalDaysCarried: parseFloat(carried.toFixed(2)) };
-  if (!res) { console.log(`[CRON] Year-end carry-forward ${fromYear}→${toYear}: ${processed} employees, ${carried} days carried`); return result; }
-  return returnFunction(res, 200, true, `Carry-forward complete: ${processed} employee${processed !== 1 ? 's' : ''} processed, ${carried} day${carried !== 1 ? 's' : ''} carried to ${toYear}.`, result);
+  const holidays = await findMany('public_holidays', {});
+  return returnFunction(res, 200, true, req.locale.success, {
+    mine: await Promise.all(mine.map(enrichRequest)),
+    team: await Promise.all(team.map(enrichRequest)),
+    holidays,
+  });
 };
 
 module.exports = {
-  getLeaveBalances, listLeaveRequests, createLeaveRequest,
-  approveLeaveRequest, rejectLeaveRequest, deleteLeaveRequest,
-  revokeLeaveRequest, resolveDispute, getLeaveCalendar, getLeaveConflicts,
-  getMyBalances, getCalendarEntries, getTodayAbsences, getUpcomingLeaves,
-  cancelLeaveRequest, getLeaveRequest, exportLeaveRequests, adjustLeaveBalance,
-  listPolicies, createPolicy, getPolicy, updatePolicy, deletePolicy, setDefaultPolicy,
-  listHolidays, addHoliday, deleteHoliday, getLeaveAnalytics,
-  runLeaveAccrual,
-  // leave governance
+  createLeaveType, listLeaveTypes, getLeaveType, updateLeaveType, deleteLeaveType,
+  createPublicHoliday, listPublicHolidays, updatePublicHoliday, deletePublicHoliday,
+  createAccrualPolicy, listAccrualPolicies, getAccrualPolicy, updateAccrualPolicy, deleteAccrualPolicy,
+  runAccrualPolicies, runYearEndCarryForward,
+  getLeaveBalances, getEmployeeLeaveBalances, adjustLeaveBalance,
+  listLeaveRequests, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
+  approveLeaveRequest, rejectLeaveRequest, cancelLeaveRequest,
+  revokeLeaveRequest, disputeLeaveRequest, resolveDispute,
+  getLeaveCalendar, getPayrollFeed, markPayrollFeedProcessed, getLeaveAnalytics,
   listBlackouts, addBlackout, deleteBlackout,
-  getLeaveConfig, updateLeaveConfig,
-  runYearEndCarryForward,
+  getMyLeaveTypeOptions, getMyBalances, getMyRequests, getMyRequestDetail, uploadMyAttachment, getMyCalendar,
 };
