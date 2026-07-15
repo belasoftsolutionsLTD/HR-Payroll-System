@@ -15,6 +15,7 @@ const {
 } = require('./configFunctions');
 const { getCompanySettings, updateCompanySettings, uploadCompanyFile, serveCompanyLogo, serveTermsPdf } = require('./companySettingsFunctions');
 const { getTaxConfig, updateTaxConfig } = require('./taxFunctions');
+const { getOvertimeConfig, updateOvertimeConfig } = require('./overtimeFunctions');
 
 const ROLES = ['super_admin', 'hr_manager'];
 const multer = require('multer');
@@ -85,6 +86,10 @@ router.delete('/events/:id',  allowRoles(ROLES), AsyncHandler(deleteScheduledEve
 // Tax & Payroll Configuration
 router.get('/tax-config',  allowRoles(ROLES), AsyncHandler(getTaxConfig));
 router.put('/tax-config',  allowRoles(ROLES), AsyncHandler(updateTaxConfig));
+
+// Overtime Rate Configuration (HR-defined multipliers — no hardcoded defaults)
+router.get('/overtime-config', allowRoles(ROLES), AsyncHandler(getOvertimeConfig));
+router.put('/overtime-config', allowRoles(ROLES), AsyncHandler(updateOvertimeConfig));
 
 // JD Templates
 router.get('/jd-templates',              allowRoles(ROLES), AsyncHandler(listJdTemplates));

@@ -629,14 +629,137 @@ const deleteNote = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
+// ── Chat Groups ───────────────────────────────────────────────────────────────
+// A project's default chat ("General", groupId: null) always includes every project
+// member — that's the project itself acting as the group. These are optional smaller
+// sub-groups (e.g. just 3 of 8 members) layered on top, scoped to a chosen subset of
+// people who are already on the project.
+
+async function getValidProjectPersonIds(project) {
+  const members = await findMany('project_members', { projectId: project._id }, { projection: { employeeId: 1 } });
+  const ids = new Set(members.map((m) => String(m.employeeId)));
+  ids.add(String(project.createdBy));
+  return ids;
+}
+
+const listChatGroups = async (req, res) => {
+  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const userId = String(req.user._id);
+  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+
+  const filter = { projectId: project._id };
+  if (!isSup) filter.memberIds = new ObjectId(userId);
+
+  const groups = await findMany('project_chat_groups', filter, { sort: { createdAt: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, groups);
+};
+
+const createChatGroup = async (req, res) => {
+  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const { name, memberIds } = req.body;
+  if (!name?.trim()) return returnFunction(res, 400, false, 'Group name is required.');
+  if (!Array.isArray(memberIds) || memberIds.length === 0) return returnFunction(res, 400, false, 'Select at least one member.');
+
+  const userId = String(req.user._id);
+  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+  const validIds = await getValidProjectPersonIds(project);
+
+  if (!isSup && !validIds.has(userId)) {
+    return returnFunction(res, 403, false, 'Only project members can create chat groups.');
+  }
+
+  const cleanMemberIds = new Set(memberIds.map(String).filter((id) => validIds.has(id)));
+  cleanMemberIds.add(userId); // creator is always a member of their own group
+  if (cleanMemberIds.size < 2) return returnFunction(res, 400, false, 'Select at least one other project member.');
+
+  let creatorName = req.user.name || '';
+  if (!creatorName) {
+    const emp = await findOne('employees', { _id: new ObjectId(userId) }, { projection: { fullName: 1 } });
+    creatorName = emp?.fullName ?? 'Unknown';
+  }
+
+  const doc = {
+    projectId:     project._id,
+    name:          name.trim(),
+    memberIds:     [...cleanMemberIds].map((id) => new ObjectId(id)),
+    createdBy:     new ObjectId(userId),
+    createdByName: creatorName,
+    createdAt:     new Date(),
+  };
+
+  const result = await insertOne('project_chat_groups', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+};
+
+const updateChatGroup = async (req, res) => {
+  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const group = await findOne('project_chat_groups', { _id: new ObjectId(req.params.groupId) });
+  if (!group) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const userId = String(req.user._id);
+  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+  if (!isSup && String(group.createdBy) !== userId) {
+    return returnFunction(res, 403, false, 'Only the group creator can update this group.');
+  }
+
+  const $set = { updatedAt: new Date() };
+  if (req.body.name?.trim()) $set.name = req.body.name.trim();
+  if (Array.isArray(req.body.memberIds)) {
+    const validIds = await getValidProjectPersonIds(project);
+    const cleanMemberIds = new Set(req.body.memberIds.map(String).filter((id) => validIds.has(id)));
+    cleanMemberIds.add(String(group.createdBy));
+    $set.memberIds = [...cleanMemberIds].map((id) => new ObjectId(id));
+  }
+
+  await updateOne('project_chat_groups', { _id: group._id }, { $set });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteChatGroup = async (req, res) => {
+  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const group = await findOne('project_chat_groups', { _id: new ObjectId(req.params.groupId) });
+  if (!group) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const userId = String(req.user._id);
+  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+  if (!isSup && String(group.createdBy) !== userId) {
+    return returnFunction(res, 403, false, 'Only the group creator can delete this group.');
+  }
+
+  await global.dbo.collection('project_chat_groups').deleteOne({ _id: group._id });
+  await global.dbo.collection('project_messages').deleteMany({ groupId: group._id });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
 // ── Chat / Messages ───────────────────────────────────────────────────────────
 
 const getMessages = async (req, res) => {
   const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
+  const userId = String(req.user._id);
+  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+
+  let groupId = null;
+  if (req.query.groupId) {
+    const group = await findOne('project_chat_groups', { _id: new ObjectId(req.query.groupId) });
+    if (!group) return returnFunction(res, 404, false, req.locale.notFound);
+    if (!isSup && !group.memberIds.some((id) => String(id) === userId)) {
+      return returnFunction(res, 403, false, 'Not a member of this chat group.');
+    }
+    groupId = group._id;
+  }
+
   const limit  = Math.min(Number(req.query.limit) || 60, 100);
-  const filter = { projectId: new ObjectId(req.params.id) };
+  const filter = { projectId: new ObjectId(req.params.id), groupId };
   if (req.query.before) {
     try { filter._id = { $lt: new ObjectId(req.query.before) }; } catch { /* ignore invalid id */ }
   }
@@ -655,9 +778,20 @@ const sendMessage = async (req, res) => {
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
   const { message } = req.body;
-  if (!message?.trim()) return returnFunction(res, 400, false, 'Message is required.');
+  if (!message?.trim() && !req.file) return returnFunction(res, 400, false, 'Message or attachment is required.');
 
   const userId = String(req.user._id);
+  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+
+  let groupId = null;
+  if (req.body.groupId) {
+    const group = await findOne('project_chat_groups', { _id: new ObjectId(req.body.groupId) });
+    if (!group) return returnFunction(res, 404, false, req.locale.notFound);
+    if (!isSup && !group.memberIds.some((id) => String(id) === userId)) {
+      return returnFunction(res, 403, false, 'Not a member of this chat group.');
+    }
+    groupId = group._id;
+  }
 
   let senderName = req.user.name || '';
   if (!senderName) {
@@ -666,7 +800,7 @@ const sendMessage = async (req, res) => {
   }
 
   let senderRole = 'member';
-  if (isSupervisor(project, userId) || HR_ROLES.includes(req.user.role)) {
+  if (isSup) {
     senderRole = 'supervisor';
   } else {
     const member = await findOne('project_members', { projectId: new ObjectId(req.params.id), employeeId: new ObjectId(userId) });
@@ -675,10 +809,14 @@ const sendMessage = async (req, res) => {
 
   const doc = {
     projectId:  new ObjectId(req.params.id),
+    groupId,
     senderId:   new ObjectId(userId),
     senderName,
     senderRole,
-    message:    message.trim(),
+    message:    message?.trim() ?? '',
+    attachmentFilename:     req.file?.filename     ?? null,
+    attachmentOriginalName: req.file?.originalname ?? null,
+    attachmentMimeType:     req.file?.mimetype      ?? null,
     createdAt:  new Date(),
   };
 
@@ -692,5 +830,6 @@ module.exports = {
   listSubtasks, createSubtask, updateSubtask, deleteSubtask,
   assignSubtaskEmployees, submitSubtaskReport,
   listNotes, createNote, deleteNote,
+  listChatGroups, createChatGroup, updateChatGroup, deleteChatGroup,
   getMessages, sendMessage,
 };

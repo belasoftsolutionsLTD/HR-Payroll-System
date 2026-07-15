@@ -5,8 +5,10 @@ const { ObjectId } = require('mongodb');
 const router = express.Router();
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
+const crypto = require('crypto');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
+const { respondToOfferCore } = require('../recruitment/recruitmentFunctions');
 
 const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
@@ -22,9 +24,12 @@ const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max for public resume uploads
   fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
-    cb(null, allowed.includes(file.mimetype));
+    // CVs are PDF-only — Word docs used to be accepted too, but reviewers need a
+    // consistent, previewable format across every application.
+    if (file.mimetype === 'application/pdf') return cb(null, true);
+    const err = new Error('Only PDF files are accepted for your CV.');
+    err.statusCode = 400;
+    cb(err);
   },
 });
 
@@ -286,5 +291,52 @@ router.get('/jobs/:id/pdf', async (req, res) => {
     if (!res.headersSent) returnFunction(res, 500, false, 'Failed to generate PDF');
   }
 });
+
+// ── Candidate offer response (public, token-based — no login exists for candidates) ──
+
+// Finds the application whose offerDetails.responseTokenHash matches the given raw
+// token, if any, and if the offer hasn't already been responded to or expired.
+async function findApplicationByOfferToken(rawToken) {
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  return findOne('applications', { 'offerDetails.responseTokenHash': tokenHash });
+}
+
+// GET /api/public/offers/:token — candidate views their offer before deciding
+router.get('/offers/:token', AsyncHandler(async (req, res) => {
+  const application = await findApplicationByOfferToken(req.params.token);
+  if (!application || !application.offerDetails) return returnFunction(res, 404, false, 'Offer not found or link has expired.');
+  if (new Date(application.offerDetails.expiresAt) < new Date()) return returnFunction(res, 410, false, 'This offer has expired.');
+
+  const [candidate, requisition] = await Promise.all([
+    findOne('candidates', { _id: application.candidateId }),
+    findOne('jobRequisitions', { _id: application.requisitionId }),
+  ]);
+
+  return returnFunction(res, 200, true, 'Offer found.', {
+    candidateName: candidate ? `${candidate.firstName} ${candidate.lastName}` : '',
+    jobTitle: requisition?.title || '',
+    department: requisition?.department || '',
+    salary: application.offerDetails.salary,
+    currency: application.offerDetails.currency,
+    startDate: application.offerDetails.startDate,
+    expiresAt: application.offerDetails.expiresAt,
+    status: application.offerDetails.status,
+  });
+}));
+
+// POST /api/public/offers/:token/respond — candidate accepts or declines
+router.post('/offers/:token/respond', AsyncHandler(async (req, res) => {
+  if (!validateRequiredFields(req, res, ['status'])) return;
+  if (!['accepted', 'declined'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be accepted or declined.');
+
+  const application = await findApplicationByOfferToken(req.params.token);
+  if (!application || !application.offerDetails) return returnFunction(res, 404, false, 'Offer not found or link has expired.');
+  if (application.offerDetails.status !== 'pending') return returnFunction(res, 400, false, 'This offer has already been responded to.');
+  if (new Date(application.offerDetails.expiresAt) < new Date()) return returnFunction(res, 410, false, 'This offer has expired.');
+
+  await respondToOfferCore(application, req.body.status, null);
+
+  return returnFunction(res, 200, true, `Offer ${req.body.status}.`);
+}));
 
 module.exports = router;
