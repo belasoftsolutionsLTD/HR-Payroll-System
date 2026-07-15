@@ -9,6 +9,17 @@ const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
 const HR_ROLE_LIST = [SUPER_ADMIN, HR_MANAGER];
 const isHR = (req) => HR_ROLE_LIST.includes(req.user?.role);
 
+// Minutes of overlap between [rangeStart, rangeEnd) (same-day, minutes-since-midnight)
+// and the configured night window [nightStart, nightEnd), which may wrap past midnight
+// (e.g. 22:00–06:00). Used to split an employee's overtime into day vs night portions.
+const overlapMins = (aStart, aEnd, bStart, bEnd) => Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
+const minutesInNightWindow = (rangeStart, rangeEnd, nightStart, nightEnd) => {
+  if (rangeEnd <= rangeStart) return 0;
+  if (nightStart < nightEnd) return overlapMins(rangeStart, rangeEnd, nightStart, nightEnd);
+  // Wraps past midnight — night is [nightStart, 1440) union [0, nightEnd)
+  return overlapMins(rangeStart, rangeEnd, nightStart, 1440) + overlapMins(rangeStart, rangeEnd, 0, nightEnd);
+};
+
 // Same convention as the leave module's getScopedEmployeeIds: null = no restriction
 // (HR/super_admin see everyone), department_head sees their department, and a plain
 // "manager" — any employee referenced as someone's managerId, regardless of role —
@@ -240,13 +251,20 @@ async function computeWeeklyHoursFromAttendance(employeeId, weekStartStr, weekEn
   let totalRegularMinutes = 0;
   let totalOvertimeMinutes = 0;
   let totalBreakMinutes = 0;
+  const overtimeBreakdown = { weekdayDayMins: 0, weekdayNightMins: 0, weekendDayMins: 0, weekendNightMins: 0 };
   for (const r of recs) {
     if (!r.checkOutTime) continue; // incomplete day — no split computed yet
     totalRegularMinutes  += r.regularMinutes || 0;
     totalOvertimeMinutes += r.overtimeMinutes || 0;
     totalBreakMinutes    += r.totalBreakMinutes || 0;
+    if (r.overtimeBreakdown) {
+      overtimeBreakdown.weekdayDayMins   += r.overtimeBreakdown.weekdayDayMins || 0;
+      overtimeBreakdown.weekdayNightMins += r.overtimeBreakdown.weekdayNightMins || 0;
+      overtimeBreakdown.weekendDayMins   += r.overtimeBreakdown.weekendDayMins || 0;
+      overtimeBreakdown.weekendNightMins += r.overtimeBreakdown.weekendNightMins || 0;
+    }
   }
-  return { totalRegularMinutes, totalOvertimeMinutes, totalBreakMinutes, totalMinutes: totalRegularMinutes + totalOvertimeMinutes };
+  return { totalRegularMinutes, totalOvertimeMinutes, totalBreakMinutes, totalMinutes: totalRegularMinutes + totalOvertimeMinutes, overtimeBreakdown };
 }
 
 function haversineMeters(lat1, lng1, lat2, lng2) {
@@ -392,6 +410,23 @@ const clockOut = async (req, res) => {
   // previously nothing ever wrote this field, so every payroll cycle's overtime pay was silently 0.
   const overtimeHours = Math.round((overtimeMinutes / 60) * 100) / 100;
 
+  // Split overtime minutes into weekday/weekend × day/night buckets so payroll can apply
+  // HR's own custom multiplier per bucket instead of one flat rate for all overtime.
+  // Overtime is the tail end of the shift, i.e. the last `overtimeMinutes` minutes
+  // before checkout.
+  const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
+  const isWeekend = [0, 6].includes(new Date(today + 'T00:00:00').getDay());
+  let weekdayDayMins = 0, weekdayNightMins = 0, weekendDayMins = 0, weekendNightMins = 0;
+  if (overtimeMinutes > 0) {
+    const nightMins = overtimeConfig ? minutesInNightWindow(
+      Math.max(0, toMins(checkOutTime) - overtimeMinutes), toMins(checkOutTime),
+      toMins(overtimeConfig.nightStart), toMins(overtimeConfig.nightEnd)
+    ) : 0;
+    const dayMins = overtimeMinutes - nightMins;
+    if (isWeekend) { weekendDayMins = dayMins; weekendNightMins = nightMins; }
+    else { weekdayDayMins = dayMins; weekdayNightMins = nightMins; }
+  }
+
   await global.dbo.collection('attendance_records').updateOne(
     { employeeId: empId, date: today },
     { $set: {
@@ -405,6 +440,7 @@ const clockOut = async (req, res) => {
       regularMinutes,
       overtimeMinutes,
       overtimeHours,
+      overtimeBreakdown: { weekdayDayMins, weekdayNightMins, weekendDayMins, weekendNightMins },
       payCategory,
       updatedAt:         now,
     }}
@@ -623,6 +659,7 @@ const getCurrentTimesheet = async (req, res) => {
       totalMinutes: weekHours.totalMinutes,
       totalRegularMinutes: weekHours.totalRegularMinutes,
       overtimeMinutes: weekHours.totalOvertimeMinutes,
+      overtimeBreakdown: weekHours.overtimeBreakdown,
       totalBreakMinutes: weekHours.totalBreakMinutes,
       status: 'draft',
       createdAt: new Date(),
@@ -657,6 +694,7 @@ const saveTimesheet = async (req, res) => {
       totalMinutes: weekHours.totalMinutes,
       totalRegularMinutes: weekHours.totalRegularMinutes,
       overtimeMinutes: weekHours.totalOvertimeMinutes,
+      overtimeBreakdown: weekHours.overtimeBreakdown,
       totalBreakMinutes: weekHours.totalBreakMinutes,
       status: req.body.status || 'draft',
       updatedAt: new Date(),

@@ -1,4 +1,5 @@
 const { ObjectId } = require('mongodb');
+const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const {
@@ -283,7 +284,7 @@ const hireCandidate = async (application, requisition, actingUser) => {
     title: 'New Hire',
     subtitle: `${fullName} has been hired as ${empDoc.designation}. Staff #: ${staffNumber}`,
     referenceId: empResult.insertedId, referenceModel: 'employees',
-    requiresAction: false, triggeredBy: actingUser._id,
+    requiresAction: false, triggeredBy: actingUser?._id ?? null,
   }).catch(() => {});
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'New Hire',
@@ -390,12 +391,17 @@ const extendOffer = async (req, res) => {
   const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
+  // A candidate must actively confirm their own offer — HR extending it doesn't count as
+  // acceptance. The raw token goes out in the email only; we store just its hash, same
+  // pattern as the password-reset flow (authFunctions.js).
+  const rawResponseToken = crypto.randomBytes(32).toString('hex');
   const offerDetails = {
     salary: Number(req.body.salary),
     currency: req.body.currency || 'KES',
     startDate: new Date(req.body.startDate),
     expiresAt: new Date(req.body.expiresAt),
     status: 'pending',
+    responseTokenHash: crypto.createHash('sha256').update(rawResponseToken).digest('hex'),
   };
   await updateOne('applications', { _id: application._id }, { $set: { offerDetails, updatedAt: new Date() } });
 
@@ -403,35 +409,52 @@ const extendOffer = async (req, res) => {
     findOne('candidates', { _id: application.candidateId }),
     findOne('jobRequisitions', { _id: application.requisitionId }),
   ]);
+
+  // Extending an offer IS the action that moves a candidate into the "Offer" stage —
+  // there is no separate manual drag for it, so offer details can never be missing for
+  // someone sitting in that stage (matches the same auto-move-on-accept pattern in
+  // respondToOffer below, just for entering the stage instead of moving past it).
+  const offerStage = requisition?.pipelineStages.find((s) => s.type === 'offer');
+  if (offerStage && offerStage.id !== application.currentStageId) {
+    const fromStage = requisition.pipelineStages.find((s) => s.id === application.currentStageId);
+    const now = new Date();
+    const stageHistory = (application.stageHistory || []).map((h, i) => (
+      i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
+    ));
+    stageHistory.push({ stageId: offerStage.id, stageName: offerStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) });
+    await updateOne('applications', { _id: application._id }, { $set: { currentStageId: offerStage.id, stageHistory, updatedAt: now } });
+
+    if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
+    await fireAutoActions({ ...application, currentStageId: offerStage.id }, offerStage, global.dbo, 'onEnter');
+  }
+
   if (candidate?.email) {
     const tokens = candidateTokens(candidate, requisition);
+    const offerUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/offer/${rawResponseToken}`;
     sendTemplatedEmail({
       trigger: 'offerExtended',
       to: candidate.email,
-      tokens,
+      tokens: { ...tokens, offerUrl },
       fallbackSubject: 'Offer of Employment',
-      fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>We are pleased to extend an offer with a gross salary of ${offerDetails.currency} ${offerDetails.salary.toLocaleString()}, starting ${offerDetails.startDate.toDateString()}. This offer expires on ${offerDetails.expiresAt.toDateString()}.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+      fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>We are pleased to extend an offer with a gross salary of ${offerDetails.currency} ${offerDetails.salary.toLocaleString()}, starting ${offerDetails.startDate.toDateString()}. This offer expires on ${offerDetails.expiresAt.toDateString()}.</p><p>Please review and respond to your offer here: <a href="${offerUrl}">${offerUrl}</a></p><p>Regards,<br/>${tokens.companyName}</p>`,
     }).catch(() => {});
   }
 
   return returnFunction(res, 201, true, 'Offer extended.');
 };
 
-const respondToOffer = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['status'])) return;
-  if (!['accepted', 'declined'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be accepted or declined.');
-
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
-  if (!application) return returnFunction(res, 404, false, req.locale.notFound);
-
+// Shared core so both the HR-authenticated route and the candidate-facing public
+// token route (see publicRoutes.js) apply identical accept/decline logic — actingUser
+// is null for candidate self-service, since there's no logged-in user in that flow.
+const respondToOfferCore = async (application, status, actingUser) => {
   await updateOne('applications', { _id: application._id }, {
-    $set: { 'offerDetails.status': req.body.status, updatedAt: new Date() },
+    $set: { 'offerDetails.status': status, updatedAt: new Date() },
   });
 
   // Accepting the offer moves the candidate straight into the requisition's "hired" stage
   // (if one is configured) instead of leaving that as a separate manual drag.
   let hiredEmployeeId = null;
-  if (req.body.status === 'accepted' && application.status === 'active') {
+  if (status === 'accepted' && application.status === 'active') {
     const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
     const fromStage = requisition?.pipelineStages.find((s) => s.id === application.currentStageId);
     const hiredStage = requisition?.pipelineStages.find((s) => s.type === 'hired');
@@ -441,15 +464,27 @@ const respondToOffer = async (req, res) => {
       const stageHistory = application.stageHistory.map((h, i) => (
         i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
       ));
-      stageHistory.push({ stageId: hiredStage.id, stageName: hiredStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) });
+      stageHistory.push({ stageId: hiredStage.id, stageName: hiredStage.name, enteredAt: now, movedBy: actingUser?._id ? new ObjectId(actingUser._id) : null });
       await updateOne('applications', { _id: application._id }, { $set: { currentStageId: hiredStage.id, stageHistory, updatedAt: now } });
 
       if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
       await fireAutoActions({ ...application, currentStageId: hiredStage.id }, hiredStage, global.dbo, 'onEnter');
 
-      hiredEmployeeId = await hireCandidate({ ...application, currentStageId: hiredStage.id }, requisition, req.user);
+      hiredEmployeeId = await hireCandidate({ ...application, currentStageId: hiredStage.id }, requisition, actingUser);
     }
   }
+
+  return hiredEmployeeId;
+};
+
+const respondToOffer = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['status'])) return;
+  if (!['accepted', 'declined'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be accepted or declined.');
+
+  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  if (!application) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const hiredEmployeeId = await respondToOfferCore(application, req.body.status, req.user);
 
   return returnFunction(res, 200, true, `Offer ${req.body.status}.`, hiredEmployeeId ? { employeeId: hiredEmployeeId } : undefined);
 };
@@ -457,7 +492,9 @@ const respondToOffer = async (req, res) => {
 // ── Interviewer assignments ───────────────────────────────────────────────────
 
 const assignInterviewer = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['stageId', 'interviewerId'])) return;
+  // scheduledAt is mandatory — an interview/assessment stage assignment with no date/time
+  // is exactly the gap that left HR unable to remind candidates ahead of time.
+  if (!validateRequiredFields(req, res, ['stageId', 'interviewerId', 'scheduledAt'])) return;
 
   const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
@@ -474,6 +511,7 @@ const assignInterviewer = async (req, res) => {
     stageId: req.body.stageId,
     interviewerId: new ObjectId(req.body.interviewerId),
     interviewerName: interviewer.name,
+    scheduledAt: new Date(req.body.scheduledAt),
     assignedAt: new Date(),
   };
   await updateOne('applications', { _id: application._id }, {
@@ -483,11 +521,39 @@ const assignInterviewer = async (req, res) => {
 
   notifyUser(interviewer._id, {
     title: 'Interview Assigned',
-    body: `You've been assigned to interview a candidate at the "${req.body.stageId}" stage.`,
+    body: `You've been assigned to interview a candidate at the "${req.body.stageId}" stage, scheduled ${assignment.scheduledAt.toLocaleString()}.`,
     type: 'recruitment',
   }).catch(() => {});
 
   return returnFunction(res, 201, true, 'Interviewer assigned.', assignment);
+};
+
+// HR-triggered reminder email to the candidate ahead of their scheduled interview/assessment
+// — a deliberate manual action (not an automated cron job) so HR decides when to reach out.
+const sendInterviewReminder = async (req, res) => {
+  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  if (!application) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const assignment = (application.interviewAssignments || []).find((a) => a.stageId === req.params.stageId);
+  if (!assignment) return returnFunction(res, 404, false, 'No interview assignment found for this stage.');
+
+  const [candidate, requisition] = await Promise.all([
+    findOne('candidates', { _id: application.candidateId }),
+    findOne('jobRequisitions', { _id: application.requisitionId }),
+  ]);
+  if (!candidate?.email) return returnFunction(res, 400, false, 'This candidate has no email on file.');
+
+  const tokens = candidateTokens(candidate, requisition);
+  const when = assignment.scheduledAt ? new Date(assignment.scheduledAt).toLocaleString('en-KE', { dateStyle: 'full', timeStyle: 'short' }) : 'the scheduled time';
+  await sendTemplatedEmail({
+    trigger: 'interviewReminder',
+    to: candidate.email,
+    tokens: { ...tokens, interviewDateTime: when },
+    fallbackSubject: 'Reminder: Upcoming Interview',
+    fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>This is a reminder of your upcoming interview on ${when}.</p><p>We look forward to speaking with you.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, 'Reminder sent to candidate.');
 };
 
 const unassignInterviewer = async (req, res) => {
@@ -927,7 +993,7 @@ const deleteInterviewKit = async (req, res) => {
 
 // ── Email Templates ───────────────────────────────────────────────────────────
 
-const EMAIL_TRIGGERS = ['applicationReceived', 'stageAdvance', 'rejection', 'offerExtended', 'nurture'];
+const EMAIL_TRIGGERS = ['applicationReceived', 'stageAdvance', 'rejection', 'offerExtended', 'nurture', 'interviewReminder'];
 
 const createEmailTemplate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'trigger', 'subject', 'body'])) return;
@@ -973,8 +1039,8 @@ module.exports = {
   submitRequisition, approveRequisition, deleteRequisition,
   REQUISITION_STATUSES,
   listApplicationsForRequisition, moveApplicationStage, updateApplicationStatus,
-  extendOffer, respondToOffer,
-  assignInterviewer, unassignInterviewer,
+  extendOffer, respondToOffer, respondToOfferCore,
+  assignInterviewer, unassignInterviewer, sendInterviewReminder,
   submitScorecard, listScorecardsForApplication, getScorecard,
   createCandidate, listCandidates, getCandidate, updateCandidate, convertCandidate,
   createNurtureCampaign, listNurtureCampaigns, addNurtureTouchpoint, listNurtureCandidates,

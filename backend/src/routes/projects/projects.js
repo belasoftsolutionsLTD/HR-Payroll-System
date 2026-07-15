@@ -12,6 +12,7 @@ const {
   listSubtasks, createSubtask, updateSubtask, deleteSubtask,
   assignSubtaskEmployees, submitSubtaskReport,
   listNotes, createNote, deleteNote,
+  listChatGroups, createChatGroup, updateChatGroup, deleteChatGroup,
   getMessages, sendMessage,
 } = require('./projectsFunctions');
 
@@ -69,8 +70,13 @@ router.get('/:id/notes',            allRoles, AsyncHandler(listNotes));
 router.post('/:id/notes',           allRoles, AsyncHandler(createNote));
 router.delete('/:id/notes/:noteId', allRoles, AsyncHandler(deleteNote));
 
+router.get('/:id/chat-groups',             allRoles, AsyncHandler(listChatGroups));
+router.post('/:id/chat-groups',            allRoles, AsyncHandler(createChatGroup));
+router.patch('/:id/chat-groups/:groupId',  allRoles, AsyncHandler(updateChatGroup));
+router.delete('/:id/chat-groups/:groupId', allRoles, AsyncHandler(deleteChatGroup));
+
 router.get('/:id/messages',  allRoles, AsyncHandler(getMessages));
-router.post('/:id/messages', allRoles, AsyncHandler(sendMessage));
+router.post('/:id/messages', allRoles, projectUpload.single('file'), AsyncHandler(sendMessage));
 
 router.post('/:id/members',               mgmtOnly, AsyncHandler(addMembers));
 router.delete('/:id/members/:employeeId', mgmtOnly, AsyncHandler(removeMember));

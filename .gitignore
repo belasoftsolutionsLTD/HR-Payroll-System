@@ -7,3 +7,5 @@ frontend/node_modules/
 .next/
 dist/
 build/
+db-export/
+*.tar.gz

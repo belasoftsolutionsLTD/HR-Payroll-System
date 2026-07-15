@@ -237,6 +237,16 @@ const submitClaim = async (req, res) => {
       body: `Your claim of ${currency || 'KES'} ${finalAmount.toLocaleString()} was auto-approved (under the policy threshold).`,
       type: 'expense',
     }).catch(() => {});
+    // Auto-approval skips the action chain, but HR still needs visibility into money that
+    // was committed on their behalf — an FYI inbox item (requiresAction: false) so it shows
+    // under the "notifications" tab rather than sitting in "pending" with nothing to action.
+    notifyHR({
+      type: 'expense', subType: 'expense_claim_auto_approved',
+      title: `Expense claim auto-approved for ${empNameInbox}`,
+      subtitle: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type} (under policy threshold, no approval needed)`,
+      referenceId: result.insertedId, referenceModel: 'expense_claims',
+      requiresAction: false, triggeredBy: req.user._id,
+    }).catch(() => {});
   }
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, isPolicyViolation, autoApproved: autoApprove });
