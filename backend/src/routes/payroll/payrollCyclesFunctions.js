@@ -7,6 +7,7 @@ const { generateP9Form } = require('../../services/p9Service');
 const { buildCalculator, loadTaxConfig } = require('../../functions/taxCalculator');
 const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
 const { sendEmail } = require('../../services/emailService');
+const { isPayrollReady, getMissingCriticalFields } = require('../employees/employeesFunctions');
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -265,7 +266,17 @@ async function lockCycleInternal(req, res, cycle) {
     };
     if (cycle.payGroup && cycle.payGroup !== 'all') empFilter.$and.push({ payGroup: cycle.payGroup });
   }
-  const employees = await findMany('employees', empFilter, {});
+  const allEmployeesInScope = await findMany('employees', empFilter, {});
+
+  // Pay employees with a complete profile first — anyone missing a critical payroll
+  // field (Gross Pay, Job Group) is excluded from this run entirely rather than
+  // silently getting a broken/incorrect payslip. They're recorded on the cycle so HR
+  // can see exactly who was skipped and why, fix their profile, and include them next run.
+  const employees = allEmployeesInScope.filter(isPayrollReady);
+  const excludedEmployees = allEmployeesInScope.filter(e => !isPayrollReady(e)).map(e => ({
+    employeeId: e._id, fullName: e.fullName, staffNumber: e.staffNumber || null,
+    missingFields: getMissingCriticalFields(e),
+  }));
 
   // Delete any previous results for this cycle
   await global.dbo.collection('payroll_results').deleteMany({ cycleId: cycle._id });
@@ -277,6 +288,11 @@ async function lockCycleInternal(req, res, cycle) {
   // Load tax config once for all employees (avoids N+1 DB calls)
   const taxConfig = await loadTaxConfig();
   const taxCalc   = buildCalculator(taxConfig);
+
+  // HR-defined overtime multipliers (weekday/weekend × day/night) — no hardcoded
+  // defaults; falls back to 1x (no premium) for any bucket HR hasn't configured yet.
+  const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
+  const otRate = (key) => overtimeConfig?.[key] != null ? overtimeConfig[key] : 1;
 
   // Job-group-scoped Allowances/Deductions (Payroll Settings) — fetched once per cycle,
   // filtered per employee below by jobGroupId. Empty jobGroupIds = applies to everyone.
@@ -380,8 +396,33 @@ async function lockCycleInternal(req, res, cycle) {
     matchedTimesheetIds.push(...cycleTimesheets.map((t) => t._id));
     const overtimeMinutesTotal = cycleTimesheets.reduce((sum, t) => sum + (t.overtimeMinutes || 0), 0);
     const overtimeHours  = Math.round((overtimeMinutesTotal / 60) * 100) / 100;
-    const overtimeRate   = emp.grossPay ? (emp.grossPay / 22 / 8) * 1.5 : 0;
-    const overtimeAmount = Math.round(overtimeHours * overtimeRate);
+
+    // Base hourly rate, then each overtime bucket (weekday/weekend × day/night) is paid
+    // at that hour × HR's own configured multiplier for that bucket — replaces the old
+    // single flat 1.5x applied to every overtime hour regardless of when it was worked.
+    const hourlyRate = emp.grossPay ? emp.grossPay / 22 / 8 : 0;
+    const otBreakdownTotals = cycleTimesheets.reduce((acc, t) => {
+      const b = t.overtimeBreakdown || {};
+      acc.weekdayDayMins   += b.weekdayDayMins || 0;
+      acc.weekdayNightMins += b.weekdayNightMins || 0;
+      acc.weekendDayMins   += b.weekendDayMins || 0;
+      acc.weekendNightMins += b.weekendNightMins || 0;
+      return acc;
+    }, { weekdayDayMins: 0, weekdayNightMins: 0, weekendDayMins: 0, weekendNightMins: 0 });
+    const bucketedMinutes = otBreakdownTotals.weekdayDayMins + otBreakdownTotals.weekdayNightMins
+      + otBreakdownTotals.weekendDayMins + otBreakdownTotals.weekendNightMins;
+    let overtimeAmount = Math.round(
+      hourlyRate * (
+        (otBreakdownTotals.weekdayDayMins / 60) * otRate('weekdayDayRate') +
+        (otBreakdownTotals.weekdayNightMins / 60) * otRate('weekdayNightRate') +
+        (otBreakdownTotals.weekendDayMins / 60) * otRate('weekendDayRate') +
+        (otBreakdownTotals.weekendNightMins / 60) * otRate('weekendNightRate')
+      )
+    );
+    // Timesheets predating this breakdown (or manually adjusted with no bucket data)
+    // fall back to a flat 1x on the unaccounted minutes rather than dropping that pay.
+    const unbucketedMinutes = Math.max(0, overtimeMinutesTotal - bucketedMinutes);
+    if (unbucketedMinutes > 0) overtimeAmount += Math.round(hourlyRate * (unbucketedMinutes / 60));
     const adjustedGross  = proratedGross + overtimeAmount;
 
     // Percentage-of-gross job-group deductions resolve now that adjustedGross is known.
@@ -514,6 +555,7 @@ async function lockCycleInternal(req, res, cycle) {
       employeeCount:  employees.length,
       hasExceptions:  exceptionCount > 0,
       exceptionCount,
+      excludedEmployees,
       lockedAt: new Date(), lockedBy: req.user?._id ?? null,
       updatedAt: new Date(),
     },
@@ -542,7 +584,10 @@ async function lockCycleInternal(req, res, cycle) {
     });
   }
 
-  return returnFunction(res, 200, true, 'Cycle locked and payroll calculated.');
+  const message = excludedEmployees.length
+    ? `Cycle locked and payroll calculated for ${employees.length} employee(s). ${excludedEmployees.length} employee(s) were excluded due to incomplete profiles — see the Excluded tab.`
+    : 'Cycle locked and payroll calculated.';
+  return returnFunction(res, 200, true, message, { employeeCount: employees.length, excludedEmployees });
 }
 
 // ── Close Cycle → Distribute Payslips ────────────────────────────────────────

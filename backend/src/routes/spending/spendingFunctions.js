@@ -3,6 +3,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
 const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('../../lib/spend/approvalChain');
 const { resolvePolicy } = require('../../lib/spend/policyResolver');
 const { buildSpendScopeFilter, canAccessRecord } = require('../../lib/spend/orgScope');
@@ -235,7 +236,7 @@ const createPurchaseRequest = async (req, res) => {
   const { title, description, justification, estimatedCost, currency, priority, vendor, vendorId, items, neededBy } = req.body;
 
   const employeeId = req.user?.employeeId ? new ObjectId(req.user.employeeId) : null;
-  const employee = employeeId ? await findOne('employees', { _id: employeeId }, { projection: { department: 1 } }) : null;
+  const employee = employeeId ? await findOne('employees', { _id: employeeId }, { projection: { department: 1, fullName: 1 } }) : null;
 
   const policy = await resolvePolicy('procurement_policies', {
     employeeId, role: req.user?.role, department: employee?.department,
@@ -266,6 +267,20 @@ const createPurchaseRequest = async (req, res) => {
     createdAt:     new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('purchase_requests', doc);
+
+  const requesterName = employee?.fullName || req.user?.name || 'An employee';
+  const inboxPayload = {
+    type: 'procurement', subType: 'purchase_request_submitted',
+    title: `Purchase request from ${requesterName}`,
+    subtitle: `"${title}" — ${doc.currency} ${doc.estimatedCost.toLocaleString()}`,
+    referenceId: result.insertedId, referenceModel: 'purchase_requests',
+    requiresAction: true, triggeredBy: req.user?._id ?? null,
+  };
+  // Inbox — this is what HR/admin actually check for actionable items (distinct from
+  // the bell-icon notifications below, which this handler already sent but the Inbox
+  // never received, so approvers had no reliable way to see a new request).
+  if (employeeId) notifyManager(employeeId, inboxPayload).catch(() => {});
+  notifyHR(inboxPayload).catch(() => {});
 
   if (approvalChain[0]) {
     notifyUser(approvalChain[0].approverId, {

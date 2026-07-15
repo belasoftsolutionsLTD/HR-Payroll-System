@@ -7,7 +7,7 @@ const {
   submitRequisition, approveRequisition, deleteRequisition,
   listApplicationsForRequisition, moveApplicationStage, updateApplicationStatus,
   extendOffer, respondToOffer,
-  assignInterviewer, unassignInterviewer,
+  assignInterviewer, unassignInterviewer, sendInterviewReminder,
   submitScorecard, listScorecardsForApplication, getScorecard,
   createCandidate, listCandidates, getCandidate, updateCandidate, convertCandidate,
   createNurtureCampaign, listNurtureCampaigns, addNurtureTouchpoint, listNurtureCandidates,
@@ -39,6 +39,7 @@ router.patch('/applications/:id/offer',       allowRoles(MGMT), AsyncHandler(res
 // ── Interviewer assignments ───────────────────────────────────────────────────
 router.post('/applications/:id/interviewers',                          allowRoles(MGMT), AsyncHandler(assignInterviewer));
 router.delete('/applications/:id/interviewers/:stageId/:interviewerId', allowRoles(MGMT), AsyncHandler(unassignInterviewer));
+router.post('/applications/:id/interviewers/:stageId/remind',          allowRoles(MGMT), AsyncHandler(sendInterviewReminder));
 
 // ── Scorecards ────────────────────────────────────────────────────────────────
 router.post('/applications/:id/scorecards',   allowRoles(MGMT), AsyncHandler(submitScorecard));

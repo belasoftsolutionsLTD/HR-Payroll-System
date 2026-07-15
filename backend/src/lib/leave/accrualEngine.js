@@ -5,13 +5,19 @@ const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
 // Monthly accrual run — policy-driven (replaces the old single hardcoded
 // 21-days/year env-var rate). Idempotent per calendar month via
 // leave_balances.lastAccrualDate, same guard idiom as the old system.
-const runAccrual = async (triggeredBy = null) => {
+//
+// `onlyEmployeeIds`, when given, scopes the run to specific employees — used to grant
+// a brand-new hire their first balance immediately at creation time instead of making
+// them wait for the 1st-of-month cron (see employeesFunctions.js createEmployee).
+const runAccrual = async (triggeredBy = null, onlyEmployeeIds = null) => {
   const now = new Date();
   const year = now.getFullYear();
   const policies = await findMany('leave_accrual_policies', { isActive: true });
   if (!policies.length) return { processed: 0, message: 'No active accrual policies.' };
 
-  const employees = await findMany('employees', { status: { $ne: 'inactive' } });
+  const employeeFilter = { status: { $ne: 'inactive' } };
+  if (onlyEmployeeIds) employeeFilter._id = { $in: onlyEmployeeIds };
+  const employees = await findMany('employees', employeeFilter);
   const users = await findMany('users', { employeeId: { $in: employees.map(e => e._id) } }, { projection: { employeeId: 1, role: 1 } });
   const roleByEmployeeId = Object.fromEntries(users.map(u => [String(u.employeeId), u.role]));
 
@@ -25,7 +31,14 @@ const runAccrual = async (triggeredBy = null) => {
 
   let processed = 0;
   for (const policy of policies) {
-    if (policy.accrualFrequency !== 'monthly') continue; // annual grants are applied at creation time, not accrued monthly
+    // 'monthly' tops up by accrualAmount once per calendar month, gated by lastAccrualDate's
+    // month. 'annual' grants the full accrualAmount once per calendar year, gated by
+    // lastAccrualDate's year — previously silently skipped entirely (bug: annual-frequency
+    // policies like sick leave never got applied by anything, ever).
+    const isMonthly = policy.accrualFrequency === 'monthly';
+    const isAnnual = policy.accrualFrequency === 'annual';
+    if (!isMonthly && !isAnnual) continue;
+
     for (const employee of employees) {
       if (!policyApplies(policy, employee)) continue;
 
@@ -39,8 +52,10 @@ const runAccrual = async (triggeredBy = null) => {
         balance = { _id: insertedId, openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, lastAccrualDate: null };
       }
 
-      const lastMonth = balance.lastAccrualDate ? monthKey(new Date(balance.lastAccrualDate)) : null;
-      if (lastMonth === monthKey(now)) continue;
+      const alreadyRunThisPeriod = isMonthly
+        ? balance.lastAccrualDate && monthKey(new Date(balance.lastAccrualDate)) === monthKey(now)
+        : balance.lastAccrualDate && new Date(balance.lastAccrualDate).getFullYear() === year;
+      if (alreadyRunThisPeriod) continue;
 
       const room = Math.max(0, policy.maxAnnualEntitlement - balance.accrued);
       const amount = Math.min(policy.accrualAmount, room);
@@ -56,7 +71,7 @@ const runAccrual = async (triggeredBy = null) => {
         leaveRequestId: null, employeeId: employee._id, action: 'balanceAdjusted',
         performedBy: triggeredBy, performedByName: triggeredBy ? null : 'System (cron)',
         previousValue: { accrued: balance.accrued }, newValue: { accrued: newAccrued },
-        comment: `Monthly accrual: +${amount} days (${policy.name})`, timestamp: now,
+        comment: `${isMonthly ? 'Monthly' : 'Annual'} accrual: +${amount} days (${policy.name})`, timestamp: now,
       });
       processed += 1;
     }

@@ -9,6 +9,7 @@ const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboar
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
+const { runAccrual } = require('../../lib/leave/accrualEngine');
 
 const DEPARTMENTS = ['Administration','Human Resources','Finance & Accounts','Information Technology','Operations','Sales & Marketing','Customer Service','Legal & Compliance','Procurement','Logistics & Supply Chain','Research & Development','Communications','Health & Safety','Facilities Management','Executive'];
 
@@ -282,6 +283,10 @@ const createEmployee = async (req, res) => {
     })));
   }
 
+  // Grant this employee's first accrual immediately rather than making them wait for
+  // the 1st-of-month cron — otherwise every new hire shows 0 days for up to a month.
+  runAccrual(req.user._id, [result.insertedId]).catch(() => {});
+
   // Auto-start onboarding from the best-matching template, if any exist (fire-and-forget)
   (async () => {
     const template = await resolveDefaultTemplate(doc.department);
@@ -498,6 +503,12 @@ const READINESS_CHECKS = [
   { key: 'staffNumber',    label: 'Staff Number',     critical: false, test: e => !!e.staffNumber },
 ];
 
+// Single source of truth for "is this employee safe to run through payroll" — used both
+// by the readiness-check endpoint below and by the payroll cycle run itself (which pays
+// ready employees first and excludes the rest rather than producing a broken payslip).
+const getMissingCriticalFields = (emp) => READINESS_CHECKS.filter(c => c.critical && !c.test(emp)).map(c => c.label);
+const isPayrollReady = (emp) => getMissingCriticalFields(emp).length === 0;
+
 const getPayrollReadiness = async (req, res) => {
   const employees = await findMany(
     'employees',
@@ -689,7 +700,7 @@ const getUpcomingAnalytics = async (req, res) => {
 
 module.exports = {
   listEmployees, exportEmployeesCSV, getEmployee, createEmployee, updateEmployee, patchEmployeeStatus, deleteEmployee,
-  uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness, listPayGroups, setPayGroupFrequency, getJobHistory,
+  uploadDocument, downloadDocument, getOrgChart, getPayrollReadiness, isPayrollReady, getMissingCriticalFields, listPayGroups, setPayGroupFrequency, getJobHistory,
   updateSkills, addCertification, deleteCertification, addEducation, deleteEducation,
   updateEmergencyContacts,
   getHeadcountAnalytics, getTurnoverAnalytics, getTenureAnalytics, getDemographicsAnalytics, getUpcomingAnalytics,

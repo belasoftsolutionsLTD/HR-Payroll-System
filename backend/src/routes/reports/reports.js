@@ -19,7 +19,11 @@ const {
   getAwardsReport, getITAssetsReport,
 } = require('./reportFunctions');
 
-router.use(allowRoles(HR_ROLES));
+// Scoped to '/reports' — this router is mounted at the shared bare '/api' prefix
+// (app.js), so an unscoped router.use() here would intercept every request that
+// reaches this router in the chain (e.g. /api/expense-claims, /api/notifications,
+// /api/finance/*), rejecting non-HR staff before it ever reaches its real handler.
+router.use('/reports', allowRoles(HR_ROLES));
 
 // Executive Dashboard
 router.get('/reports/executive',        AsyncHandler(getExecutiveDashboard));
