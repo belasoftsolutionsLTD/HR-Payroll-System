@@ -177,6 +177,7 @@ async function initIndexes() {
     // ── employee_compensations ───────────────────────────────────────────────
     idx('employee_compensations', { employeeId: 1, isActive: 1 }),
     idx('employee_compensations', { conceptId: 1 }),
+    idx('employee_compensations', { scope: 1, isActive: 1 }),
 
     // ── compensation_audit_logs ──────────────────────────────────────────────
     idx('compensation_audit_logs', { employeeId: 1, performedAt: -1 }),
