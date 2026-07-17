@@ -76,51 +76,6 @@ const updateJobGroup = async (req, res) => {
 
 const deleteJobGroup = makeDelete('job_groups');
 
-// ── Allowances (job-group linked, applied automatically during payroll runs —
-// see payrollCyclesFunctions.js. Collection name kept as fixed_allowances.) ──
-const listFixedAllowances  = makeList('fixed_allowances');
-const createFixedAllowance = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['name', 'amount'])) return;
-  const existing = await findOne('fixed_allowances', { name: req.body.name });
-  if (existing) return returnFunction(res, 409, false, 'A fixed allowance with this name already exists.');
-  const doc = {
-    name: req.body.name,
-    amount: Number(req.body.amount),
-    description: req.body.description || '',
-    isEnabled: req.body.isEnabled !== false,
-    isTaxable: req.body.isTaxable !== false,
-    appearsOnPayslip: req.body.appearsOnPayslip !== false,
-    jobGroupIds: Array.isArray(req.body.jobGroupIds) ? req.body.jobGroupIds : [],
-    createdAt: new Date(), updatedAt: new Date(),
-  };
-  const result = await insertOne('fixed_allowances', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
-};
-const updateFixedAllowance = makeUpdate('fixed_allowances');
-const deleteFixedAllowance = makeDelete('fixed_allowances');
-
-// ── Deductions ────────────────────────────────────────────────────────────────
-const listDeductions = makeList('deduction_types');
-const createDeduction = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['name'])) return;
-  const existing = await findOne('deduction_types', { name: req.body.name });
-  if (existing) return returnFunction(res, 409, false, 'A deduction with this name already exists.');
-  const doc = {
-    name: req.body.name,
-    type: req.body.type || 'fixed',       // 'fixed' | 'percentage'
-    amount: req.body.amount ? Number(req.body.amount) : null,
-    percentage: req.body.percentage ? Number(req.body.percentage) : null,
-    isEnabled: req.body.isEnabled !== false,
-    description: req.body.description || '',
-    jobGroupIds: Array.isArray(req.body.jobGroupIds) ? req.body.jobGroupIds : [],
-    createdAt: new Date(), updatedAt: new Date(),
-  };
-  const result = await insertOne('deduction_types', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
-};
-const updateDeduction = makeUpdate('deduction_types');
-const deleteDeduction = makeDelete('deduction_types');
-
 // ── Designations (linked to departments) ─────────────────────────────────────
 const listDesignations = async (req, res) => {
   const data = await findMany('designations', {}, { sort: { name: 1 } });
@@ -258,8 +213,6 @@ const updateCommunicationSettings = async (req, res) => {
 module.exports = {
   listDepartments, createDepartment, updateDepartment, deleteDepartment,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
-  listFixedAllowances, createFixedAllowance, updateFixedAllowance, deleteFixedAllowance,
-  listDeductions,  createDeduction,  updateDeduction,  deleteDeduction,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,
   listJdTemplates,  createJdTemplate,  updateJdTemplate,  deleteJdTemplate, serveJdTemplate,

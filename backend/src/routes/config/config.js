@@ -5,8 +5,6 @@ const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   listDepartments, createDepartment, updateDepartment, deleteDepartment,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
-  listFixedAllowances, createFixedAllowance, updateFixedAllowance, deleteFixedAllowance,
-  listDeductions,  createDeduction,  updateDeduction,  deleteDeduction,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,
   listJdTemplates,  createJdTemplate,  updateJdTemplate,  deleteJdTemplate, serveJdTemplate,
@@ -37,20 +35,6 @@ router.get('/job-groups',         allowRoles(ROLES), AsyncHandler(listJobGroups)
 router.post('/job-groups',        allowRoles(ROLES), AsyncHandler(createJobGroup));
 router.put('/job-groups/:id',     allowRoles(ROLES), AsyncHandler(updateJobGroup));
 router.delete('/job-groups/:id',  allowRoles(ROLES), AsyncHandler(deleteJobGroup));
-
-// Allowances — job-group-scoped, applied automatically during payroll runs (see
-// payrollCyclesFunctions.js). Collection name (fixed_allowances) kept unchanged;
-// only the label was ever "Fixed Allowances".
-router.get('/fixed-allowances',         allowRoles(ROLES), AsyncHandler(listFixedAllowances));
-router.post('/fixed-allowances',        allowRoles(ROLES), AsyncHandler(createFixedAllowance));
-router.put('/fixed-allowances/:id',     allowRoles(ROLES), AsyncHandler(updateFixedAllowance));
-router.delete('/fixed-allowances/:id',  allowRoles(ROLES), AsyncHandler(deleteFixedAllowance));
-
-// Deductions — job-group-scoped, applied automatically during payroll runs.
-router.get('/deductions',         allowRoles(ROLES), AsyncHandler(listDeductions));
-router.post('/deductions',        allowRoles(ROLES), AsyncHandler(createDeduction));
-router.put('/deductions/:id',     allowRoles(ROLES), AsyncHandler(updateDeduction));
-router.delete('/deductions/:id',  allowRoles(ROLES), AsyncHandler(deleteDeduction));
 
 // Communication Settings
 router.get('/communication-settings',   allowRoles(ROLES), AsyncHandler(getCommunicationSettings));
