@@ -82,6 +82,110 @@ const addCompensation = async (req, res) => {
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
+// Assign a concept to one employee, several employees, or a whole department/job-group/
+// everyone at once — a generalization of addCompensation that also supports the
+// group-scope (scope:'group', appliesTo) shape from employee_compensations. The
+// existing single-employee `addCompensation`/`POST /payroll/compensations` path is
+// left completely untouched (it already works and is in daily use) — this is purely
+// additive, reached only through the new `POST /payroll/concepts/:id/assign` route.
+const assignConcept = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['conceptId', 'target'])) return;
+  const { conceptId, target, amount, currency, effectiveFrom, effectiveTo, notes, principal, openingBalance } = req.body;
+
+  const concept = await findOne('payroll_concepts', { _id: new ObjectId(conceptId) }, { projection: { name: 1, code: 1, category: 1, subCategory: 1 } });
+  if (!concept) return returnFunction(res, 404, false, 'Concept not found.');
+
+  const targetType = target?.type;
+  if (!['employee', 'employees', 'all', 'department', 'jobGroup'].includes(targetType)) {
+    return returnFunction(res, 400, false, 'Invalid target type.');
+  }
+
+  const now = new Date();
+  const baseFields = {
+    conceptId: concept._id, conceptName: concept.name, conceptCode: concept.code,
+    category: concept.category, subCategory: concept.subCategory,
+    currency: currency || 'KES',
+    effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : now,
+    effectiveTo: effectiveTo ? new Date(effectiveTo) : null,
+    cycleId: null, isActive: true,
+    addedBy: req.user?._id ?? null,
+    notes: notes || null,
+    createdAt: now, updatedAt: now,
+  };
+
+  const hasPrincipal = principal !== undefined && principal !== null && principal !== '';
+
+  if (targetType === 'employee' || targetType === 'employees') {
+    const employeeIds = Array.isArray(target.employeeIds) ? target.employeeIds : [];
+    if (employeeIds.length === 0) {
+      return returnFunction(res, 400, false, 'Select at least one employee.');
+    }
+
+    const employees = await findMany('employees', { _id: { $in: employeeIds.map((id) => new ObjectId(id)) } }, { projection: { fullName: 1 } });
+    if (employees.length !== employeeIds.length) {
+      return returnFunction(res, 404, false, 'One or more employees were not found.');
+    }
+
+    const insertedIds = [];
+    for (const empId of employeeIds) {
+      const doc = {
+        ...baseFields,
+        scope: 'individual',
+        employeeId: new ObjectId(empId),
+        amount: Number(amount) || 0,
+      };
+      if (hasPrincipal) {
+        const principalNum = Number(principal);
+        const openingNum = (openingBalance !== undefined && openingBalance !== null && openingBalance !== '')
+          ? Number(openingBalance) : principalNum;
+        doc.principal = principalNum;
+        doc.openingBalance = openingNum;
+        doc.balanceRemaining = openingNum;
+        doc.totalRepaid = 0;
+        doc.loanStatus = 'active';
+      }
+      const result = await insertOne('employee_compensations', doc);
+      insertedIds.push(result.insertedId);
+      logCompensationChange(doc.employeeId, result.insertedId, doc.conceptName, 'added',
+        [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
+    }
+    return returnFunction(res, 201, true, req.locale.createdSuccessfully, { insertedIds });
+  }
+
+  // 'all' | 'department' | 'jobGroup' — a single shared assignment record, no running
+  // balance possible (a loan needs one specific person's balance, not a group's).
+  if (hasPrincipal) {
+    return returnFunction(res, 400, false, 'A loan-like assignment (with a principal) must target a specific employee, not a group.');
+  }
+
+  let appliesTo;
+  if (targetType === 'all') {
+    appliesTo = { type: 'all' };
+  } else if (targetType === 'department') {
+    if (!Array.isArray(target.departments) || target.departments.length === 0) {
+      return returnFunction(res, 400, false, 'Select at least one department.');
+    }
+    appliesTo = { type: 'department', departments: target.departments };
+  } else {
+    if (!Array.isArray(target.jobGroupIds) || target.jobGroupIds.length === 0) {
+      return returnFunction(res, 400, false, 'Select at least one job group.');
+    }
+    appliesTo = { type: 'jobGroup', jobGroupIds: target.jobGroupIds.map((id) => new ObjectId(id)) };
+  }
+
+  const doc = {
+    ...baseFields,
+    scope: 'group',
+    employeeId: null,
+    appliesTo,
+    amount: Number(amount) || 0,
+  };
+  const result = await insertOne('employee_compensations', doc);
+  logCompensationChange(null, result.insertedId, doc.conceptName, 'added',
+    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
 // Update compensation item
 const updateCompensation = async (req, res) => {
   const { id } = req.params;
@@ -128,4 +232,8 @@ const getCompensationAuditLog = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
-module.exports = { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation, getCompensationAuditLog };
+module.exports = {
+  getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation,
+  assignConcept, updateCompensation, removeCompensation, getCompensationAuditLog,
+  logCompensationChange,
+};

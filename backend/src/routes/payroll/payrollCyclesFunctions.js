@@ -8,6 +8,9 @@ const { buildCalculator, loadTaxConfig } = require('../../functions/taxCalculato
 const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
 const { sendEmail } = require('../../services/emailService');
 const { isPayrollReady, getMissingCriticalFields } = require('../employees/employeesFunctions');
+const { resolveConceptPass1, resolveConceptPass2 } = require('../../lib/payroll/resolveConceptPayItems');
+const { resolveLegacyPass1, resolveLegacyPass2 } = require('../../lib/payroll/resolveLegacyPayItems');
+const { logCompensationChange } = require('./payrollCompensationsFunctions');
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -283,7 +286,8 @@ async function lockCycleInternal(req, res, cycle) {
 
   let totalGross = 0, totalDeductions = 0, totalNet = 0, totalEmployerCost = 0, exceptionCount = 0;
   const matchedTimesheetIds = [];
-  const loanApplications = []; // { loanId, installmentApplied } — balance decremented after lock succeeds
+  const loanApplications = []; // { loanId, installmentApplied } — legacy staff_loans, balance decremented after lock succeeds
+  const conceptLoanApplications = []; // { assignmentId, installmentApplied } — unified-engine loan-like employee_compensations, same deferred-write timing
 
   // Load tax config once for all employees (avoids N+1 DB calls)
   const taxConfig = await loadTaxConfig();
@@ -300,6 +304,23 @@ async function lockCycleInternal(req, res, cycle) {
   const jobGroupDeductionDefs = await findMany('deduction_types', { isEnabled: true }, {});
   const matchesJobGroup = (def, emp) =>
     !def.jobGroupIds || def.jobGroupIds.length === 0 || def.jobGroupIds.map(String).includes(String(emp.jobGroupId));
+
+  // Unified Concepts engine — off by default. When on, job-group Allowances/Deductions
+  // and staff_loans above are bypassed in favor of payroll_concepts + the new targeting
+  // layer on employee_compensations (scope:'individual'/'group'). Gated behind this flag,
+  // with a per-cycle override, until the preview-concepts-engine endpoint has shown zero
+  // diffs against the legacy engine across real cycles — see the Concepts unification plan.
+  const payrollEngineConfig = await global.dbo.collection('payroll_engine_config').findOne({});
+  const useUnifiedConceptsEngine = cycle.useUnifiedConceptsEngine === true
+    || (cycle.useUnifiedConceptsEngine !== false && payrollEngineConfig?.useUnifiedConceptsEngine === true);
+
+  let conceptById = {};
+  let groupAssignments = [];
+  if (useUnifiedConceptsEngine) {
+    const allConcepts = await findMany('payroll_concepts', { isActive: true }, {});
+    conceptById = Object.fromEntries(allConcepts.map((c) => [String(c._id), c]));
+    groupAssignments = await findMany('employee_compensations', { scope: 'group', isActive: true }, {});
+  }
 
   // Get all required alert concepts
   const alertConcepts = await findMany('payroll_concepts', { alertIfUndefined: true, isActive: true }, {});
@@ -321,32 +342,64 @@ async function lockCycleInternal(req, res, cycle) {
       ],
     }, {});
 
-    const earnings             = comps.filter(c => c.category === 'earnings');
-    const deductions           = comps.filter(c => c.category === 'deductions');
-    const benefits             = comps.filter(c => c.category === 'benefits');
-    const employerContributions= comps.filter(c => c.category === 'employer_contributions');
+    let earnings, deductions, benefits, employerContributions;
+    let jgAllowanceItems, taxableJgAllowanceTotal, nonTaxableJgAllowanceTotal;
+    let jgFixedDeductionItems, jgFixedDeductionTotal;
+    let grossPay, empContribTotal;
+    const conceptEngineWarnings = [];
 
-    // Job-group-scoped Allowances (Payroll Settings) — taxable ones flow into gross
-    // pay like any other earning; non-taxable ones are added straight to net pay
-    // further down, after the statutory tax calc, so they never inflate PAYE/NSSF/SHA/AHL.
-    const jgAllowanceItems = jobGroupAllowanceDefs.filter(d => matchesJobGroup(d, emp)).map(d => ({
-      conceptId: null, conceptName: d.name, conceptCode: 'JG-ALW', subCategory: 'fixed_pay',
-      amount: d.amount || 0, isTaxable: d.isTaxable !== false, source: 'job_group',
-    }));
-    const taxableJgAllowanceTotal    = jgAllowanceItems.filter(i => i.isTaxable).reduce((s, i) => s + i.amount, 0);
-    const nonTaxableJgAllowanceTotal = jgAllowanceItems.filter(i => !i.isTaxable).reduce((s, i) => s + i.amount, 0);
+    if (useUnifiedConceptsEngine) {
+      // Basic Pay is itself a concept (code 'BASIC', auto-synced from emp.grossPay —
+      // see syncBasicPay.js), so it's the canonical basic_salary value for formula/
+      // percentage evaluation. hours_worked isn't known yet at this point in the loop
+      // (overtime/timesheets are pulled further down) — formulas referencing it in an
+      // earnings/pass-1 concept get 0 here; this is a known limitation, not a bug.
+      const basicPayComp = comps.find(c => c.conceptCode === 'BASIC');
+      const basicSalary = basicPayComp?.amount ?? emp.grossPay ?? 0;
+      const pass1 = resolveConceptPass1({
+        emp, individualComps: comps, groupAssignments, conceptById,
+        context: { basic_salary: basicSalary, hours_worked: 0 },
+      });
+      conceptEngineWarnings.push(...pass1.warnings);
 
-    // Job-group-scoped Deductions — fixed amounts resolve now; percentage-of-gross ones
-    // resolve further down once adjustedGross is known.
-    const jgDeductionDefsForEmp = jobGroupDeductionDefs.filter(d => matchesJobGroup(d, emp));
-    const jgFixedDeductionItems = jgDeductionDefsForEmp.filter(d => d.type !== 'percentage').map(d => ({
-      conceptId: null, conceptName: d.name, conceptCode: 'JG-DED', subCategory: 'other_withholding',
-      amount: d.amount || 0, source: 'job_group',
-    }));
-    const jgFixedDeductionTotal = jgFixedDeductionItems.reduce((s, i) => s + i.amount, 0);
+      earnings = []; deductions = []; // superseded by the *Items arrays below for this engine
+      benefits = pass1.benefitsItems;
+      employerContributions = pass1.employerContributionItems;
+      jgAllowanceItems = pass1.earningsItems;
+      taxableJgAllowanceTotal = pass1.taxableEarningsTotal;
+      nonTaxableJgAllowanceTotal = pass1.nonTaxableEarningsTotal;
+      jgFixedDeductionItems = pass1.deductionItemsPass1;
+      jgFixedDeductionTotal = pass1.deductionTotalPass1;
+      grossPay = taxableJgAllowanceTotal;
+      empContribTotal = pass1.employerContributionTotal;
+    } else {
+      earnings              = comps.filter(c => c.category === 'earnings');
+      deductions            = comps.filter(c => c.category === 'deductions');
+      benefits              = comps.filter(c => c.category === 'benefits');
+      employerContributions = comps.filter(c => c.category === 'employer_contributions');
 
-    const grossPay           = earnings.reduce((s, c) => s + (c.amount || 0), 0) + taxableJgAllowanceTotal;
-    const empContribTotal    = employerContributions.reduce((s, c) => s + (c.amount || 0), 0);
+      // Job-group-scoped Allowances (Payroll Settings) — taxable ones flow into gross
+      // pay like any other earning; non-taxable ones are added straight to net pay
+      // further down, after the statutory tax calc, so they never inflate PAYE/NSSF/SHA/AHL.
+      jgAllowanceItems = jobGroupAllowanceDefs.filter(d => matchesJobGroup(d, emp)).map(d => ({
+        conceptId: null, conceptName: d.name, conceptCode: 'JG-ALW', subCategory: 'fixed_pay',
+        amount: d.amount || 0, isTaxable: d.isTaxable !== false, source: 'job_group',
+      }));
+      taxableJgAllowanceTotal    = jgAllowanceItems.filter(i => i.isTaxable).reduce((s, i) => s + i.amount, 0);
+      nonTaxableJgAllowanceTotal = jgAllowanceItems.filter(i => !i.isTaxable).reduce((s, i) => s + i.amount, 0);
+
+      // Job-group-scoped Deductions — fixed amounts resolve now; percentage-of-gross ones
+      // resolve further down once adjustedGross is known.
+      const jgDeductionDefsForEmp = jobGroupDeductionDefs.filter(d => matchesJobGroup(d, emp));
+      jgFixedDeductionItems = jgDeductionDefsForEmp.filter(d => d.type !== 'percentage').map(d => ({
+        conceptId: null, conceptName: d.name, conceptCode: 'JG-DED', subCategory: 'other_withholding',
+        amount: d.amount || 0, source: 'job_group',
+      }));
+      jgFixedDeductionTotal = jgFixedDeductionItems.reduce((s, i) => s + i.amount, 0);
+
+      grossPay        = earnings.reduce((s, c) => s + (c.amount || 0), 0) + taxableJgAllowanceTotal;
+      empContribTotal = employerContributions.reduce((s, c) => s + (c.amount || 0), 0);
+    }
 
     // Real proration — new hires / mid-cycle terminations only get paid for days actually
     // worked in this period. Fixed voluntary deductions (loans, etc.) are not prorated.
@@ -425,31 +478,58 @@ async function lockCycleInternal(req, res, cycle) {
     if (unbucketedMinutes > 0) overtimeAmount += Math.round(hourlyRate * (unbucketedMinutes / 60));
     const adjustedGross  = proratedGross + overtimeAmount;
 
-    // Percentage-of-gross job-group deductions resolve now that adjustedGross is known.
-    const jgPercentageDeductionItems = jgDeductionDefsForEmp.filter(d => d.type === 'percentage').map(d => ({
-      conceptId: null, conceptName: d.name, conceptCode: 'JG-DED', subCategory: 'other_withholding',
-      amount: Math.round(adjustedGross * (d.percentage || 0) / 100 * 100) / 100, source: 'job_group',
-    }));
-    const jgPercentageDeductionTotal = jgPercentageDeductionItems.reduce((s, i) => s + i.amount, 0);
+    // Percentage/formula/bracket-type deductions (job-group legacy, or any Concept)
+    // resolve now that adjustedGross is known. Staff loans resolve here too — unlike a
+    // flat deduction, a loan has a running balance; the installment is capped at
+    // min(evaluated amount, balanceRemaining) so the final payment never overshoots, and
+    // the balance itself is only decremented (loan marked completed) after this cycle
+    // successfully locks, mirroring how timesheets are only stamped processed once the
+    // lock actually goes through — see the deferred-write loop after the cycle is marked locked.
+    let jgPercentageDeductionItems, jgPercentageDeductionTotal, loanDeductionItems, loanDeductionTotal;
 
-    // Staff loans — unlike a flat employee_compensations deduction, a loan has a running
-    // balance. Deduct min(installment, balanceRemaining) so the final payment never
-    // overshoots what's actually still owed; the balance itself is only decremented (and
-    // the loan marked completed) after this cycle successfully locks, mirroring how
-    // timesheets are only stamped processed once the lock actually goes through.
-    const activeLoans = await global.dbo.collection('staff_loans').find({ employeeId: emp._id, status: 'active' }).toArray();
-    const loanDeductionItems = activeLoans.map((loan) => {
-      const installmentApplied = Math.min(loan.monthlyInstallment, loan.balanceRemaining);
-      loanApplications.push({ loanId: loan._id, installmentApplied });
-      return {
-        conceptId: null, conceptName: loan.loanType || 'Staff Loan', conceptCode: 'LOAN', subCategory: 'other_withholding',
-        amount: installmentApplied, source: 'loan', loanId: loan._id,
-        balanceAfter: Math.round((loan.balanceRemaining - installmentApplied) * 100) / 100,
-      };
-    }).filter((i) => i.amount > 0);
-    const loanDeductionTotal = loanDeductionItems.reduce((s, i) => s + i.amount, 0);
+    if (useUnifiedConceptsEngine) {
+      const basicPayComp = comps.find(c => c.conceptCode === 'BASIC');
+      const basicSalary = basicPayComp?.amount ?? emp.grossPay ?? 0;
+      const pass2 = resolveConceptPass2({
+        emp, individualComps: comps, groupAssignments, conceptById,
+        context: { basic_salary: basicSalary, gross_salary: proratedGross, adjusted_gross: adjustedGross, hours_worked: overtimeHours },
+        loanApplications: conceptLoanApplications,
+      });
+      conceptEngineWarnings.push(...pass2.warnings);
+      jgPercentageDeductionItems = pass2.deductionItemsPass2;
+      jgPercentageDeductionTotal = pass2.deductionTotalPass2;
+      loanDeductionItems = pass2.loanItems;
+      loanDeductionTotal = pass2.loanTotal;
+    } else {
+      const jgDeductionDefsForEmp = jobGroupDeductionDefs.filter(d => matchesJobGroup(d, emp));
+      jgPercentageDeductionItems = jgDeductionDefsForEmp.filter(d => d.type === 'percentage').map(d => ({
+        conceptId: null, conceptName: d.name, conceptCode: 'JG-DED', subCategory: 'other_withholding',
+        amount: Math.round(adjustedGross * (d.percentage || 0) / 100 * 100) / 100, source: 'job_group',
+      }));
+      jgPercentageDeductionTotal = jgPercentageDeductionItems.reduce((s, i) => s + i.amount, 0);
+
+      const activeLoans = await global.dbo.collection('staff_loans').find({ employeeId: emp._id, status: 'active' }).toArray();
+      loanDeductionItems = activeLoans.map((loan) => {
+        const installmentApplied = Math.min(loan.monthlyInstallment, loan.balanceRemaining);
+        loanApplications.push({ loanId: loan._id, installmentApplied });
+        return {
+          conceptId: null, conceptName: loan.loanType || 'Staff Loan', conceptCode: 'LOAN', subCategory: 'other_withholding',
+          amount: installmentApplied, source: 'loan', loanId: loan._id,
+          balanceAfter: Math.round((loan.balanceRemaining - installmentApplied) * 100) / 100,
+        };
+      }).filter((i) => i.amount > 0);
+      loanDeductionTotal = loanDeductionItems.reduce((s, i) => s + i.amount, 0);
+    }
 
     const totalDeds = deductions.reduce((s, c) => s + (c.amount || 0), 0) + jgFixedDeductionTotal + jgPercentageDeductionTotal + loanDeductionTotal;
+
+    // Surface any concept-evaluation problem (malformed formula, missing base, unknown
+    // variable) as a payslip exception rather than a silently-wrong number — matches
+    // this file's existing philosophy of degrading one employee's bad data into a
+    // visible warning instead of either crashing the run or hiding the issue.
+    for (const w of conceptEngineWarnings) {
+      exceptions.push({ type: 'concept_evaluation', message: w, severity: 'warning' });
+    }
 
     // Pull approved expense reimbursements for this cycle period
     const expenseDocs = await global.dbo.collection('expense_claims').find({
@@ -534,6 +614,7 @@ async function lockCycleInternal(req, res, cycle) {
       leave, leaveDeductionTotal,
       hasException:  exceptions.length > 0,
       exceptions,
+      engine:        useUnifiedConceptsEngine ? 'concepts' : 'legacy',
       status:        'pending',
       approvedBy:    null, approvedAt: null,
       payslipUrl:    null, payslipSentAt: null,
@@ -584,11 +665,187 @@ async function lockCycleInternal(req, res, cycle) {
     });
   }
 
+  // Unified-engine loan-like employee_compensations — same deferred-write timing as
+  // above. A fully-repaid loan is auto-unassigned via isActive:false, the same
+  // soft-delete convention every other compensation row already uses (no new concept
+  // needed) — logged to the audit trail so it's visible, not a silent flip.
+  for (const { assignmentId, installmentApplied } of conceptLoanApplications) {
+    const assignment = await findOne('employee_compensations', { _id: assignmentId });
+    if (!assignment) continue;
+    const newBalance = Math.round((assignment.balanceRemaining - installmentApplied) * 100) / 100;
+    const isPaidOff = newBalance <= 0;
+    await updateOne('employee_compensations', { _id: assignmentId }, {
+      $set: {
+        balanceRemaining: Math.max(0, newBalance),
+        totalRepaid: Math.round(((assignment.totalRepaid || 0) + installmentApplied) * 100) / 100,
+        loanStatus: isPaidOff ? 'completed' : 'active',
+        isActive: isPaidOff ? false : assignment.isActive,
+        updatedAt: new Date(),
+      },
+    });
+    if (isPaidOff) {
+      logCompensationChange(assignment.employeeId, assignment._id, assignment.conceptName, 'updated',
+        [{ field: 'loanStatus', oldValue: 'active', newValue: 'completed' },
+         { field: 'isActive', oldValue: true, newValue: false }],
+        null);
+    }
+  }
+
   const message = excludedEmployees.length
     ? `Cycle locked and payroll calculated for ${employees.length} employee(s). ${excludedEmployees.length} employee(s) were excluded due to incomplete profiles — see the Excluded tab.`
     : 'Cycle locked and payroll calculated.';
   return returnFunction(res, 200, true, message, { employeeCount: employees.length, excludedEmployees });
 }
+
+// ── Preview: Unified Concepts Engine vs Legacy (read-only, no writes) ────────────
+// The required go/no-go gate before useUnifiedConceptsEngine is ever flipped for a
+// real cycle lock (see the Concepts unification plan). Runs both engines for every
+// eligible employee and returns a per-employee diff — grossPay/totalDeductions/netPay
+// plus which named line items differ — without writing payroll_results, without
+// touching cycle status, and without stamping any timesheet/expense as processed.
+// Scope note: this compares the parts that actually differ between engines (earnings/
+// deductions/loans resolution, and the statutory tax that depends on the resulting
+// adjustedGross). Leave and expense-reimbursement figures are engine-agnostic and are
+// deliberately left out of both sides — including them would require the same
+// timesheet/expense-claim writes lockCycleInternal does, which a read-only preview
+// must never perform.
+const previewConceptsEngine = async (req, res) => {
+  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
+  if (cycle.status !== 'review') return returnFunction(res, 400, false, 'Cycle must be in Review to preview.');
+
+  // Employee scoping — mirrors lockCycleInternal's own scoping exactly (see there for
+  // the reasoning); duplicated rather than shared because this endpoint must never
+  // risk touching the live lock path.
+  let empFilter;
+  if (cycle.targetEmployeeIds?.length) {
+    empFilter = { _id: { $in: cycle.targetEmployeeIds } };
+  } else {
+    const cycleFrequency = cycle.payFrequency || 'monthly';
+    const frequencyMatch = cycleFrequency === 'monthly'
+      ? { $or: [{ payFrequency: 'monthly' }, { payFrequency: { $exists: false } }, { payFrequency: null }] }
+      : { payFrequency: cycleFrequency };
+    empFilter = {
+      $and: [
+        { $or: [{ status: 'active' }, { status: 'terminated', updatedAt: { $gte: cycle.period.startDate } }] },
+        frequencyMatch,
+      ],
+    };
+    if (cycle.payGroup && cycle.payGroup !== 'all') empFilter.$and.push({ payGroup: cycle.payGroup });
+  }
+  const allEmployeesInScope = await findMany('employees', empFilter, {});
+  const employees = allEmployeesInScope.filter(isPayrollReady);
+
+  const taxConfig = await loadTaxConfig();
+  const taxCalc   = buildCalculator(taxConfig);
+  const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
+  const otRate = (key) => overtimeConfig?.[key] != null ? overtimeConfig[key] : 1;
+
+  const jobGroupAllowanceDefs = await findMany('fixed_allowances', { isEnabled: true }, {});
+  const jobGroupDeductionDefs = await findMany('deduction_types', { isEnabled: true }, {});
+  const allConcepts = await findMany('payroll_concepts', { isActive: true }, {});
+  const conceptById = Object.fromEntries(allConcepts.map((c) => [String(c._id), c]));
+  const groupAssignments = await findMany('employee_compensations', { scope: 'group', isActive: true }, {});
+
+  const diffs = [];
+
+  for (const emp of employees) {
+    const comps = await findMany('employee_compensations', {
+      employeeId: emp._id, isActive: true,
+      $or: [{ effectiveTo: null }, { effectiveTo: { $gte: cycle.period.startDate } }],
+    }, {});
+
+    const basicPayComp = comps.find((c) => c.conceptCode === 'BASIC');
+    const basicSalary = basicPayComp?.amount ?? emp.grossPay ?? 0;
+
+    // ── Legacy pass 1 ──
+    const legacyEarnings = comps.filter((c) => c.category === 'earnings');
+    const legacyPass1 = resolveLegacyPass1({ emp, jobGroupAllowanceDefs, jobGroupDeductionDefs });
+    const legacyGrossPay = legacyEarnings.reduce((s, c) => s + (c.amount || 0), 0) + legacyPass1.taxableJgAllowanceTotal;
+
+    // ── New engine pass 1 ──
+    const newPass1 = resolveConceptPass1({
+      emp, individualComps: comps, groupAssignments, conceptById,
+      context: { basic_salary: basicSalary, hours_worked: 0 },
+    });
+    const newGrossPay = newPass1.taxableEarningsTotal;
+
+    // ── Proration + overtime — engine-agnostic, computed once, applied to both ──
+    const proration = calculateProration(emp, cycle.period.startDate, cycle.period.endDate);
+    const legacyProratedGross = Math.round(legacyGrossPay * proration.factor * 100) / 100;
+    const newProratedGross    = Math.round(newGrossPay * proration.factor * 100) / 100;
+
+    const cycleTimesheets = await global.dbo.collection('timesheets').find({
+      employeeId: emp._id, status: 'approved', payrollRunId: null,
+      weekStart: { $gte: cycle.period.startDate, $lte: cycle.period.endDate },
+    }).toArray();
+    const overtimeMinutesTotal = cycleTimesheets.reduce((sum, t) => sum + (t.overtimeMinutes || 0), 0);
+    const overtimeHours = Math.round((overtimeMinutesTotal / 60) * 100) / 100;
+    const hourlyRate = emp.grossPay ? emp.grossPay / 22 / 8 : 0;
+    const otBreakdownTotals = cycleTimesheets.reduce((acc, t) => {
+      const b = t.overtimeBreakdown || {};
+      acc.weekdayDayMins += b.weekdayDayMins || 0; acc.weekdayNightMins += b.weekdayNightMins || 0;
+      acc.weekendDayMins += b.weekendDayMins || 0; acc.weekendNightMins += b.weekendNightMins || 0;
+      return acc;
+    }, { weekdayDayMins: 0, weekdayNightMins: 0, weekendDayMins: 0, weekendNightMins: 0 });
+    const bucketedMinutes = otBreakdownTotals.weekdayDayMins + otBreakdownTotals.weekdayNightMins + otBreakdownTotals.weekendDayMins + otBreakdownTotals.weekendNightMins;
+    let overtimeAmount = Math.round(hourlyRate * (
+      (otBreakdownTotals.weekdayDayMins / 60) * otRate('weekdayDayRate') + (otBreakdownTotals.weekdayNightMins / 60) * otRate('weekdayNightRate')
+      + (otBreakdownTotals.weekendDayMins / 60) * otRate('weekendDayRate') + (otBreakdownTotals.weekendNightMins / 60) * otRate('weekendNightRate')
+    ));
+    const unbucketedMinutes = Math.max(0, overtimeMinutesTotal - bucketedMinutes);
+    if (unbucketedMinutes > 0) overtimeAmount += Math.round(hourlyRate * (unbucketedMinutes / 60));
+
+    const legacyAdjustedGross = legacyProratedGross + overtimeAmount;
+    const newAdjustedGross    = newProratedGross + overtimeAmount;
+
+    // ── Pass 2 (both engines) ──
+    const legacyPass2 = await resolveLegacyPass2({
+      emp, jobGroupDeductionDefs, adjustedGross: legacyAdjustedGross,
+      findStaffLoansForEmployee: (employeeId) => global.dbo.collection('staff_loans').find({ employeeId, status: 'active' }).toArray(),
+    });
+    const legacyDeductions = comps.filter((c) => c.category === 'deductions');
+    const legacyTotalDeds = legacyDeductions.reduce((s, c) => s + (c.amount || 0), 0)
+      + legacyPass1.jgFixedDeductionTotal + legacyPass2.jgPercentageDeductionTotal + legacyPass2.loanDeductionTotal;
+
+    const noopLoanApplications = [];
+    const newPass2 = resolveConceptPass2({
+      emp, individualComps: comps, groupAssignments, conceptById,
+      context: { basic_salary: basicSalary, gross_salary: newProratedGross, adjusted_gross: newAdjustedGross, hours_worked: overtimeHours },
+      loanApplications: noopLoanApplications, // preview only — never actually applied/written
+    });
+    const newTotalDeds = newPass1.deductionTotalPass1 + newPass2.deductionTotalPass2 + newPass2.loanTotal;
+
+    // ── Statutory tax — depends on adjustedGross, which differs per engine ──
+    const legacyStatutory = Math.round((taxCalc.calcIncomeTax(legacyAdjustedGross) + taxCalc.calcPension(legacyAdjustedGross) + taxCalc.calcHealth(legacyAdjustedGross) + taxCalc.calcHousingLevy(legacyAdjustedGross)) * 100) / 100;
+    const newStatutory    = Math.round((taxCalc.calcIncomeTax(newAdjustedGross) + taxCalc.calcPension(newAdjustedGross) + taxCalc.calcHealth(newAdjustedGross) + taxCalc.calcHousingLevy(newAdjustedGross)) * 100) / 100;
+
+    const legacyNetApprox = Math.round((legacyAdjustedGross - legacyStatutory - legacyTotalDeds + legacyPass1.nonTaxableJgAllowanceTotal) * 100) / 100;
+    const newNetApprox    = Math.round((newAdjustedGross - newStatutory - newTotalDeds + newPass1.nonTaxableEarningsTotal) * 100) / 100;
+
+    const diffThreshold = 0.01; // rounding-noise floor, not a real discrepancy
+    const grossDiff = Math.round((newAdjustedGross - legacyAdjustedGross) * 100) / 100;
+    const dedsDiff  = Math.round(((newTotalDeds + newStatutory) - (legacyTotalDeds + legacyStatutory)) * 100) / 100;
+    const netDiff   = Math.round((newNetApprox - legacyNetApprox) * 100) / 100;
+    const hasDiff = Math.abs(grossDiff) > diffThreshold || Math.abs(dedsDiff) > diffThreshold || Math.abs(netDiff) > diffThreshold;
+
+    diffs.push({
+      employeeId: emp._id, fullName: emp.fullName, staffNumber: emp.staffNumber || null,
+      legacy: { grossPay: legacyAdjustedGross, totalDeductions: legacyTotalDeds + legacyStatutory, netPay: legacyNetApprox },
+      concepts: { grossPay: newAdjustedGross, totalDeductions: newTotalDeds + newStatutory, netPay: newNetApprox },
+      diff: { grossPay: grossDiff, totalDeductions: dedsDiff, netPay: netDiff },
+      hasDiff,
+      warnings: [...newPass1.warnings, ...newPass2.warnings],
+    });
+  }
+
+  const employeesWithDiffs = diffs.filter((d) => d.hasDiff).length;
+  return returnFunction(res, 200, true,
+    employeesWithDiffs === 0
+      ? `No differences found across ${diffs.length} employee(s) — safe to consider enabling the unified engine for this cycle.`
+      : `${employeesWithDiffs} of ${diffs.length} employee(s) would produce a different result under the unified engine — review before enabling.`,
+    { employeeCount: diffs.length, employeesWithDiffs, diffs });
+};
 
 // ── Close Cycle → Distribute Payslips ────────────────────────────────────────
 
@@ -831,5 +1088,5 @@ module.exports = {
   listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles,
   getCycleResults, getCycleExceptions, approveEmployees,
   lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult,
-  emailPayslips, downloadP9Form,
+  emailPayslips, downloadP9Form, previewConceptsEngine,
 };

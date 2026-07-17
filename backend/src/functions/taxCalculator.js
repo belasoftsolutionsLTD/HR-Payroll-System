@@ -1,6 +1,8 @@
 // Reusable tax calculator driven by a config document from `tax_config` collection.
 // Rates in config are stored as PERCENTAGES (e.g. 10 = 10%), converted to decimals here.
 
+const { calcBracketAmount } = require('./bracketCalculator');
+
 const KENYA_DEFAULT = {
   currency: 'KES',
   currencySymbol: 'KES',
@@ -101,20 +103,7 @@ const buildCalculator = (config) => {
       taxable = Math.max(0, gross - calcPension(gross));
     }
 
-    let tax = 0;
-    let rem = taxable;
-    for (const b of (itCfg.brackets || [])) {
-      if (rem <= 0) break;
-      const r = b.rate / 100;
-      if (b.limit) {
-        const t = Math.min(rem, b.limit);
-        tax += t * r;
-        rem -= t;
-      } else {
-        tax += rem * r;
-        rem  = 0;
-      }
-    }
+    const tax = calcBracketAmount(taxable, itCfg.brackets || []);
     return Math.round(Math.max(0, tax - (itCfg.personalRelief || 0)) * 100) / 100;
   };
 

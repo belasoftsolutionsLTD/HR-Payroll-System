@@ -5,9 +5,8 @@ const { allowRoles } = require('../../middleware/RolesMiddleware');
 const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
 
 const { listConcepts, createConcept, updateConcept, deleteConcept, getConcept } = require('./payrollConceptsFunctions');
-const { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, updateCompensation, removeCompensation, getCompensationAuditLog } = require('./payrollCompensationsFunctions');
-const { getEmployeeLoans, listActiveLoanSummaries, createLoan, updateLoan } = require('./payrollLoansFunctions');
-const { listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult, emailPayslips, downloadP9Form } = require('./payrollCyclesFunctions');
+const { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, assignConcept, updateCompensation, removeCompensation, getCompensationAuditLog } = require('./payrollCompensationsFunctions');
+const { listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult, emailPayslips, downloadP9Form, previewConceptsEngine } = require('./payrollCyclesFunctions');
 const { getMyPayslips, downloadPayslipPDF, getPayslip, getEmployeePayslips } = require('./payrollPayslipsFunctions');
 const { getPayrollAnalytics } = require('./payrollAnalyticsFunctions');
 
@@ -21,6 +20,7 @@ router.post('/concepts',         hrOnly, AsyncHandler(createConcept));
 router.get('/concepts/:id',      hrOnly, AsyncHandler(getConcept));
 router.put('/concepts/:id',      hrOnly, AsyncHandler(updateConcept));
 router.delete('/concepts/:id',   hrOnly, AsyncHandler(deleteConcept));
+router.post('/concepts/:id/assign', hrOnly, AsyncHandler((req, res) => assignConcept({ ...req, body: { ...req.body, conceptId: req.params.id } }, res)));
 
 // ── Employee Compensations ────────────────────────────────────────────────────
 router.get('/compensations/employees',              hrOnly, AsyncHandler(listEmployeeCompensationSummaries));
@@ -30,12 +30,6 @@ router.post('/compensations',                       hrOnly, AsyncHandler(addComp
 router.put('/compensations/:id',                    hrOnly, AsyncHandler(updateCompensation));
 router.delete('/compensations/:id',                 hrOnly, AsyncHandler(removeCompensation));
 
-// ── Staff Loans ───────────────────────────────────────────────────────────────
-router.get('/loans/active',            hrOnly, AsyncHandler(listActiveLoanSummaries));
-router.get('/loans/:employeeId',       hrOnly, AsyncHandler(getEmployeeLoans));
-router.post('/loans',                  hrOnly, AsyncHandler(createLoan));
-router.put('/loans/:id',               hrOnly, AsyncHandler(updateLoan));
-
 // ── Payroll Cycles ────────────────────────────────────────────────────────────
 router.get('/cycles',                               hrOnly, AsyncHandler(listCycles));
 router.post('/cycles',                              hrOnly, AsyncHandler(createCycle));
@@ -44,6 +38,7 @@ router.get('/cycles/:id',                           hrOnly, AsyncHandler(getCycl
 router.put('/cycles/:id/status',                    hrOnly, AsyncHandler(advanceCycleStatus));
 router.get('/cycles/:id/results',                   hrOnly, AsyncHandler(getCycleResults));
 router.get('/cycles/:id/exceptions',                hrOnly, AsyncHandler(getCycleExceptions));
+router.get('/cycles/:id/preview-concepts-engine',   hrOnly, AsyncHandler(previewConceptsEngine));
 router.post('/cycles/:id/approve',                  hrOnly, AsyncHandler(approveEmployees));
 router.post('/cycles/:id/lock',                     hrOnly, AsyncHandler(lockCycle));
 router.post('/cycles/:id/close',                    hrOnly, AsyncHandler(closeCycle));
