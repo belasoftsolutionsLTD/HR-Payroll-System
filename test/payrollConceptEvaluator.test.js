@@ -166,3 +166,77 @@ test('evaluateConceptAmount: null/undefined concept never throws', () => {
   assert.doesNotThrow(() => evaluateConceptAmount(null, {}, CTX));
   assert.doesNotThrow(() => evaluateConceptAmount(undefined, {}, CTX));
 });
+
+// ── evaluateConceptAmount: cap / flatCredit (statutory concepts extension) ──
+
+test('cap: percentage type clamps the raw amount before rounding', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, cap: 4000 }, {}, CTX
+  );
+  assert.equal(amount, 4000); // uncapped would be 6000
+});
+
+test('cap: percentage type is a no-op when the raw amount is under the cap', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, cap: 9000 }, {}, CTX
+  );
+  assert.equal(amount, 6000);
+});
+
+test('cap: bracket type clamps the raw amount before rounding', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'bracket', percentageOf: 'adjusted_gross', brackets: [{ limit: null, rate: 10 }], cap: 5000 }, {}, CTX
+  );
+  assert.equal(amount, 5000); // uncapped would be 6200
+});
+
+test('flatCredit: percentage type subtracts after the raw amount is computed', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, flatCredit: 1500 }, {}, CTX
+  );
+  assert.equal(amount, 4500); // 6000 - 1500
+});
+
+test('flatCredit: floors at zero rather than going negative', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, flatCredit: 999999 }, {}, CTX
+  );
+  assert.equal(amount, 0);
+});
+
+test('flatCredit: formula type applies after the negative-floor step', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'formula', formula: 'basic_salary / 10', flatCredit: 1000 }, {}, CTX
+  );
+  assert.equal(amount, 4000); // 50000/10=5000, minus 1000 credit
+});
+
+test('cap and flatCredit combined: cap is applied first, then credit subtracted', () => {
+  const { amount } = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, cap: 4000, flatCredit: 1000 }, {}, CTX
+  );
+  // raw 6000 -> capped to 4000 -> minus 1000 credit = 3000.
+  // If credit were applied before cap it would also be 3000 here by coincidence,
+  // so this case alone doesn't pin the order — the next test does.
+  assert.equal(amount, 3000);
+});
+
+test('cap and flatCredit combined: order is provably cap-then-credit, not credit-then-cap', () => {
+  // raw = 6000. cap-then-credit: min(6000,5500)=5500, 5500-1000=4500.
+  // credit-then-cap would be: 6000-1000=5000, min(5000,5500)=5000 (different answer).
+  const { amount } = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, cap: 5500, flatCredit: 1000 }, {}, CTX
+  );
+  assert.equal(amount, 4500);
+});
+
+test('cap/flatCredit absent (every concept before this extension): behavior is byte-identical to before', () => {
+  const withoutFields = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10 }, {}, CTX
+  );
+  const withNullFields = evaluateConceptAmount(
+    { type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, cap: null, flatCredit: null }, {}, CTX
+  );
+  assert.equal(withoutFields.amount, 6000);
+  assert.equal(withNullFields.amount, 6000);
+});

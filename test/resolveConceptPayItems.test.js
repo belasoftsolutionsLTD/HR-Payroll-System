@@ -193,3 +193,109 @@ test('pass2: totals sum correctly across multiple items', () => {
   assert.equal(result.deductionTotalPass2, 6000); // 10% of 60000
   assert.equal(result.loanTotal, 1000);
 });
+
+// ── Pass 2 — dependency sub-passes + statutoryItems (statutory concepts extension) ──
+
+test('pass2: dependency-free concepts (no deductConceptCodesFromBase) behave exactly as before — regression', () => {
+  const c = concept({ _id: 'p2b', category: 'deductions', type: 'percentage', percentageOf: 'adjusted_gross', percentageValue: 5, deductConceptCodesFromBase: [] });
+  const conceptById = { p2b: c };
+  const individualComps = [{ conceptId: 'p2b', category: 'deductions', amount: 0 }];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  assert.equal(result.deductionItemsPass2[0].amount, 3100);
+  assert.deepEqual(result.statutoryItems, []);
+});
+
+test('pass2: a concept referencing another concept subtracts its resolved amount from the base before evaluating', () => {
+  const nssf = concept({ _id: 'nssf', code: 'NSSF', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10 });
+  const paye = concept({ _id: 'paye', code: 'PAYE', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 20, deductConceptCodesFromBase: ['NSSF'] });
+  const conceptById = { nssf, paye };
+  const individualComps = [
+    { conceptId: 'nssf', category: 'deductions', amount: 0 },
+    { conceptId: 'paye', category: 'deductions', amount: 0 },
+  ];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  const nssfItem = result.deductionItemsPass2.find((i) => i.conceptCode === 'NSSF');
+  const payeItem = result.deductionItemsPass2.find((i) => i.conceptCode === 'PAYE');
+  assert.equal(nssfItem.amount, 6000); // 10% of 60000
+  assert.equal(payeItem.amount, 10800); // 20% of (60000 - 6000)
+});
+
+test('pass2: result is independent of assignment array order (dependency resolves regardless of position)', () => {
+  const nssf = concept({ _id: 'nssf', code: 'NSSF', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10 });
+  const paye = concept({ _id: 'paye', code: 'PAYE', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 20, deductConceptCodesFromBase: ['NSSF'] });
+  const conceptById = { nssf, paye };
+  const forward = [{ conceptId: 'nssf', category: 'deductions', amount: 0 }, { conceptId: 'paye', category: 'deductions', amount: 0 }];
+  const reversed = [{ conceptId: 'paye', category: 'deductions', amount: 0 }, { conceptId: 'nssf', category: 'deductions', amount: 0 }];
+
+  const r1 = resolveConceptPass2({ emp, individualComps: forward, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  const r2 = resolveConceptPass2({ emp, individualComps: reversed, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  const payeAmt = (r) => r.deductionItemsPass2.find((i) => i.conceptCode === 'PAYE').amount;
+  assert.equal(payeAmt(r1), payeAmt(r2));
+  assert.equal(payeAmt(r1), 10800);
+});
+
+test('pass2: a dangling/missing referenced code degrades to 0 deduction with a warning, never throws', () => {
+  const paye = concept({ _id: 'paye', code: 'PAYE', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 20, deductConceptCodesFromBase: ['NSSF'] });
+  const conceptById = { paye };
+  const individualComps = [{ conceptId: 'paye', category: 'deductions', amount: 0 }];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  const payeItem = result.deductionItemsPass2.find((i) => i.conceptCode === 'PAYE');
+  assert.equal(payeItem.amount, 12000); // 20% of full 60000, no deduction applied
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /not resolved this cycle/);
+});
+
+test('pass2: base subtraction is floored at zero, never goes negative', () => {
+  const bigDeduction = concept({ _id: 'big', code: 'BIG', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 500 });
+  const dependent = concept({ _id: 'dep', code: 'DEP', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, deductConceptCodesFromBase: ['BIG'] });
+  const conceptById = { big: bigDeduction, dep: dependent };
+  const individualComps = [
+    { conceptId: 'big', category: 'deductions', amount: 0 },
+    { conceptId: 'dep', category: 'deductions', amount: 0 },
+  ];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  // BIG = 500% of 60000 = 300000, far exceeding gross_salary (60000) -> base floors at 0
+  const depItem = result.deductionItemsPass2.find((i) => i.conceptCode === 'DEP');
+  assert.equal(depItem.amount, 0); // 10% of 0
+});
+
+test('pass2: statutoryKey concepts are moved into statutoryItems, out of deductionItemsPass2', () => {
+  const paye = concept({ _id: 'paye', code: 'PAYE', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 20, statutoryKey: 'paye' });
+  const other = concept({ _id: 'other', code: 'OTHER', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 5 });
+  const conceptById = { paye, other };
+  const individualComps = [
+    { conceptId: 'paye', category: 'deductions', amount: 0 },
+    { conceptId: 'other', category: 'deductions', amount: 0 },
+  ];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  assert.equal(result.statutoryItems.length, 1);
+  assert.equal(result.statutoryItems[0].statutoryKey, 'paye');
+  assert.equal(result.statutoryItems[0].amount, 12000);
+  assert.equal(result.deductionItemsPass2.length, 1);
+  assert.equal(result.deductionItemsPass2[0].conceptCode, 'OTHER');
+});
+
+test('pass2: statutoryItems is excluded from deductionTotalPass2 (no double-count)', () => {
+  const paye = concept({ _id: 'paye', code: 'PAYE', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 20, statutoryKey: 'paye' });
+  const conceptById = { paye };
+  const individualComps = [{ conceptId: 'paye', category: 'deductions', amount: 0 }];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  assert.equal(result.deductionTotalPass2, 0);
+  assert.equal(result.statutoryItems[0].amount, 12000);
+});
+
+test('pass2: a statutory concept can also be a dependency target for another concept (NSSF feeds PAYE, both correctly bucketed)', () => {
+  const nssf = concept({ _id: 'nssf', code: 'NSSF', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 10, statutoryKey: 'nssf' });
+  const paye = concept({ _id: 'paye', code: 'PAYE', category: 'deductions', type: 'percentage', percentageOf: 'gross_salary', percentageValue: 20, deductConceptCodesFromBase: ['NSSF'], statutoryKey: 'paye' });
+  const conceptById = { nssf, paye };
+  const individualComps = [
+    { conceptId: 'nssf', category: 'deductions', amount: 0 },
+    { conceptId: 'paye', category: 'deductions', amount: 0 },
+  ];
+  const result = resolveConceptPass2({ emp, individualComps, groupAssignments: [], conceptById, context: CONTEXT, loanApplications: [] });
+  assert.equal(result.deductionItemsPass2.length, 0);
+  assert.equal(result.statutoryItems.length, 2);
+  const byKey = Object.fromEntries(result.statutoryItems.map((i) => [i.statutoryKey, i.amount]));
+  assert.equal(byKey.nssf, 6000);
+  assert.equal(byKey.paye, 10800); // 20% of (60000 - 6000), dependency still resolves even though NSSF was routed to statutoryItems
+});

@@ -2,6 +2,7 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+const { VALID_EMPLOYMENT_TYPES } = require('../../lib/payroll/conceptTargeting');
 
 // Immutable log of every change to an employee's compensation — amount, effective dates,
 // active/inactive (added/removed), viewable by HR on the employee's payroll profile.
@@ -96,8 +97,15 @@ const assignConcept = async (req, res) => {
   if (!concept) return returnFunction(res, 404, false, 'Concept not found.');
 
   const targetType = target?.type;
-  if (!['employee', 'employees', 'all', 'department', 'jobGroup'].includes(targetType)) {
+  if (!['employee', 'employees', 'all', 'department', 'jobGroup', 'employmentType'].includes(targetType)) {
     return returnFunction(res, 400, false, 'Invalid target type.');
+  }
+
+  const excludeEmploymentTypes = Array.isArray(target?.excludeEmploymentTypes)
+    ? target.excludeEmploymentTypes.filter((t) => VALID_EMPLOYMENT_TYPES.includes(t))
+    : undefined;
+  if (target?.excludeEmploymentTypes && !excludeEmploymentTypes?.length) {
+    return returnFunction(res, 400, false, `excludeEmploymentTypes must contain valid employment types: ${VALID_EMPLOYMENT_TYPES.join(', ')}.`);
   }
 
   const now = new Date();
@@ -166,12 +174,21 @@ const assignConcept = async (req, res) => {
       return returnFunction(res, 400, false, 'Select at least one department.');
     }
     appliesTo = { type: 'department', departments: target.departments };
-  } else {
+  } else if (targetType === 'jobGroup') {
     if (!Array.isArray(target.jobGroupIds) || target.jobGroupIds.length === 0) {
       return returnFunction(res, 400, false, 'Select at least one job group.');
     }
     appliesTo = { type: 'jobGroup', jobGroupIds: target.jobGroupIds.map((id) => new ObjectId(id)) };
+  } else {
+    const employmentTypes = Array.isArray(target.employmentTypes)
+      ? target.employmentTypes.filter((t) => VALID_EMPLOYMENT_TYPES.includes(t))
+      : [];
+    if (employmentTypes.length === 0) {
+      return returnFunction(res, 400, false, `Select at least one valid employment type: ${VALID_EMPLOYMENT_TYPES.join(', ')}.`);
+    }
+    appliesTo = { type: 'employmentType', employmentTypes };
   }
+  if (excludeEmploymentTypes?.length) appliesTo.excludeEmploymentTypes = excludeEmploymentTypes;
 
   const doc = {
     ...baseFields,
