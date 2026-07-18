@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { matchesGroupAssignment } = require('../src/lib/payroll/conceptTargeting');
+const { matchesGroupAssignment, VALID_EMPLOYMENT_TYPES } = require('../src/lib/payroll/conceptTargeting');
 
 test('matchesGroupAssignment: type "all" matches every employee', () => {
   const assignment = { appliesTo: { type: 'all' } };
@@ -32,4 +32,33 @@ test('matchesGroupAssignment: missing/malformed appliesTo never throws, returns 
 
 test('matchesGroupAssignment: unknown type is false, not a throw', () => {
   assert.equal(matchesGroupAssignment({ appliesTo: { type: 'nonsense' } }, {}), false);
+});
+
+// ── employmentType targeting (contractor withholding-tax extension) ────────────
+
+test('VALID_EMPLOYMENT_TYPES matches the employees.employmentType enum used across the app', () => {
+  assert.deepEqual(VALID_EMPLOYMENT_TYPES, ['permanent', 'contract', 'partTime', 'intern']);
+});
+
+test('matchesGroupAssignment: type "employmentType" matches only listed employment types', () => {
+  const assignment = { appliesTo: { type: 'employmentType', employmentTypes: ['contract'] } };
+  assert.equal(matchesGroupAssignment(assignment, { employmentType: 'contract' }), true);
+  assert.equal(matchesGroupAssignment(assignment, { employmentType: 'permanent' }), false);
+  assert.equal(matchesGroupAssignment(assignment, {}), false);
+});
+
+test('matchesGroupAssignment: excludeEmploymentTypes filters out matching employees regardless of type', () => {
+  const allExceptContract = { appliesTo: { type: 'all', excludeEmploymentTypes: ['contract'] } };
+  assert.equal(matchesGroupAssignment(allExceptContract, { employmentType: 'permanent' }), true);
+  assert.equal(matchesGroupAssignment(allExceptContract, { employmentType: 'contract' }), false);
+
+  const deptExceptIntern = { appliesTo: { type: 'department', departments: ['Sales'], excludeEmploymentTypes: ['intern'] } };
+  assert.equal(matchesGroupAssignment(deptExceptIntern, { department: 'Sales', employmentType: 'permanent' }), true);
+  assert.equal(matchesGroupAssignment(deptExceptIntern, { department: 'Sales', employmentType: 'intern' }), false);
+});
+
+test('matchesGroupAssignment: excludeEmploymentTypes absent (every assignment before this extension) changes nothing — regression', () => {
+  const assignment = { appliesTo: { type: 'all' } };
+  assert.equal(matchesGroupAssignment(assignment, { employmentType: 'contract' }), true);
+  assert.equal(matchesGroupAssignment(assignment, {}), true);
 });
