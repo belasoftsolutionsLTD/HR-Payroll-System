@@ -77,12 +77,32 @@ function resolveConceptPass1({ emp, individualComps, groupAssignments, conceptBy
 }
 
 // ── Pass 2 — deductions needing adjustedGross + loans (evaluated, capped at remaining balance) ──
+//
+// Non-loan pass-2 deductions are further split into two ordered sub-passes because a
+// concept may declare `deductConceptCodesFromBase` (e.g. PAYE needing NSSF's amount
+// already subtracted from its taxable base) — depth-1 only, enforced at write time in
+// payrollConceptsFunctions.js, so this fixed two-sub-pass ordering is provably sufficient
+// and a general dependency graph/topological sort is unnecessary:
+//   2a — concepts with no dependency: evaluate normally, record resolvedByCode[code].
+//   2b — concepts that reference other codes: sum the referenced amounts from
+//        resolvedByCode (missing reference → warning, contributes 0, never throws),
+//        subtract that sum (floored at 0) from the relevant context variable, then evaluate.
+//
+// Any resolved deduction whose concept has `statutoryKey` set is moved into a separate
+// `statutoryItems` bucket instead of `deductionItemsPass2` — see resolveStatutoryLine in
+// payrollCyclesFunctions.js, which prefers this over the legacy taxCalc.calc*() output
+// when a concept claims that key. No concept has `statutoryKey` set until HR opts in, so
+// `statutoryItems` is always `[]` and `deductionItemsPass2`/`deductionTotalPass2` are
+// unchanged for every deployment that hasn't adopted this extension.
 function resolveConceptPass2({ emp, individualComps, groupAssignments, conceptById, context, loanApplications }) {
   const all = assignmentsForEmployee(emp, individualComps, groupAssignments);
 
   const deductionItemsPass2 = [];
+  const statutoryItems = [];
   const loanItems = [];
   const warnings = [];
+  const resolvedByCode = {};
+  const pass2Deductions = [];
 
   for (const a of all) {
     if (a.category !== 'deductions') continue;
@@ -105,19 +125,55 @@ function resolveConceptPass2({ emp, individualComps, groupAssignments, conceptBy
     }
 
     if (!PASS2_TYPES.has(concept.type)) continue; // already resolved in pass 1
+    pass2Deductions.push({ a, concept });
+  }
 
-    const { amount, warnings: w } = evaluateConceptAmount(concept, a, context);
-    if (w.length) warnings.push(...w.map((msg) => `${concept.name} (${emp.fullName || emp._id}): ${msg}`));
-    deductionItemsPass2.push({
+  const hasDependency = ({ concept }) =>
+    Array.isArray(concept.deductConceptCodesFromBase) && concept.deductConceptCodesFromBase.length > 0;
+  const sub2a = pass2Deductions.filter((x) => !hasDependency(x));
+  const sub2b = pass2Deductions.filter(hasDependency);
+
+  const recordResolved = ({ a, concept }, amount) => {
+    const item = {
       conceptId: a.conceptId, conceptName: a.conceptName || concept.name, conceptCode: a.conceptCode || concept.code,
       subCategory: a.subCategory || concept.subCategory, amount, source: a.scope === 'group' ? 'concept_group' : 'concept',
-    });
+    };
+    if (concept.code) resolvedByCode[concept.code] = amount;
+    if (concept.statutoryKey) {
+      statutoryItems.push({ statutoryKey: concept.statutoryKey, conceptId: a.conceptId, conceptName: item.conceptName, amount });
+    } else {
+      deductionItemsPass2.push(item);
+    }
+  };
+
+  for (const entry of sub2a) {
+    const { a, concept } = entry;
+    const { amount, warnings: w } = evaluateConceptAmount(concept, a, context);
+    if (w.length) warnings.push(...w.map((msg) => `${concept.name} (${emp.fullName || emp._id}): ${msg}`));
+    recordResolved(entry, amount);
+  }
+
+  for (const entry of sub2b) {
+    const { a, concept } = entry;
+    let baseDeduction = 0;
+    for (const refCode of concept.deductConceptCodesFromBase) {
+      if (Object.prototype.hasOwnProperty.call(resolvedByCode, refCode)) {
+        baseDeduction += resolvedByCode[refCode];
+      } else {
+        warnings.push(`${concept.name} (${emp.fullName || emp._id}): referenced concept code "${refCode}" was not resolved this cycle — treated as 0`);
+      }
+    }
+    const baseKey = concept.percentageOf || 'adjusted_gross';
+    const adjustedContext = { ...context, [baseKey]: Math.max(0, (Number(context[baseKey]) || 0) - baseDeduction) };
+    const { amount, warnings: w } = evaluateConceptAmount(concept, a, adjustedContext);
+    if (w.length) warnings.push(...w.map((msg) => `${concept.name} (${emp.fullName || emp._id}): ${msg}`));
+    recordResolved(entry, amount);
   }
 
   const deductionTotalPass2 = deductionItemsPass2.reduce((s, i) => s + i.amount, 0);
   const loanTotal = loanItems.reduce((s, i) => s + i.amount, 0);
 
-  return { deductionItemsPass2, deductionTotalPass2, loanItems, loanTotal, warnings };
+  return { deductionItemsPass2, deductionTotalPass2, statutoryItems, loanItems, loanTotal, warnings };
 }
 
 module.exports = { resolveConceptPass1, resolveConceptPass2 };
