@@ -9,3 +9,5 @@ dist/
 build/
 db-export/
 *.tar.gz
+*.zip
+.claude/worktrees/
