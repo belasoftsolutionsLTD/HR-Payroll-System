@@ -47,6 +47,7 @@ const dashboardRoutes     = require('./src/routes/dashboard/dashboard');
 const itRoutes            = require('./src/routes/it/it');
 const notificationRoutes  = require('./src/routes/notifications/notifications');
 const trainingRoutes      = require('./src/routes/training/training');
+const welfareRoutes       = require('./src/routes/welfare/welfare');
 
 const path = require('path');
 const app = express();
@@ -134,6 +135,7 @@ app.use('/api/dashboard',     decodeToken, getUserData, dashboardRoutes);
 app.use('/api/it',            decodeToken, getUserData, itRoutes);
 app.use('/api/notifications', decodeToken, getUserData, notificationRoutes);
 app.use('/api/training',      decodeToken, getUserData, trainingRoutes);
+app.use('/api/welfare',       decodeToken, getUserData, welfareRoutes);
 
 // ── Global error handler (must be last) ──────────────────────────────────────
 app.use(ErrorHandler);

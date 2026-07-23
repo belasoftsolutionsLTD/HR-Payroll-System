@@ -6,7 +6,7 @@ const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
 
 const { listConcepts, createConcept, updateConcept, deleteConcept, getConcept } = require('./payrollConceptsFunctions');
 const { getEmployeeCompensations, listEmployeeCompensationSummaries, addCompensation, assignConcept, updateCompensation, removeCompensation, getCompensationAuditLog } = require('./payrollCompensationsFunctions');
-const { listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult, emailPayslips, downloadP9Form } = require('./payrollCyclesFunctions');
+const { listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles, getCycleResults, getCycleExceptions, approveEmployees, lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult, emailPayslips, downloadP9Form, downloadPayslipsZip } = require('./payrollCyclesFunctions');
 const { getMyPayslips, downloadPayslipPDF, getPayslip, getEmployeePayslips } = require('./payrollPayslipsFunctions');
 const { getPayrollAnalytics } = require('./payrollAnalyticsFunctions');
 
@@ -44,6 +44,7 @@ router.post('/cycles/:id/close',                    hrOnly, AsyncHandler(closeCy
 router.get('/cycles/:id/export',                    hrOnly, AsyncHandler(exportCycleCSV));
 router.get('/cycles/:id/bank-file',                 hrOnly, AsyncHandler(exportBankFile));
 router.post('/cycles/:id/email-payslips',           hrOnly, AsyncHandler(emailPayslips));
+router.get('/cycles/:cycleId/payslips/zip',         hrOnly, AsyncHandler(downloadPayslipsZip));
 
 // ── Payroll Results ───────────────────────────────────────────────────────────
 router.get('/results/:cycleId/:employeeId',         hrOnly, AsyncHandler(getEmployeeResult));

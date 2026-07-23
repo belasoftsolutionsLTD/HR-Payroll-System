@@ -12,6 +12,7 @@ const {
   getLeaveBalances, getEmployeeLeaveBalances, adjustLeaveBalance,
   listLeaveRequests, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
   approveLeaveRequest, rejectLeaveRequest, cancelLeaveRequest,
+  counterOfferLeaveRequest, acceptCounterOffer, disputeCounterOffer,
   revokeLeaveRequest, disputeLeaveRequest, resolveDispute,
   getLeaveCalendar, getPayrollFeed, markPayrollFeedProcessed, getLeaveAnalytics,
   listBlackouts, addBlackout, deleteBlackout,
@@ -76,6 +77,11 @@ router.patch('/requests/:id/reject',       allRoles, AsyncHandler(rejectLeaveReq
 router.patch('/requests/:id/cancel',       allRoles, AsyncHandler(cancelLeaveRequest));
 router.patch('/requests/:id/revoke',       hrOnly, AsyncHandler(revokeLeaveRequest));
 router.patch('/requests/:id/resolve-dispute', hrOnly, AsyncHandler(resolveDispute));
+router.post('/requests/:id/counter-offer',    hrOnly, AsyncHandler(counterOfferLeaveRequest));
+// Ownership (must be the requesting employee) is enforced inside the handler via
+// an employeeId-scoped query filter, matching /my/requests/:id/dispute's pattern.
+router.post('/requests/:id/accept-counter',   allRoles, AsyncHandler(acceptCounterOffer));
+router.post('/requests/:id/dispute-counter',  allRoles, AsyncHandler(disputeCounterOffer));
 
 // ── Public Holidays — HR manages, all roles can view ────────────────────────────
 router.post('/public-holidays',       hrOnly, AsyncHandler(createPublicHoliday));

@@ -76,10 +76,17 @@ router.get('/company-info', async (req, res) => {
   }
 });
 
+// A requisition with a past applicationDeadline is treated as closed immediately, even
+// before the daily cron (closeExpiredRequisitions) has flipped its status — this filter
+// is the real-time guarantee, the cron is just what makes the change visible in HR's own
+// requisition list/status field too. Must be a function, not a static object — a plain
+// object literal would capture `new Date()` once at server startup and never advance.
+const notExpired = () => ({ $or: [{ applicationDeadline: null }, { applicationDeadline: { $gte: new Date() } }] });
+
 // GET /api/public/jobs — open requisitions for the careers site (no auth)
 router.get('/jobs', async (req, res) => {
   try {
-    const filter = { status: 'open' };
+    const filter = { status: 'open', ...notExpired() };
     if (req.query.department) filter.department = req.query.department;
     if (req.query.location) filter.location = req.query.location;
     const jobs = await findMany('jobRequisitions', filter, { sort: { createdAt: -1 } });
@@ -92,7 +99,7 @@ router.get('/jobs', async (req, res) => {
 // GET /api/public/jobs/:id — job detail (no auth)
 router.get('/jobs/:id', async (req, res) => {
   try {
-    const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open' });
+    const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open', ...notExpired() });
     if (!job) return returnFunction(res, 404, false, 'Job not found or closed');
     return returnFunction(res, 200, true, 'OK', job);
   } catch (e) {
@@ -114,7 +121,7 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
   try {
     if (!validateRequiredFields(req, res, ['firstName', 'lastName', 'email'])) return;
 
-    const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open' });
+    const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open', ...notExpired() });
     if (!requisition) return returnFunction(res, 404, false, 'Job not found or closed');
     if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'This job is not currently accepting applications.');
 

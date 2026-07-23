@@ -315,6 +315,19 @@ const completeTask = async (req, res) => {
     { $set: { status: 'not_started', updatedAt: new Date() } }
   );
 
+  // Approval-type tasks have a dedicated approverId field that nothing in the codebase
+  // ever notified — the assignee could mark it complete and the approver would never
+  // know a decision was waiting on them. (Note: there's no createdBy id on a task, only
+  // an assignedBy display-name string, so the assignee's own manager/creator can't be
+  // notified the same way — approverId is the one reliable id this schema has.)
+  if (task.type === 'approval' && task.approverId) {
+    notifyEmployee(task.approverId, {
+      title: 'Task completed — awaiting your approval',
+      body: `"${task.title}" was marked complete by ${req.user?.name || 'the assignee'} and needs your sign-off.`,
+      type: 'general',
+    }).catch(() => {});
+  }
+
   return returnFunction(res, 200, true, 'Task completed.');
 };
 

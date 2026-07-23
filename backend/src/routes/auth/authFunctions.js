@@ -90,6 +90,7 @@ const logout = async (req, res) => {
   return returnFunction(res, 200, true, 'Logged out successfully.');
 };
 
+// Disabled — unauthenticated endpoint that hardcodes hr_manager role. Use POST /auth/accounts instead.
 const register = async (req, res) => {
   const locale = req.locale;
 

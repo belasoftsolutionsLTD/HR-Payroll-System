@@ -5,7 +5,8 @@ const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../
 const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
 
 // ── HR: create announcement ───────────────────────────────────────────────────
-// audiences: array — any combo of 'all' | 'staff' | 'department_head' | 'department:<name>' | 'hr_only'
+// audiences: array — any combo of 'all' | 'staff' | 'department_head' | 'hr_only' |
+// 'department:<name>' | 'employee:<employeeId>' | 'jobGroup:<jobGroupId>' | 'employmentType:<type>'
 // type: 'news' | 'alert' | 'campaign' (defaults to 'news')
 const createAnnouncement = async (req, res) => {
   if (!validateRequiredFields(req, res, ['title', 'body'])) return;
@@ -36,6 +37,11 @@ const createAnnouncement = async (req, res) => {
   const deptTargets = audiences.filter(a => a.startsWith('department:')).map(a => a.replace('department:', ''));
   if (deptTargets.length === 1) doc.department = deptTargets[0];
 
+  // Same 'prefix:value' convention for the newer targeting dimensions.
+  const empTargets = audiences.filter(a => a.startsWith('employee:')).map(a => a.replace('employee:', ''));
+  const jobGroupTargets = audiences.filter(a => a.startsWith('jobGroup:')).map(a => a.replace('jobGroup:', ''));
+  const employmentTypeTargets = audiences.filter(a => a.startsWith('employmentType:')).map(a => a.replace('employmentType:', ''));
+
   const result = await insertOne('announcements', doc);
 
   const notifySnippet = body.substring(0, 120) + (body.length > 120 ? '…' : '');
@@ -59,6 +65,20 @@ const createAnnouncement = async (req, res) => {
       const emps = await findMany('employees', { department: dept, status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
       emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
     }
+    // Specific employees
+    for (const empId of empTargets) {
+      notifyEmployee(empId, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {});
+    }
+    // Job groups
+    for (const jgId of jobGroupTargets) {
+      const emps = await findMany('employees', { jobGroupId: new ObjectId(jgId), status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
+      emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
+    }
+    // Employment types
+    for (const et of employmentTypeTargets) {
+      const emps = await findMany('employees', { employmentType: et, status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
+      emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
+    }
   }
 
   return returnFunction(res, 201, true, 'Announcement published.', { _id: result.insertedId });
@@ -79,21 +99,35 @@ const deleteAnnouncement = async (req, res) => {
 };
 
 // ── Staff: get announcements visible to them ──────────────────────────────────
+// Matches directly against the stored `audiences` array (Mongo matches an array field
+// against a scalar by containment) rather than the derived legacy `audience` singular
+// field, so every targeting dimension HR can pick from actually becomes visible here.
 const getMyAnnouncements = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
 
-  const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1 } });
+  const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1, jobGroupId: 1, employmentType: 1 } });
   const dept = emp?.department;
 
-  const filter = {
-    $or: [
-      { audience: 'all' },
-      { audience: 'staff' },
-      ...(dept ? [{ audience: 'department', department: dept }] : []),
-    ],
-  };
+  const orClauses = [
+    { audiences: 'all' },
+    { audiences: 'staff' },
+    { audiences: `employee:${String(req.user.employeeId)}` },
+    // Legacy fallback — any announcement written before the `audiences` array existed
+    // only has these singular fields set, and would otherwise match nothing above and
+    // silently vanish from every staff member's view.
+    { audience: 'all' },
+    { audience: 'staff' },
+  ];
+  if (dept) {
+    orClauses.push({ audiences: `department:${dept}` });
+    orClauses.push({ audience: 'department', department: dept });
+  }
+  if (emp?.jobGroupId) orClauses.push({ audiences: `jobGroup:${String(emp.jobGroupId)}` });
+  if (emp?.employmentType) orClauses.push({ audiences: `employmentType:${emp.employmentType}` });
+  if (req.user.role === 'department_head') orClauses.push({ audiences: 'department_head' });
+  if (['hr_manager', 'super_admin'].includes(req.user.role)) orClauses.push({ audiences: 'hr_only' });
 
-  const announcements = await findMany('announcements', filter, { sort: { createdAt: -1 }, limit: 30 });
+  const announcements = await findMany('announcements', { $or: orClauses }, { sort: { createdAt: -1 }, limit: 30 });
 
   // Attach read status for this user
   const userId = String(req.user._id);

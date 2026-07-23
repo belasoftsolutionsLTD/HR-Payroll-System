@@ -302,6 +302,71 @@ async function autoMarkAbsent() {
   if (onLeaveNoRecordIds.length) console.log(`[CRON] Auto-marked ${onLeaveNoRecordIds.length} employee(s) as onLeave for ${todayStr}`);
 }
 
+// Leave: 3-day advance reminder before an approved leave starts. Matches by
+// calendar date only (a UTC day range), not time-of-day. leaveStartReminderSent
+// guards against re-sending on the next run once a request has been notified.
+async function leaveStartReminder() {
+  if (!global.dbo) return;
+  const target = new Date();
+  target.setUTCDate(target.getUTCDate() + 3);
+  const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
+  const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+  const upcoming = await global.dbo.collection('leave_requests').find({
+    status: 'approved',
+    startDate: { $gte: dayStart, $lt: dayEnd },
+    leaveStartReminderSent: { $ne: true },
+  }).toArray();
+  if (!upcoming.length) return;
+
+  const leaveTypeIds = [...new Set(upcoming.map(r => String(r.leaveTypeId)))].map(id => new ObjectId(id));
+  const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }, { projection: { name: 1 } }).toArray();
+  const nameById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t.name]));
+
+  for (const r of upcoming) {
+    const dateStr = new Date(r.startDate).toISOString().split('T')[0];
+    notifyEmployee(r.employeeId, {
+      title: 'Upcoming Leave',
+      body: `Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.`,
+      type: 'leave',
+    }).catch(() => {});
+    await global.dbo.collection('leave_requests').updateOne({ _id: r._id }, { $set: { leaveStartReminderSent: true, updatedAt: new Date() } });
+  }
+  console.log(`[CRON] Sent ${upcoming.length} leave-start reminder(s)`);
+}
+
+// Leave: "welcome back" reminder 3 days after an approved leave ended. Same
+// date-only matching + sent-flag guard as leaveStartReminder above.
+async function leaveEndReminder() {
+  if (!global.dbo) return;
+  const target = new Date();
+  target.setUTCDate(target.getUTCDate() - 3);
+  const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
+  const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+  const ended = await global.dbo.collection('leave_requests').find({
+    status: 'approved',
+    endDate: { $gte: dayStart, $lt: dayEnd },
+    leaveEndReminderSent: { $ne: true },
+  }).toArray();
+  if (!ended.length) return;
+
+  const leaveTypeIds = [...new Set(ended.map(r => String(r.leaveTypeId)))].map(id => new ObjectId(id));
+  const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }, { projection: { name: 1 } }).toArray();
+  const nameById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t.name]));
+
+  for (const r of ended) {
+    const dateStr = new Date(r.endDate).toISOString().split('T')[0];
+    notifyEmployee(r.employeeId, {
+      title: 'Welcome Back',
+      body: `Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.`,
+      type: 'leave',
+    }).catch(() => {});
+    await global.dbo.collection('leave_requests').updateOne({ _id: r._id }, { $set: { leaveEndReminderSent: true, updatedAt: new Date() } });
+  }
+  console.log(`[CRON] Sent ${ended.length} leave-end reminder(s)`);
+}
+
 // ── Training / LMS: overdue detection + automation rule engine ────────────────
 
 async function checkOverdueTraining() {
@@ -337,6 +402,21 @@ async function checkOverdueTraining() {
   }
 
   console.log(`[CRON] Marked ${overdue.length} training enrollment(s) overdue`);
+}
+
+// Flip 'open' requisitions past their applicationDeadline to 'closed'. The public/
+// internal application routes already reject expired-but-still-open requisitions
+// in real time (see the notExpired() filter in publicRoutes.js / meFunctions.js) —
+// this is what makes that reflected in HR's own requisition list/status field too.
+async function closeExpiredRequisitions() {
+  if (!global.dbo) return;
+  const result = await global.dbo.collection('jobRequisitions').updateMany(
+    { status: 'open', applicationDeadline: { $ne: null, $lt: new Date() } },
+    { $set: { status: 'closed', updatedAt: new Date() } }
+  );
+  if (result.modifiedCount > 0) {
+    console.log(`[CRON] Auto-closed ${result.modifiedCount} requisition(s) past their application deadline`);
+  }
 }
 
 async function runTrainingAutomationRules() {
@@ -408,10 +488,24 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Training overdue check error:', err); }
   });
 
+  // Daily at 08:00 UTC — leave-start (3 days ahead) and leave-end (3 days after) reminders
+  cron.schedule('0 8 * * *', async () => {
+    try { await leaveStartReminder(); }
+    catch (err) { console.error('[CRON] Leave start reminder error:', err); }
+    try { await leaveEndReminder(); }
+    catch (err) { console.error('[CRON] Leave end reminder error:', err); }
+  });
+
   // Daily at 08:15 UTC — run due "scheduled" and "onCertExpiry" training assignment rules
   cron.schedule('15 8 * * *', async () => {
     try { await runTrainingAutomationRules(); }
     catch (err) { console.error('[CRON] Training automation rule error:', err); }
+  });
+
+  // Daily at 00:15 UTC — auto-close requisitions past their application deadline
+  cron.schedule('15 0 * * *', async () => {
+    try { await closeExpiredRequisitions(); }
+    catch (err) { console.error('[CRON] Requisition auto-close error:', err); }
   });
 
   // Daily at 06:00 UTC — run due weekly/monthly scheduled custom reports and email them
@@ -423,4 +517,4 @@ function startCronJobs() {
   console.log('[CRON] All cron jobs scheduled');
 }
 
-module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, autoMarkAbsent, markLateArrivals, detectMissedClockOuts };
+module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, autoMarkAbsent, markLateArrivals, detectMissedClockOuts, closeExpiredRequisitions, leaveStartReminder, leaveEndReminder };

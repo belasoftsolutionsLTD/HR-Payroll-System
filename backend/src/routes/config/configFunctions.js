@@ -38,11 +38,23 @@ const makeDelete = (collection) => async (req, res) => {
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
+const makeBulkDelete = (collection) => async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || !ids.length) {
+    return returnFunction(res, 400, false, 'ids must be a non-empty array.');
+  }
+  const result = await global.dbo.collection(collection).deleteMany({
+    _id: { $in: ids.map((id) => new ObjectId(id)) },
+  });
+  return returnFunction(res, 200, true, `${result.deletedCount} deleted.`, { deletedCount: result.deletedCount });
+};
+
 // ── Departments ──────────────────────────────────────────────────────────────
 const listDepartments  = makeList('departments');
 const createDepartment = makeCreate('departments', ['name']);
 const updateDepartment = makeUpdate('departments');
 const deleteDepartment = makeDelete('departments');
+const bulkDeleteDepartments = makeBulkDelete('departments');
 
 // ── Job Groups (with salary range) ───────────────────────────────────────────
 const listJobGroups = makeList('job_groups');
@@ -211,7 +223,7 @@ const updateCommunicationSettings = async (req, res) => {
 };
 
 module.exports = {
-  listDepartments, createDepartment, updateDepartment, deleteDepartment,
+  listDepartments, createDepartment, updateDepartment, deleteDepartment, bulkDeleteDepartments,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,
