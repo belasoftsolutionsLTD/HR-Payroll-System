@@ -2,8 +2,9 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, aggregate } = require('../../functions/Database/commonDBFunctions');
-const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
 const { evaluateRulesForUser } = require('../../lib/training/autoEnrollment');
+const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
 
 // ── Existing appraisal functions (keep) ───────────────────────────────────────
 
@@ -36,14 +37,34 @@ const createAppraisal = async (req, res) => {
     return returnFunction(res, 400, false, 'Review period must be Q1, Q2, Q3, or Q4 (optionally with a year, e.g. "Q1 2025").');
   }
 
+  // Normalize to a dedup key (quarter + year, defaulting to the current year when the
+  // caller didn't specify one) so "Q1" and "Q1 2025" for the same actual quarter can't
+  // both slip through as separate records.
+  const yearMatch = req.body.reviewPeriod.match(/(\d{4})/);
+  const periodKey = `${periodBase} ${yearMatch ? yearMatch[1] : new Date().getFullYear()}`;
+
+  // Only one non-rejected appraisal per employee per quarter — a rejected one may be
+  // redone, so it doesn't block a resubmission for the same period.
+  const duplicate = await findOne('appraisal_records', {
+    employeeId: new ObjectId(req.body.employeeId), periodKey, status: { $ne: 'rejected' },
+  });
+  if (duplicate) return returnFunction(res, 409, false, `An appraisal for ${periodKey} already exists for this employee.`);
+
+  // HR authoring an appraisal directly is final immediately (no one above HR to review
+  // it); a department_head's appraisal is submitted for HR review before it counts.
+  const status = _isHR(req.user.role) ? 'approved' : 'submitted';
+
   const doc = {
     employeeId: new ObjectId(req.body.employeeId),
     reviewPeriod: req.body.reviewPeriod,
+    periodKey,
     reviewerId: new ObjectId(req.user._id),
     goalsSet: req.body.goalsSet || [],
     goalsAchieved: req.body.goalsAchieved || [],
     rating,
     comments: req.body.comments || null,
+    status,
+    reviewedBy: null, reviewedAt: null, reviewComment: null,
     createdAt: new Date(),
   };
   const result = await insertOne('appraisal_records', doc);
@@ -51,20 +72,75 @@ const createAppraisal = async (req, res) => {
   const employee = await findOne('employees', { _id: new ObjectId(req.body.employeeId) }, { projection: { fullName: 1 } });
   const empName = employee?.fullName ?? 'An employee';
   const ratingLabel = ['', 'Unsatisfactory', 'Needs Improvement', 'Meets Expectations', 'Exceeds Expectations', 'Outstanding'][doc.rating] ?? `${doc.rating}/5`;
+  const employeeMessage = status === 'approved'
+    ? `Your appraisal for ${doc.reviewPeriod} has been recorded — ${ratingLabel}.`
+    : `Your appraisal for ${doc.reviewPeriod} has been submitted for HR review — ${ratingLabel}.`;
 
   notifyEmployee(req.body.employeeId, {
     title: 'New Appraisal Recorded',
-    body: `Your appraisal for ${doc.reviewPeriod} has been submitted — ${ratingLabel}.`,
+    body: employeeMessage,
     type: 'general',
-  });
+  }).catch(() => {});
 
   notifyByRoles(['hr_manager', 'super_admin'], {
-    title: 'Appraisal Submitted',
+    title: status === 'submitted' ? 'Appraisal Awaiting Review' : 'Appraisal Submitted',
     body: `${req.user.name ?? 'Dept Head'} submitted an appraisal for ${empName} (${doc.reviewPeriod}) — ${ratingLabel}.`,
     type: 'general',
-  });
+  }).catch(() => {});
+
+  const employeeUser = await findOne('users', { employeeId: new ObjectId(req.body.employeeId) }, { projection: { email: 1 } });
+  if (employeeUser?.email) {
+    sendTemplatedEmail({
+      trigger: 'appraisalSubmitted',
+      to: employeeUser.email,
+      tokens: { employeeName: empName, period: doc.reviewPeriod, rating: ratingLabel },
+      fallbackSubject: `Your Appraisal — ${doc.reviewPeriod}`,
+      fallbackHtml: `<p>Dear ${empName},</p><p>${employeeMessage}</p>`,
+    }).catch(() => {});
+  }
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+// HR approves or rejects a department_head's submitted appraisal. A rejected appraisal
+// can be resubmitted for the same period (the duplicate guard above excludes 'rejected'),
+// an approved one is final.
+const reviewAppraisal = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['decision'])) return;
+  const { decision, comment } = req.body;
+  if (!['approved', 'rejected'].includes(decision)) {
+    return returnFunction(res, 400, false, 'Decision must be "approved" or "rejected".');
+  }
+
+  const existing = await findOne('appraisal_records', { _id: new ObjectId(req.params.id) });
+  if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+  if (existing.status !== 'submitted') {
+    return returnFunction(res, 400, false, 'Only appraisals awaiting review can be approved or rejected.');
+  }
+
+  await updateOne('appraisal_records', { _id: existing._id }, {
+    $set: { status: decision, reviewedBy: new ObjectId(req.user._id), reviewedAt: new Date(), reviewComment: comment || null },
+  });
+
+  const employee = await findOne('employees', { _id: existing.employeeId }, { projection: { fullName: 1 } });
+  const empName = employee?.fullName ?? 'the employee';
+
+  notifyEmployee(existing.employeeId, {
+    title: decision === 'approved' ? 'Appraisal Approved' : 'Appraisal Rejected',
+    body: decision === 'approved'
+      ? `Your appraisal for ${existing.reviewPeriod} has been approved by HR.`
+      : `Your appraisal for ${existing.reviewPeriod} was rejected by HR and will need to be redone.${comment ? ` Reason: ${comment}` : ''}`,
+    type: 'general',
+  }).catch(() => {});
+
+  // Let the department_head who submitted it know the outcome of their submission too.
+  notifyUser(existing.reviewerId, {
+    title: decision === 'approved' ? 'Appraisal Approved' : 'Appraisal Rejected',
+    body: `Your submitted appraisal for ${empName} (${existing.reviewPeriod}) was ${decision} by HR.${comment ? ` Comment: ${comment}` : ''}`,
+    type: 'general',
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, `Appraisal ${decision}.`);
 };
 
 const updateAppraisal = async (req, res) => {
@@ -74,8 +150,20 @@ const updateAppraisal = async (req, res) => {
   if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(existing.employeeId))) {
     return returnFunction(res, 403, false, "You are not authorized to edit this employee's appraisal.");
   }
+  // An approved appraisal is final — only HR may still correct it (administrative
+  // correction, same exception this module already makes elsewhere for HR).
+  if (existing.status === 'approved' && !_isHR(req.user.role)) {
+    return returnFunction(res, 403, false, 'An approved appraisal can only be edited by HR.');
+  }
   const update = { ...req.body };
-  delete update._id;
+  // Status transitions are only valid through reviewAppraisal (the HR approve/reject gate)
+  // — otherwise a department_head could just PATCH their own submission straight to
+  // 'approved' and bypass review entirely. employeeId/reviewerId are stripped too — the
+  // scope check above validates against `existing.employeeId` BEFORE the update is
+  // applied, so leaving either writable would let the body silently reassign this
+  // appraisal to a different employee/reviewer outside the caller's own scope.
+  delete update._id; delete update.status; delete update.reviewedBy; delete update.reviewedAt;
+  delete update.reviewComment; delete update.periodKey; delete update.employeeId; delete update.reviewerId;
   if (update.rating) update.rating = parseInt(update.rating);
   await updateOne('appraisal_records', { _id: existing._id }, { $set: update });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
@@ -1450,6 +1538,7 @@ module.exports = {
   // Legacy appraisal
   getEmployeePerformance,
   createAppraisal,
+  reviewAppraisal,
   updateAppraisal,
   getPerformanceAlerts,
   // Goals

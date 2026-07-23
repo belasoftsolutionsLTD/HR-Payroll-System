@@ -8,7 +8,7 @@ const VALID_TYPES      = ['fixed', 'variable', 'percentage', 'formula', 'bracket
 
 const SUB_CATEGORY_MAP = {
   earnings:                ['fixed_pay', 'variable_pay', 'benefits_in_kind', 'bonus', 'allowance'],
-  deductions:              ['tax', 'social_security', 'other_withholding', 'loans'],
+  deductions:              ['tax', 'social_security', 'other_withholding', 'loans', 'welfare'],
   benefits:                ['meals_transport', 'health', 'childcare', 'training', 'wellness'],
   employer_contributions:  ['employer_contribution'],
 };

@@ -3,7 +3,7 @@ const router = express.Router();
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
-  getEmployeePerformance, createAppraisal, updateAppraisal, getPerformanceAlerts,
+  getEmployeePerformance, createAppraisal, reviewAppraisal, updateAppraisal, getPerformanceAlerts,
   listGoals, createGoal, getGoal, updateGoal, deleteGoal, addCheckin, addGoalComment,
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate,
   listCycles, createCycle, getCycle, updateCycle, launchCycle, closeCycle, assignPeerReviewers,
@@ -99,6 +99,7 @@ router.get('/alerts', allowRoles(MGMT), AsyncHandler(getPerformanceAlerts));
 // ── Legacy appraisal routes (generic catch-all last) ─────────────────────────
 router.get('/:employeeId', allowRoles(MGMT), AsyncHandler(getEmployeePerformance));
 router.post('/',           allowRoles(MGMT), AsyncHandler(createAppraisal));
+router.patch('/:id/review', allowRoles(HR),  AsyncHandler(reviewAppraisal));
 router.put('/:id',         allowRoles(MGMT), AsyncHandler(updateAppraisal));
 
 module.exports = router;

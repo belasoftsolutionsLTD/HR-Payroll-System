@@ -7,6 +7,7 @@ const { HR_ROLES, ALL_ROLES } = require('../../constants/roles');
 const {
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, uploadTemplateResource,
   createRecord, listRecords, getRecord, updateRecordTask, addRecordTask, updateWelcome,
+  setRecordCompensation,
   getMyOnboarding, updateMyTask, uploadMyDocument, uploadRecordDocument, updateMeetTheTeam,
   listRecordDocuments, verifyDocument, getAnalytics,
 } = require('./onboardingFunctions');
@@ -54,6 +55,7 @@ router.post('/records/:id/document',       hrOnly, upload.single('file'), AsyncH
 router.patch('/records/:id/task',          hrOnly, AsyncHandler(updateRecordTask));
 router.post('/records/:id/task',           hrOnly, AsyncHandler(addRecordTask));
 router.patch('/records/:id/welcome',       hrOnly, AsyncHandler(updateWelcome));
+router.patch('/records/:id/compensation',  hrOnly, AsyncHandler(setRecordCompensation));
 router.patch('/documents/:id/verify',      hrOnly, AsyncHandler(verifyDocument));
 
 // ── Analytics ──────────────────────────────────────────────────────────────────

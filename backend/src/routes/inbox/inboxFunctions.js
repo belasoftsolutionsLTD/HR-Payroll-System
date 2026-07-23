@@ -130,6 +130,17 @@ const getInboxItem = async (req, res) => {
       const emp = await findOne('employees', { _id: referenceData.employeeId });
       referenceData = { ...referenceData, employee: emp || null };
     }
+
+    // Leave requests store leaveTypeId/totalDays, but LeaveDetail (frontend) reads
+    // ref.leaveType (a name string) and ref.numberOfDays — map the raw doc's fields
+    // onto what the detail card actually expects, same idea as enrichRequest() in
+    // leaveFunctions.js but scoped to just the two mismatched field names.
+    if (item.type === 'leave' && item.referenceModel === 'leave_requests' && referenceData) {
+      const leaveType = referenceData.leaveTypeId
+        ? await findOne('leave_types', { _id: referenceData.leaveTypeId }, { projection: { name: 1 } })
+        : null;
+      referenceData = { ...referenceData, leaveType: leaveType?.name ?? null, numberOfDays: referenceData.totalDays };
+    }
   }
 
   return returnFunction(res, 200, true, req.locale.success, { ...item, referenceData });

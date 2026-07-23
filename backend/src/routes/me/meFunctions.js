@@ -8,6 +8,7 @@ const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpe
 
 const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { notifyHR } = require('../inbox/inboxFunctions');
+const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { getEmployeePayslipRecords } = require('../payroll/payrollPayslipsFunctions');
 
 // Kenyan mobile format: 254 followed by 9 digits, Safaricom/Airtel/Telkom ranges start with 7 or 1.
@@ -371,8 +372,15 @@ const getMyTasks = async (req, res) => {
 // Backed by the recruitment module's jobRequisitions/candidates/applications collections
 // (see backend/src/routes/recruitment/recruitmentFunctions.js) rather than the legacy
 // job_positions/applicants collections.
+// A requisition with a past applicationDeadline is closed immediately, even before the
+// daily closeExpiredRequisitions cron has flipped its status field — same real-time
+// guarantee as the public careers-site routes (publicRoutes.js). Must be a function, not
+// a static object — a plain object literal would capture `new Date()` once at server
+// startup and never advance.
+const notExpired = () => ({ $or: [{ applicationDeadline: null }, { applicationDeadline: { $gte: new Date() } }] });
+
 const getOpenPositions = async (req, res) => {
-  const positions = await findMany('jobRequisitions', { status: 'open' }, { sort: { createdAt: -1 } });
+  const positions = await findMany('jobRequisitions', { status: 'open', ...notExpired() }, { sort: { createdAt: -1 } });
   return returnFunction(res, 200, true, 'OK', positions);
 };
 
@@ -381,7 +389,7 @@ const applyInternal = async (req, res) => {
   const employee = await findOne('employees', { _id: req.user.employeeId });
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.positionId), status: 'open' });
+  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.positionId), status: 'open', ...notExpired() });
   if (!requisition) return returnFunction(res, 404, false, 'Position not found or no longer open.');
   if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'This position is not currently accepting applications.');
 
@@ -418,7 +426,7 @@ const applyInternal = async (req, res) => {
 
   const firstStage = requisition.pipelineStages[0];
   const now = new Date();
-  await insertOne('applications', {
+  const result = await insertOne('applications', {
     candidateId: candidate._id,
     requisitionId: requisition._id,
     currentStageId: firstStage.id,
@@ -444,6 +452,22 @@ const applyInternal = async (req, res) => {
       fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>Thank you for applying to ${tokens.jobTitle}. Our team will review your application and be in touch soon.</p><p>Regards,<br/>${tokens.companyName}</p>`,
     }).catch(() => {});
   }
+
+  // The external careers-site application flow (publicRoutes.js) notifies HR — this
+  // internal-employee equivalent never did, so an internal application could sit
+  // unnoticed indefinitely. Mirrors that flow exactly.
+  notifyHR({
+    type: 'recruitment', subType: 'new_application',
+    title: 'New Internal Application Received',
+    subtitle: `${employee.fullName} applied for ${requisition.title}.`,
+    referenceId: result.insertedId, referenceModel: 'applications',
+    requiresAction: true, triggeredBy: req.user._id,
+  }).catch(() => {});
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'New Internal Application Received',
+    body: `${employee.fullName} applied for ${requisition.title}.`,
+    type: 'recruitment',
+  }).catch(() => {});
 
   return returnFunction(res, 201, true, 'Application submitted successfully.');
 };

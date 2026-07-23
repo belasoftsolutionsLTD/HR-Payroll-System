@@ -19,7 +19,8 @@ const loginLimiter = rateLimit({
 
 // ── Public ─────────────────────────────────────────────────────────────────────
 router.post('/login',           loginLimiter, AsyncHandler(login));
-router.post('/register',                      AsyncHandler(register));
+// Disabled — unauthenticated endpoint that hardcodes hr_manager role. Use POST /auth/accounts instead.
+// router.post('/register',                      AsyncHandler(register));
 router.post('/refresh',                       AsyncHandler(refreshAccessToken));
 router.post('/mfa/complete',   loginLimiter,  AsyncHandler(completeMfaLogin));
 router.post('/forgot-password', loginLimiter, AsyncHandler(forgotPassword));

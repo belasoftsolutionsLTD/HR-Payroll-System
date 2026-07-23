@@ -3,8 +3,14 @@ const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { initiateOnboarding, notifyStakeholder } = require('../../lib/onboarding/autoAssignTasks');
+const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
+const { matchesGroupAssignment } = require('../../lib/payroll/conceptTargeting');
+const { logJobHistoryChange } = require('../employees/employeesFunctions');
+
+const PAYMENT_METHODS = ['bank_transfer', 'mpesa', 'cash', 'paypal', 'crypto'];
+const MPESA_NUMBER_REGEX = /^254(7|1)\d{8}$/;
 
 const HR_ROLE_LIST = ['super_admin', 'hr_manager'];
 const isHR = (req) => HR_ROLE_LIST.includes(req.user?.role);
@@ -30,6 +36,23 @@ const computeProgress = (record) => {
 const enrichEmployee = async (record) => {
   const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } });
   return { ...record, employee: employee || null };
+};
+
+// Read-only preview of the job-group-scoped Concepts (allowances/benefits) that will
+// automatically apply to this employee at their next payroll run — these need no
+// per-employee assignment (see resolveConceptPass1's groupAssignments handling), so
+// this is purely informational for HR during onboarding, not an action to take.
+const getGroupAllowancesPreview = async (employee) => {
+  if (!employee?.jobGroupId) return [];
+  const groupAssignments = await findMany('employee_compensations', { scope: 'group', isActive: true }, {});
+  const matching = groupAssignments.filter((a) => matchesGroupAssignment(a, employee));
+  if (!matching.length) return [];
+  const conceptIds = matching.map((a) => a.conceptId);
+  const activeConcepts = await findMany('payroll_concepts', { _id: { $in: conceptIds }, isActive: true }, { projection: { _id: 1 } });
+  const activeIds = new Set(activeConcepts.map((c) => String(c._id)));
+  return matching
+    .filter((a) => activeIds.has(String(a.conceptId)))
+    .map((a) => ({ conceptId: a.conceptId, conceptName: a.conceptName, category: a.category, subCategory: a.subCategory, amount: a.amount }));
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -172,7 +195,85 @@ const getRecord = async (req, res) => {
   const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
   const enriched = await enrichEmployee(computeProgress(record));
-  return returnFunction(res, 200, true, req.locale.success, enriched);
+
+  // Full compensation fields for the onboarding compensation step (enrichEmployee's own
+  // projection intentionally stays lean for the list view — this only runs on the
+  // single-record detail fetch).
+  const employeeComp = await findOne('employees', { _id: record.employeeId },
+    { projection: { jobGroupId: 1, grossPay: 1, paymentMethod: 1, bankName: 1, bankAccountNumber: 1, mpesaNumber: 1 } });
+  const groupAllowancesPreview = await getGroupAllowancesPreview(employeeComp);
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    ...enriched,
+    compensationSetup: record.compensationSetup || null,
+    employeeCompensation: employeeComp || null,
+    groupAllowancesPreview,
+  });
+};
+
+// HR captures gross pay + payment method as part of the onboarding flow itself
+// (previously only ever set at employee creation, with nothing in onboarding forcing
+// or tracking it). Writes straight onto the employees document — same fields, same
+// syncBasicPayCompensation call — updateEmployee already uses, so payroll sees this
+// employee as immediately ready once onboarding captures it, and separately stamps
+// the onboarding record's own compensationSetup for tracking/display.
+const setRecordCompensation = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['grossPay', 'paymentMethod'])) return;
+  const { grossPay, paymentMethod, bankName, bankAccountNumber, mpesaNumber } = req.body;
+
+  if (!PAYMENT_METHODS.includes(paymentMethod)) {
+    return returnFunction(res, 400, false, `paymentMethod must be one of: ${PAYMENT_METHODS.join(', ')}.`);
+  }
+  const numericGrossPay = Number(grossPay);
+  if (!(numericGrossPay > 0)) return returnFunction(res, 400, false, 'grossPay must be greater than 0.');
+  if (paymentMethod === 'mpesa' && !MPESA_NUMBER_REGEX.test(String(mpesaNumber || '').trim())) {
+    return returnFunction(res, 400, false, 'M-Pesa number must start with 254 and be a valid Kenyan mobile number (e.g. 254712345678).');
+  }
+  if (paymentMethod === 'bank_transfer' && (!bankName || !bankAccountNumber)) {
+    return returnFunction(res, 400, false, 'bankName and bankAccountNumber are required for bank transfer.');
+  }
+
+  const record = await findOne('onboarding_records', { _id: new ObjectId(req.params.id) });
+  if (!record) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const employee = await findOne('employees', { _id: record.employeeId });
+  if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
+
+  const employeeUpdate = {
+    grossPay: numericGrossPay, paymentMethod,
+    bankName: paymentMethod === 'bank_transfer' ? bankName : (employee.bankName ?? null),
+    bankAccountNumber: paymentMethod === 'bank_transfer' ? bankAccountNumber : (employee.bankAccountNumber ?? null),
+    mpesaNumber: paymentMethod === 'mpesa' ? String(mpesaNumber).trim() : (employee.mpesaNumber ?? null),
+    updatedAt: new Date(),
+  };
+  await updateOne('employees', { _id: employee._id }, { $set: employeeUpdate });
+  if (numericGrossPay !== employee.grossPay) {
+    await syncBasicPayCompensation(employee._id, numericGrossPay, req.user._id, employee.dateOfHire);
+    // This bypasses updateEmployee (which would normally log this via
+    // recordJobHistoryIfChanged) since it writes straight to the employees collection —
+    // without this, a salary set during onboarding would never show up in Job History.
+    await logJobHistoryChange({
+      employeeId: employee._id, changeType: 'salaryChange', effectiveDate: new Date(),
+      previousValues: { grossPay: employee.grossPay ?? null }, newValues: { grossPay: numericGrossPay },
+      reason: 'Set during onboarding', changedBy: req.user._id, changedByName: req.user.name,
+    });
+  }
+
+  const now = new Date();
+  await updateOne('onboarding_records', { _id: record._id }, {
+    $set: {
+      compensationSetup: { grossPay: numericGrossPay, paymentMethod, setAt: now, setBy: req.user?._id ?? null },
+      updatedAt: now,
+    },
+  });
+
+  notifyEmployee(employee._id, {
+    title: 'Compensation Set Up',
+    body: 'Your salary and payment details have been set up by HR as part of your onboarding.',
+    type: 'onboarding',
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const finalizeIfComplete = async (record) => {
@@ -471,6 +572,12 @@ const uploadMyDocument = async (req, res) => {
     { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': req.body.taskId }] }
   );
 
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'Onboarding Document Uploaded',
+    body: `A document was uploaded for task "${task.title}".`,
+    type: 'general',
+  }).catch(() => {});
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.insertedId });
 };
 
@@ -542,6 +649,7 @@ const verifyDocument = async (req, res) => {
 module.exports = {
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, uploadTemplateResource,
   createRecord, listRecords, getRecord, updateRecordTask, addRecordTask, updateWelcome,
+  setRecordCompensation,
   getMyOnboarding, updateMyTask, uploadMyDocument, uploadRecordDocument, updateMeetTheTeam,
   listRecordDocuments, verifyDocument, getAnalytics,
   computeProgress, enrichEmployee, isHR,

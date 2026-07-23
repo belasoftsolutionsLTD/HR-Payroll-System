@@ -40,6 +40,7 @@ const createRequisition = async (req, res) => {
       currency: req.body.salaryRange?.currency || 'KES',
     },
     description: req.body.description,
+    applicationDeadline: req.body.applicationDeadline ? new Date(req.body.applicationDeadline) : null,
     competencies: Array.isArray(req.body.competencies) ? req.body.competencies : [],
     pipelineStages: Array.isArray(req.body.pipelineStages) ? req.body.pipelineStages : [],
     screeningQuestions: Array.isArray(req.body.screeningQuestions) ? req.body.screeningQuestions : [],
@@ -99,11 +100,14 @@ const getRequisition = async (req, res) => {
 const updateRequisition = async (req, res) => {
   const allowed = [
     'title', 'department', 'location', 'employmentType', 'headcount', 'salaryRange',
-    'description', 'competencies', 'pipelineStages', 'screeningQuestions', 'approvalChain', 'hiringManagerId',
+    'description', 'applicationDeadline', 'competencies', 'pipelineStages', 'screeningQuestions', 'approvalChain', 'hiringManagerId',
   ];
   const update = { updatedAt: new Date() };
   allowed.forEach((f) => {
-    if (req.body[f] !== undefined) update[f] = f === 'hiringManagerId' ? new ObjectId(req.body[f]) : req.body[f];
+    if (req.body[f] === undefined) return;
+    if (f === 'hiringManagerId') update[f] = new ObjectId(req.body[f]);
+    else if (f === 'applicationDeadline') update[f] = req.body[f] ? new Date(req.body[f]) : null;
+    else update[f] = req.body[f];
   });
 
   const result = await updateOne('jobRequisitions', { _id: new ObjectId(req.params.id) }, { $set: update });
@@ -385,6 +389,117 @@ const updateApplicationStatus = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
+// ── Bulk Applicant Actions ────────────────────────────────────────────────────
+// POST /recruitment/requisitions/:id/applications/bulk-action
+// Lets HR select several applicants at once and shortlist/reject/hire them together
+// instead of one at a time. Each application is processed independently — one bad
+// item (wrong stage, missing scorecard, etc.) is reported in `failed` rather than
+// aborting the whole batch, matching this file's existing per-item error isolation
+// (see hireCandidate's callers and payroll/attendance's own bulk-tolerant patterns).
+
+const BULK_APPLICATION_ACTIONS = ['shortlist', 'reject', 'hire'];
+
+const bulkApplicationAction = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['applicationIds', 'action'])) return;
+  const { applicationIds, action, stageId, rejectionReason } = req.body;
+
+  if (!Array.isArray(applicationIds) || !applicationIds.length) {
+    return returnFunction(res, 400, false, 'applicationIds must be a non-empty array.');
+  }
+  if (!BULK_APPLICATION_ACTIONS.includes(action)) {
+    return returnFunction(res, 400, false, `action must be one of: ${BULK_APPLICATION_ACTIONS.join(', ')}`);
+  }
+
+  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+  if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
+
+  // 'shortlist' moves to an HR-chosen stage; 'hire' always targets the requisition's
+  // designated hired-type stage (same as a single moveApplicationStage hire).
+  let targetStage = null;
+  if (action === 'shortlist') {
+    if (!stageId) return returnFunction(res, 400, false, 'stageId is required for the shortlist action.');
+    targetStage = requisition.pipelineStages.find((s) => s.id === stageId);
+    if (!targetStage) return returnFunction(res, 400, false, 'Invalid target stage.');
+  } else if (action === 'hire') {
+    targetStage = requisition.pipelineStages.find((s) => s.type === 'hired');
+    if (!targetStage) return returnFunction(res, 400, false, 'This requisition has no "hired" stage configured.');
+  }
+
+  const succeeded = [];
+  const failed = [];
+
+  for (const id of applicationIds) {
+    try {
+      const application = await findOne('applications', { _id: new ObjectId(id), requisitionId: requisition._id });
+      if (!application) throw new Error('Application not found in this requisition.');
+      if (application.status !== 'active') throw new Error('Only active applications can be updated.');
+
+      if (action === 'reject') {
+        await updateOne('applications', { _id: application._id }, {
+          $set: { status: 'rejected', rejectionReason: rejectionReason || null, updatedAt: new Date() },
+        });
+        const candidate = await findOne('candidates', { _id: application.candidateId });
+        if (candidate?.email) {
+          const tokens = candidateTokens(candidate, requisition);
+          sendTemplatedEmail({
+            trigger: 'rejection', to: candidate.email, tokens,
+            fallbackSubject: 'Application Update',
+            fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>Thank you for your interest. After careful consideration, we are unable to proceed with your application at this time.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+          }).catch(() => {});
+        }
+      } else {
+        // shortlist / hire — both are a stage move; same forward-move scorecard gate as
+        // the single-application moveApplicationStage endpoint.
+        const fromIndex = requisition.pipelineStages.findIndex((s) => s.id === application.currentStageId);
+        const toIndex = requisition.pipelineStages.findIndex((s) => s.id === targetStage.id);
+        const fromStage = requisition.pipelineStages[fromIndex];
+        if (targetStage.id === application.currentStageId) throw new Error('Already at this stage.');
+
+        const isForwardMove = fromIndex === -1 || toIndex > fromIndex;
+        if (isForwardMove && fromStage?.requiresScorecard) {
+          const stageAssignments = (application.interviewAssignments || []).filter((a) => a.stageId === fromStage.id);
+          const stageScorecards = await findMany('scorecards', { applicationId: application._id, stageId: fromStage.id }, { projection: { interviewerId: 1 } });
+          if (stageAssignments.length > 0) {
+            const submittedIds = new Set(stageScorecards.map((sc) => String(sc.interviewerId)));
+            const missing = stageAssignments.filter((a) => !submittedIds.has(String(a.interviewerId)));
+            if (missing.length > 0) throw new Error(`Waiting on a scorecard from ${missing.map((m) => m.interviewerName).join(', ')}.`);
+          } else if (stageScorecards.length === 0) {
+            throw new Error(`A scorecard must be submitted for "${fromStage.name}" first.`);
+          }
+        }
+
+        const now = new Date();
+        const stageHistory = application.stageHistory.map((h, i) => (
+          i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
+        ));
+        stageHistory.push({ stageId: targetStage.id, stageName: targetStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) });
+
+        await updateOne('applications', { _id: application._id }, {
+          $set: { currentStageId: targetStage.id, stageHistory, updatedAt: now },
+        });
+
+        // Same onEnter/onExit auto-action mechanism (including any stage-configured
+        // candidate email) a single drag-and-drop move already fires — bulk shortlist/hire
+        // sends the same automated email to every selected candidate for free.
+        if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
+        await fireAutoActions({ ...application, currentStageId: targetStage.id }, targetStage, global.dbo, 'onEnter');
+
+        if (action === 'hire') {
+          await hireCandidate({ ...application, currentStageId: targetStage.id }, requisition, req.user);
+        }
+      }
+
+      succeeded.push(id);
+    } catch (err) {
+      failed.push({ id, reason: err.message });
+    }
+  }
+
+  return returnFunction(res, 200, true,
+    `Bulk ${action}: ${succeeded.length} succeeded, ${failed.length} failed.`,
+    { succeeded, failed });
+};
+
 const extendOffer = async (req, res) => {
   if (!validateRequiredFields(req, res, ['salary', 'startDate', 'expiresAt'])) return;
 
@@ -512,6 +627,11 @@ const assignInterviewer = async (req, res) => {
     interviewerId: new ObjectId(req.body.interviewerId),
     interviewerName: interviewer.name,
     scheduledAt: new Date(req.body.scheduledAt),
+    // Candidate-facing logistics — deliberately separate from interviewerId/interviewerName
+    // above, which must never be sent to the candidate (see the email below).
+    meetingLink: req.body.meetingLink || null,
+    location: req.body.location || null,
+    requiredDocuments: req.body.requiredDocuments || null,
     assignedAt: new Date(),
   };
   await updateOne('applications', { _id: application._id }, {
@@ -524,6 +644,36 @@ const assignInterviewer = async (req, res) => {
     body: `You've been assigned to interview a candidate at the "${req.body.stageId}" stage, scheduled ${assignment.scheduledAt.toLocaleString()}.`,
     type: 'recruitment',
   }).catch(() => {});
+
+  // Tell the candidate their interview is scheduled, with every logistical detail they
+  // need (meeting link, location, time, required documents) — but never who is
+  // interviewing them, which is HR/internal-only information.
+  const [candidate, requisition] = await Promise.all([
+    findOne('candidates', { _id: application.candidateId }),
+    findOne('jobRequisitions', { _id: application.requisitionId }),
+  ]);
+  if (candidate?.email) {
+    const tokens = candidateTokens(candidate, requisition);
+    const when = assignment.scheduledAt.toLocaleString('en-KE', { dateStyle: 'full', timeStyle: 'short' });
+    sendTemplatedEmail({
+      trigger: 'interviewScheduled',
+      to: candidate.email,
+      tokens: {
+        ...tokens,
+        interviewDateTime: when,
+        meetingLink: assignment.meetingLink || '',
+        location: assignment.location || '',
+        requiredDocuments: assignment.requiredDocuments || '',
+      },
+      fallbackSubject: `Interview Scheduled — ${tokens.jobTitle}`,
+      fallbackHtml: `<p>Dear ${tokens.candidateName},</p>`
+        + `<p>Your interview for ${tokens.jobTitle} has been scheduled for <strong>${when}</strong>.</p>`
+        + (assignment.location ? `<p><strong>Location:</strong> ${assignment.location}</p>` : '')
+        + (assignment.meetingLink ? `<p><strong>Meeting link:</strong> <a href="${assignment.meetingLink}">${assignment.meetingLink}</a></p>` : '')
+        + (assignment.requiredDocuments ? `<p><strong>Please bring:</strong> ${assignment.requiredDocuments}</p>` : '')
+        + `<p>We look forward to speaking with you.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+    }).catch(() => {});
+  }
 
   return returnFunction(res, 201, true, 'Interviewer assigned.', assignment);
 };
@@ -548,9 +698,16 @@ const sendInterviewReminder = async (req, res) => {
   await sendTemplatedEmail({
     trigger: 'interviewReminder',
     to: candidate.email,
-    tokens: { ...tokens, interviewDateTime: when },
+    tokens: {
+      ...tokens, interviewDateTime: when,
+      meetingLink: assignment.meetingLink || '', location: assignment.location || '', requiredDocuments: assignment.requiredDocuments || '',
+    },
     fallbackSubject: 'Reminder: Upcoming Interview',
-    fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>This is a reminder of your upcoming interview on ${when}.</p><p>We look forward to speaking with you.</p><p>Regards,<br/>${tokens.companyName}</p>`,
+    fallbackHtml: `<p>Dear ${tokens.candidateName},</p><p>This is a reminder of your upcoming interview on ${when}.</p>`
+      + (assignment.location ? `<p><strong>Location:</strong> ${assignment.location}</p>` : '')
+      + (assignment.meetingLink ? `<p><strong>Meeting link:</strong> <a href="${assignment.meetingLink}">${assignment.meetingLink}</a></p>` : '')
+      + (assignment.requiredDocuments ? `<p><strong>Please bring:</strong> ${assignment.requiredDocuments}</p>` : '')
+      + `<p>We look forward to speaking with you.</p><p>Regards,<br/>${tokens.companyName}</p>`,
   }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Reminder sent to candidate.');
@@ -993,7 +1150,7 @@ const deleteInterviewKit = async (req, res) => {
 
 // ── Email Templates ───────────────────────────────────────────────────────────
 
-const EMAIL_TRIGGERS = ['applicationReceived', 'stageAdvance', 'rejection', 'offerExtended', 'nurture', 'interviewReminder'];
+const EMAIL_TRIGGERS = ['applicationReceived', 'stageAdvance', 'rejection', 'offerExtended', 'nurture', 'interviewReminder', 'interviewScheduled'];
 
 const createEmailTemplate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'trigger', 'subject', 'body'])) return;
@@ -1039,6 +1196,7 @@ module.exports = {
   submitRequisition, approveRequisition, deleteRequisition,
   REQUISITION_STATUSES,
   listApplicationsForRequisition, moveApplicationStage, updateApplicationStatus,
+  bulkApplicationAction,
   extendOffer, respondToOffer, respondToOfferCore,
   assignInterviewer, unassignInterviewer, sendInterviewReminder,
   submitScorecard, listScorecardsForApplication, getScorecard,

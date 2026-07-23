@@ -151,6 +151,19 @@ const createInvoice = async (req, res) => {
   };
 
   const result = await insertOne('invoices', doc);
+
+  const inboxPayload = {
+    type: 'procurement', subType: 'invoice_submitted',
+    title: `Invoice ${invoiceNumber ? `#${invoiceNumber} ` : ''}from ${vendor}`,
+    subtitle: `${doc.currency} ${doc.amount.toLocaleString()} — due ${doc.dueDate.toDateString()}`,
+    referenceId: result.insertedId, referenceModel: 'invoices',
+    requiresAction: true, triggeredBy: req.user?._id ?? null,
+  };
+  notifyHR(inboxPayload).catch(() => {});
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'New Invoice Submitted', body: inboxPayload.subtitle, type: 'general',
+  }).catch(() => {});
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
@@ -799,6 +812,18 @@ const createGoodsReceipt = async (req, res) => {
     },
   });
 
+  // A damaged/short receipt needs someone to resolve it — nobody was ever told before,
+  // so it just sat there until HR happened to open the goods-receipts list.
+  if (status === 'disputed') {
+    notifyHR({
+      type: 'procurement', subType: 'goods_receipt_disputed',
+      title: `Goods receipt flagged — PO ${po.poNumber || po._id}`,
+      subtitle: notes || 'One or more received items were marked damaged/short.',
+      referenceId: result.insertedId, referenceModel: 'goods_receipts',
+      requiresAction: true, triggeredBy: req.user?._id ?? null,
+    }).catch(() => {});
+  }
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, poStatus });
 };
 
@@ -856,6 +881,15 @@ const createVendorInvoice = async (req, res) => {
   };
   const result = await insertOne('vendor_invoices', doc);
   await updateOne('purchase_orders', { _id: po._id }, { $set: { invoiceId: result.insertedId, updatedAt: new Date() } });
+
+  notifyHR({
+    type: 'procurement', subType: 'vendor_invoice_received',
+    title: `Vendor invoice received — #${invoiceNumber}`,
+    subtitle: `${doc.currency} ${totalAmount.toLocaleString()} — needs 3-way match`,
+    referenceId: result.insertedId, referenceModel: 'vendor_invoices',
+    requiresAction: true, triggeredBy: req.user?._id ?? null,
+  }).catch(() => {});
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
@@ -917,6 +951,15 @@ const disputeVendorInvoice = async (req, res) => {
   await updateOne('vendor_invoices', { _id: invoice._id }, {
     $set: { status: 'disputed', discrepancyNotes: req.body.reason, updatedAt: new Date() },
   });
+
+  notifyHR({
+    type: 'procurement', subType: 'vendor_invoice_disputed',
+    title: `Vendor invoice disputed${invoice.invoiceNumber ? ` — #${invoice.invoiceNumber}` : ''}`,
+    subtitle: req.body.reason,
+    referenceId: invoice._id, referenceModel: 'vendor_invoices',
+    requiresAction: true, triggeredBy: req.user?._id ?? null,
+  }).catch(() => {});
+
   return returnFunction(res, 200, true, 'Invoice marked as disputed.');
 };
 

@@ -3,7 +3,8 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { parseAttendanceCSV } = require('../../services/csvService');
-const { notifyManager } = require('../inbox/inboxFunctions');
+const { notifyManager, notifyHR } = require('../inbox/inboxFunctions');
+const { notifyEmployee } = require('../../functions/HR/notifyUser');
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
 
 const HR_ROLE_LIST = [SUPER_ADMIN, HR_MANAGER];
@@ -715,16 +716,20 @@ const submitTimesheet = async (req, res) => {
 
   await updateOne('timesheets', { _id: sheet._id }, { $set: { status: 'submitted', submittedAt: new Date(), updatedAt: new Date() } });
 
-  // Inbox: notify manager that timesheet was submitted
+  // Inbox: notify manager that timesheet was submitted. notifyManager silently no-ops
+  // if the employee has no managerId on file (same gap as the leave-request bug) — HR
+  // must always get a copy too, otherwise a timesheet can go unnoticed by anyone.
   if (req.user.employeeId) {
     const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } });
-    await notifyManager(req.user.employeeId, {
+    const inboxItem = {
       type: 'timesheet', subType: 'timesheet_submission',
       title: `Timesheet submitted by ${emp?.fullName || 'An employee'}`,
       subtitle: `Week ${sheet.weekStart || ''} – ${sheet.weekEnd || ''} · ${sheet.totalHours || ''}h`,
       referenceId: sheet._id, referenceModel: 'timesheets',
       requiresAction: true, triggeredBy: req.user._id,
-    });
+    };
+    await notifyManager(req.user.employeeId, inboxItem);
+    await notifyHR(inboxItem);
   }
 
   return returnFunction(res, 200, true, 'Timesheet submitted for approval.');
@@ -1210,7 +1215,7 @@ const applyForShift = async (req, res) => {
   const existing = await findOne('shift_applications', { shiftId: new ObjectId(req.params.id), employeeId: empId });
   if (existing) return returnFunction(res, 409, false, 'You have already applied for this shift.');
   const emp = await findOne('employees', { _id: empId });
-  await global.dbo.collection('shift_applications').insertOne({
+  const result = await global.dbo.collection('shift_applications').insertOne({
     shiftId:      new ObjectId(req.params.id),
     employeeId:   empId,
     employeeName: emp?.fullName || '',
@@ -1218,6 +1223,17 @@ const applyForShift = async (req, res) => {
     note:         req.body.note || '',
     createdAt:    new Date(),
   });
+
+  const inboxItem = {
+    type: 'shift', subType: 'shift_application',
+    title: `Shift application from ${emp?.fullName || 'An employee'}`,
+    subtitle: `Shift ${shift.date || ''} ${shift.startTime || ''}–${shift.endTime || ''}`.trim(),
+    referenceId: result.insertedId, referenceModel: 'shift_applications',
+    requiresAction: true, triggeredBy: req.user._id,
+  };
+  await notifyManager(empId, inboxItem);
+  await notifyHR(inboxItem);
+
   return returnFunction(res, 201, true, 'Application submitted successfully.');
 };
 
@@ -1251,6 +1267,13 @@ const resolveShiftApplication = async (req, res) => {
       { $set: { status: 'rejected', resolvedAt: new Date() } }
     );
   }
+
+  notifyEmployee(app.employeeId, {
+    title: `Shift application ${status}`,
+    body: status === 'approved' ? 'Your shift application was approved.' : 'Your shift application was not approved.',
+    type: 'general',
+  }).catch(() => {});
+
   return returnFunction(res, 200, true, status === 'approved' ? 'Application approved.' : 'Application rejected.');
 };
 
