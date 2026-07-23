@@ -6,6 +6,7 @@ const {
   createRequisition, listRequisitions, getRequisition, updateRequisition,
   submitRequisition, approveRequisition, deleteRequisition,
   listApplicationsForRequisition, moveApplicationStage, updateApplicationStatus,
+  bulkApplicationAction,
   extendOffer, respondToOffer,
   assignInterviewer, unassignInterviewer, sendInterviewReminder,
   submitScorecard, listScorecardsForApplication, getScorecard,
@@ -31,6 +32,7 @@ router.delete('/requisitions/:id',          allowRoles([SUPER_ADMIN, HR_MANAGER]
 
 // ── Applications / Pipeline ──────────────────────────────────────────────────────
 router.get('/requisitions/:id/applications', allowRoles(MGMT), AsyncHandler(listApplicationsForRequisition));
+router.post('/requisitions/:id/applications/bulk-action', allowRoles(MGMT), AsyncHandler(bulkApplicationAction));
 router.patch('/applications/:id/stage',       allowRoles(MGMT), AsyncHandler(moveApplicationStage));
 router.patch('/applications/:id/status',      allowRoles(MGMT), AsyncHandler(updateApplicationStatus));
 router.post('/applications/:id/offer',        allowRoles(MGMT), AsyncHandler(extendOffer));

@@ -20,6 +20,7 @@ const {
   getOpenPositions, applyInternal, getMyApplications,
 } = require('./meFunctions');
 const { getMyAnnouncements, markAnnouncementRead } = require('../announcements/announcementFunctions');
+const { getMyWelfare } = require('../welfare/welfareFunctions');
 
 const auth = allowRoles(ALL_ROLES);
 
@@ -59,6 +60,9 @@ router.get('/awards', auth, AsyncHandler(getMyAwards));
 
 // Upcoming events (training & team building)
 router.get('/events', auth, AsyncHandler(getMyEvents));
+
+// Welfare scheme memberships (self-view)
+router.get('/welfare', auth, AsyncHandler(getMyWelfare));
 
 // Notification preference
 router.get('/notifications/preference',  auth, AsyncHandler(getNotificationPreference));

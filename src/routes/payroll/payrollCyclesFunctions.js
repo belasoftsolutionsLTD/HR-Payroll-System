@@ -1,4 +1,5 @@
 const { ObjectId } = require('mongodb');
+const archiver = require('archiver');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
@@ -7,6 +8,8 @@ const { generateP9Form } = require('../../services/p9Service');
 const { buildCalculator, loadTaxConfig } = require('../../functions/taxCalculator');
 const { calculateWorkingDays } = require('../../functions/HR/leaveCalculator');
 const { sendEmail } = require('../../services/emailService');
+const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
 const { isPayrollReady, getMissingCriticalFields } = require('../employees/employeesFunctions');
 const { resolveConceptPass1, resolveConceptPass2 } = require('../../lib/payroll/resolveConceptPayItems');
 const { logCompensationChange } = require('./payrollCompensationsFunctions');
@@ -107,7 +110,7 @@ const PAY_FREQUENCIES = ['weekly', 'biweekly', 'monthly'];
 
 const createCycle = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name'])) return;
-  const { name, payDate, payGroup, currency, runType } = req.body;
+  const { name, payDate, payGroup, currency, runType, departmentId, jobGroupId, employmentType } = req.body;
   const payFrequency = PAY_FREQUENCIES.includes(req.body.payFrequency) ? req.body.payFrequency : 'monthly';
   const isOffCycle = runType === 'off_cycle';
 
@@ -123,6 +126,12 @@ const createCycle = async (req, res) => {
     return returnFunction(res, 400, false, 'Provide either month+year (monthly) or an explicit startDate+endDate (weekly/biweekly/off-cycle).');
   }
   if (endDate < startDate) return returnFunction(res, 400, false, 'endDate must be on or after startDate.');
+
+  // Payroll can only be generated for the current period or earlier — never ahead of time.
+  const currentPeriodEnd = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0);
+  if (startDate > currentPeriodEnd) {
+    return returnFunction(res, 400, false, 'Payroll cannot be generated for a future period.');
+  }
 
   // Regular (non off-cycle) runs of the same frequency can't overlap — that's what off-cycle
   // runs are for. Off-cycle runs are exempt so bonuses/corrections/terminations can always
@@ -151,6 +160,9 @@ const createCycle = async (req, res) => {
     targetEmployeeIds: Array.isArray(req.body.employeeIds) && req.body.employeeIds.length
       ? req.body.employeeIds.map((id) => new ObjectId(id))
       : null,
+    departmentId:  departmentId ? new ObjectId(departmentId) : null,
+    jobGroupId:    jobGroupId   ? new ObjectId(jobGroupId)   : null,
+    employmentType: employmentType || null,
     currency:      currency  || 'KES',
     totalGross:    0, totalDeductions: 0, totalNet: 0, totalEmployerCost: 0, employeeCount: 0,
     hasExceptions: false, exceptionCount: 0,
@@ -283,6 +295,12 @@ async function lockCycleInternal(req, res, cycle) {
       ],
     };
     if (cycle.payGroup && cycle.payGroup !== 'all') empFilter.$and.push({ payGroup: cycle.payGroup });
+    if (cycle.jobGroupId) empFilter.$and.push({ jobGroupId: cycle.jobGroupId });
+    if (cycle.employmentType) empFilter.$and.push({ employmentType: cycle.employmentType });
+    if (cycle.departmentId) {
+      const dept = await findOne('departments', { _id: cycle.departmentId });
+      empFilter.$and.push({ department: dept?.name ?? '__none__' });
+    }
   }
   const allEmployeesInScope = await findMany('employees', empFilter, {});
 
@@ -636,6 +654,8 @@ async function closeCycleInternal(req, res, cycle) {
   }
 
   const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
+  const period = `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}`;
+  const notifyMessage = `Your payslip for ${period} has been generated. You can view and download it from your portal.`;
 
   // Generate payslips for each employee
   for (const result of results) {
@@ -659,6 +679,23 @@ async function closeCycleInternal(req, res, cycle) {
       await updateOne('payroll_results', { _id: result._id }, {
         $set: { payslipUrl: `/api/payroll/payslips/${slip.insertedId}/pdf`, payslipSentAt: new Date(), status: 'paid', updatedAt: new Date() },
       });
+
+      // Notify the employee (in-app + email) — separate from the manual emailPayslips action.
+      notifyEmployee(result.employeeId, {
+        title: 'Payslip Generated', body: notifyMessage, type: 'payroll',
+        link: `/payroll/payslips/${slip.insertedId}`,
+      }).catch(() => {});
+
+      const user = await findOne('users', { employeeId: result.employeeId }, { projection: { email: 1 } });
+      if (user?.email) {
+        sendTemplatedEmail({
+          trigger: 'payslipGenerated',
+          to: user.email,
+          tokens: { employeeName: emp?.fullName ?? 'Employee', period },
+          fallbackSubject: `Your Payslip — ${period}`,
+          fallbackHtml: `<p>Dear ${emp?.fullName ?? 'Employee'},</p><p>${notifyMessage}</p>`,
+        }).catch(() => {});
+      }
     } catch (err) {
       // Log and continue — don't fail the whole cycle for one payslip
       console.error(`Payslip generation failed for employee ${result.employeeId}:`, err.message);
@@ -818,6 +855,47 @@ const emailPayslips = async (req, res) => {
   );
 };
 
+// ── Bulk Payslip ZIP Download ─────────────────────────────────────────────────
+// GET /api/payroll/cycles/:cycleId/payslips/zip
+// Streams every payslip PDF for this cycle bundled into a single ZIP.
+
+const downloadPayslipsZip = async (req, res) => {
+  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.cycleId) });
+  if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
+  if (!results.length) return returnFunction(res, 400, false, 'No payroll results found for this cycle.');
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="payslips-${cycle._id}.zip"`);
+
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  // archiver's 'error' event fires asynchronously — throwing here would be an uncaught
+  // exception (AsyncHandler only catches the synchronously-returned promise's rejection),
+  // which would crash the whole Node process for every concurrent user, not just this
+  // request. Log and tear down just this response instead.
+  archive.on('error', (err) => {
+    console.error('Payslip ZIP stream error:', err.message);
+    if (!res.headersSent) return returnFunction(res, 500, false, 'Failed to generate ZIP.');
+    res.destroy(err);
+  });
+  archive.pipe(res);
+
+  for (const result of results) {
+    try {
+      const emp = await findOne('employees', { _id: result.employeeId }, { projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccountNumber: 1 } });
+      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle);
+      const filename = `payslip-${emp?.staffNumber ?? result.employeeId}-${cycle.period.year}-${String(cycle.period.month).padStart(2, '0')}.pdf`;
+      archive.append(pdfBuffer, { name: filename });
+    } catch (err) {
+      // Same philosophy as closeCycleInternal — one bad payslip doesn't sink the whole ZIP.
+      console.error(`Payslip ZIP: skipping employee ${result.employeeId}:`, err.message);
+    }
+  }
+
+  await archive.finalize();
+};
+
 // ── P9A Form (Kenya KRA Annual PAYE Deduction Card) ───────────────────────────
 // GET /api/payroll/p9/:employeeId?year=2025
 const downloadP9Form = async (req, res) => {
@@ -859,6 +937,6 @@ module.exports = {
   listCycles, getCycle, createCycle, advanceCycleStatus, compareCycles,
   getCycleResults, getCycleExceptions, approveEmployees,
   lockCycle, closeCycle, exportCycleCSV, exportBankFile, getEmployeeResult,
-  emailPayslips, downloadP9Form,
+  emailPayslips, downloadP9Form, downloadPayslipsZip,
   resolveStatutoryLine,
 };

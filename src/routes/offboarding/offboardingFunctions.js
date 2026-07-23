@@ -499,6 +499,12 @@ const uploadMyDocument = async (req, res) => {
     { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': req.body.taskId }] }
   );
 
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'Offboarding Document Uploaded',
+    body: `A document was uploaded for task "${task.title}".`,
+    type: 'general',
+  }).catch(() => {});
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.insertedId });
 };
 

@@ -391,7 +391,8 @@ const createLeaveRequest = async (req, res) => {
     halfDay: halfDay || null, reason: reason || '', attachmentUrl: attachmentUrl || null,
     status, approvalChain, currentApprovalLevel: approvalChain.length ? 1 : 0,
     rejectionReason: null, cancelledAt: null, cancelledBy: null,
-    revokedAt: null, revokedBy: null, disputeReason: null, disputeResolvedAt: null, disputeResolvedBy: null,
+    revokedAt: null, revokedBy: null, disputeReason: null, disputeSource: null, disputeResolvedAt: null, disputeResolvedBy: null,
+    proposedDays: null, counterOfferReason: null,
     payrollRunId: null, createdAt: now, updatedAt: now,
   };
   const result = await insertOne('leave_requests', doc);
@@ -404,11 +405,17 @@ const createLeaveRequest = async (req, res) => {
   if (approvalChain.length) {
     const firstApprover = approvalChain[0];
     notifyEmployee(employee._id, { title: 'Leave Request Submitted', body: `Your ${leaveType.name} request (${totalDays} day(s)) is pending approval.`, type: 'leave' }).catch(() => {});
-    notifyManager(employee._id, {
+    const inboxItem = {
       type: 'leave', subType: 'leave_request', title: `Leave request: ${employee.fullName}`,
       subtitle: `${leaveType.name} · ${totalDays} day(s) · ${new Date(startDate).toDateString()} - ${new Date(endDate).toDateString()}`,
       referenceId: result.insertedId, referenceModel: 'leave_requests', requiresAction: true,
-    }).catch(() => {});
+      triggeredBy: employee._id,
+    };
+    // notifyManager silently no-ops if the employee has no managerId on file — HR must
+    // always get a copy regardless, otherwise a leave request can go completely
+    // unnoticed by anyone until it's disputed (the only other place HR was notified).
+    notifyManager(employee._id, inboxItem).catch(() => {});
+    notifyHR(inboxItem).catch(() => {});
   } else {
     notifyEmployee(employee._id, { title: 'Leave Request Approved', body: `Your ${leaveType.name} request was auto-approved (no approval required for this leave type).`, type: 'leave' }).catch(() => {});
   }
@@ -509,6 +516,108 @@ const rejectLeaveRequest = async (req, res) => {
   return returnFunction(res, 200, true, 'Leave request rejected.');
 };
 
+// ── Partial Approval (Counter-Offer) ─────────────────────────────────────────
+// HR proposes fewer days than requested instead of a flat approve/reject; the
+// employee then accepts or disputes it from their own portal.
+
+const counterOfferLeaveRequest = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['proposedDays'])) return;
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  if (request.status !== 'pending') return returnFunction(res, 400, false, 'This request is not pending.');
+
+  const proposedDays = Number(req.body.proposedDays);
+  if (!(proposedDays > 0) || !(proposedDays < request.totalDays)) {
+    return returnFunction(res, 400, false, 'Proposed days must be greater than 0 and less than the requested total days.');
+  }
+
+  const now = new Date();
+  const counterOfferReason = req.body.counterOfferReason || '';
+  await updateOne('leave_requests', { _id: request._id }, {
+    $set: { status: 'counter_offered', proposedDays, counterOfferReason, updatedAt: now },
+  });
+
+  await logAudit({
+    leaveRequestId: request._id, employeeId: request.employeeId, action: 'counterOffered',
+    performedBy: req.user._id, performedByName: req.user.name, comment: counterOfferReason,
+    previousValue: { totalDays: request.totalDays }, newValue: { proposedDays },
+  });
+
+  notifyEmployee(request.employeeId, {
+    title: 'Leave Counter-Offer',
+    body: `Your leave request has been counter-offered. You have been proposed ${proposedDays} days instead of ${request.totalDays}. Please review and respond from your portal.`,
+    type: 'leave',
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, 'Counter-offer sent to employee.');
+};
+
+const acceptCounterOffer = async (req, res) => {
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id), employeeId: new ObjectId(req.user.employeeId) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  if (request.status !== 'counter_offered') return returnFunction(res, 400, false, 'This request has no pending counter-offer.');
+
+  const now = new Date();
+  const originalTotalDays = request.totalDays;
+  const newTotalDays = request.proposedDays;
+
+  await updateOne('leave_requests', { _id: request._id }, {
+    $set: { status: 'approved', totalDays: newTotalDays, updatedAt: now },
+  });
+
+  // Only the accepted (smaller) day count is actually consumed — release the rest
+  // of what was reserved as `pending` back to the employee's available balance.
+  const year = new Date(request.startDate).getFullYear();
+  await global.dbo.collection('leave_balances').updateOne(
+    { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+    { $inc: { pending: -originalTotalDays, used: newTotalDays }, $set: { updatedAt: now } }
+  );
+  await recomputeClosing(request.employeeId, request.leaveTypeId, year);
+
+  const today = new Date();
+  if (new Date(request.startDate) <= today && today <= new Date(request.endDate)) {
+    await updateOne('employees', { _id: request.employeeId }, { $set: { status: 'on_leave', updatedAt: now } });
+  }
+
+  await logAudit({
+    leaveRequestId: request._id, employeeId: request.employeeId, action: 'counterAccepted',
+    performedBy: req.user._id, performedByName: req.user.name,
+    comment: `Accepted ${newTotalDays} day(s) instead of ${originalTotalDays}`,
+  });
+
+  notifyByRoles(HR_ROLE_LIST, {
+    title: 'Counter-Offer Accepted',
+    body: `${req.user.name || 'An employee'} accepted the counter-offer of ${newTotalDays} day(s) for their leave request.`,
+    type: 'leave',
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, 'Counter-offer accepted. Leave approved.');
+};
+
+const disputeCounterOffer = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['reason'])) return;
+  const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id), employeeId: new ObjectId(req.user.employeeId) });
+  if (!request) return returnFunction(res, 404, false, req.locale.notFound);
+  if (request.status !== 'counter_offered') return returnFunction(res, 400, false, 'This request has no pending counter-offer.');
+
+  const now = new Date();
+  await updateOne('leave_requests', { _id: request._id }, {
+    $set: { status: 'disputed', disputeReason: req.body.reason, disputeSource: 'counterOffer', updatedAt: now },
+  });
+
+  await logAudit({
+    leaveRequestId: request._id, employeeId: request.employeeId, action: 'counterDisputed',
+    performedBy: req.user._id, performedByName: req.user.name, comment: req.body.reason,
+  });
+
+  notifyHR({
+    type: 'leave', subType: 'leave_dispute', title: 'Leave Counter-Offer Disputed',
+    subtitle: req.body.reason, referenceId: request._id, referenceModel: 'leave_requests', requiresAction: true,
+  }).catch(() => {});
+
+  return returnFunction(res, 200, true, 'Dispute submitted. HR will review.');
+};
+
 const cancelLeaveRequest = async (req, res) => {
   const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
@@ -569,7 +678,7 @@ const disputeLeaveRequest = async (req, res) => {
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
   if (request.status !== 'rejected') return returnFunction(res, 400, false, 'Only rejected requests can be disputed.');
 
-  await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'disputed', disputeReason: req.body.disputeReason, updatedAt: new Date() } });
+  await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'disputed', disputeReason: req.body.disputeReason, disputeSource: 'rejection', updatedAt: new Date() } });
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'disputed', performedBy: req.user._id, performedByName: req.user.name, comment: req.body.disputeReason });
   notifyHR({ type: 'leave', subType: 'leave_dispute', title: 'Leave Rejection Disputed', subtitle: req.body.disputeReason, referenceId: request._id, referenceModel: 'leave_requests', requiresAction: true }).catch(() => {});
   return returnFunction(res, 200, true, 'Dispute submitted. HR will review.');
@@ -583,10 +692,49 @@ const resolveDispute = async (req, res) => {
 
   const now = new Date();
   const { resolution, comment } = req.body;
+  const year = new Date(request.startDate).getFullYear();
+
+  // A counter-offer dispute is a fundamentally different case from a rejection dispute:
+  // rejectLeaveRequest already zeroes `pending` before a rejection-dispute ever starts,
+  // but counterOfferLeaveRequest/disputeCounterOffer never touch `pending` — the full
+  // original day count is still reserved here. Reusing the rejection-dispute branches
+  // below as-is would either double-decrement `used` (overturned) or leave `pending`
+  // permanently stuck with no request left to release it (upheld). There's also no
+  // "flat rejection" outcome that makes sense here — HR never rejected this request
+  // outright, they counter-offered — so anything other than 'overturned' upholds HR's
+  // counter-offer (an approval at the proposed days), not a rejection.
+  if (request.disputeSource === 'counterOffer') {
+    const finalDays = resolution === 'overturned' ? request.totalDays : request.proposedDays;
+    await updateOne('leave_requests', { _id: request._id }, {
+      $set: { status: 'approved', totalDays: finalDays, disputeResolvedAt: now, disputeResolvedBy: req.user._id, updatedAt: now },
+    });
+    await global.dbo.collection('leave_balances').updateOne(
+      { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
+      { $inc: { pending: -request.totalDays, used: finalDays }, $set: { updatedAt: now } }
+    );
+    await recomputeClosing(request.employeeId, request.leaveTypeId, year);
+
+    const today = new Date();
+    if (new Date(request.startDate) <= today && today <= new Date(request.endDate)) {
+      await updateOne('employees', { _id: request.employeeId }, { $set: { status: 'on_leave', updatedAt: now } });
+    }
+
+    await logAudit({
+      leaveRequestId: request._id, employeeId: request.employeeId, action: 'disputeResolved',
+      performedBy: req.user._id, performedByName: req.user.name,
+      comment: `${resolution} (counter-offer dispute): approved ${finalDays} day(s) — ${comment || ''}`,
+    });
+    notifyEmployee(request.employeeId, {
+      title: 'Leave Dispute Resolved',
+      body: `Your dispute was ${resolution}. Your leave has been approved for ${finalDays} day(s).`,
+      type: 'leave',
+    }).catch(() => {});
+    return returnFunction(res, 200, true, 'Dispute resolved.');
+  }
+
   if (resolution === 'overturned') {
     const updatedChain = request.approvalChain.map(c => ({ ...c, status: 'approved', actedAt: now }));
     await updateOne('leave_requests', { _id: request._id }, { $set: { status: 'approved', approvalChain: updatedChain, disputeResolvedAt: now, disputeResolvedBy: req.user._id, updatedAt: now } });
-    const year = new Date(request.startDate).getFullYear();
     await global.dbo.collection('leave_balances').updateOne(
       { employeeId: request.employeeId, leaveTypeId: request.leaveTypeId, year },
       { $inc: { used: request.totalDays }, $set: { updatedAt: now } }
@@ -804,6 +952,7 @@ module.exports = {
   getLeaveBalances, getEmployeeLeaveBalances, adjustLeaveBalance,
   listLeaveRequests, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
   approveLeaveRequest, rejectLeaveRequest, cancelLeaveRequest,
+  counterOfferLeaveRequest, acceptCounterOffer, disputeCounterOffer,
   revokeLeaveRequest, disputeLeaveRequest, resolveDispute,
   getLeaveCalendar, getPayrollFeed, markPayrollFeedProcessed, getLeaveAnalytics,
   listBlackouts, addBlackout, deleteBlackout,

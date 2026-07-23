@@ -27,6 +27,33 @@ function isSupervisor(project, userId) {
   return String(project.createdBy) === String(userId);
 }
 
+// Whether a user may view/participate in a project at all — HR, the project's
+// supervisor, a registered project_members row, or (department_head only) their
+// department is listed on the project. Used to gate the general project chat, which
+// previously had no membership check at all (any authenticated user could read/post
+// to any project's chat by guessing the project id).
+//
+// IMPORTANT: `project_members.employeeId` (and `assignedEmployees.employeeId`) store
+// the EMPLOYEE record's _id, not the USER account's _id — these are different
+// documents in different collections, never equal. `req.user._id` is the user id;
+// `req.user.employeeId` (attached by AuthMiddleware) is the linked employee id. Every
+// membership/department lookup below must use `reqUser.employeeId`, while
+// `isSupervisor` (which compares against `project.createdBy`, itself always a user id)
+// correctly keeps using `reqUser._id`.
+async function canAccessProject(project, reqUser) {
+  if (HR_ROLES.includes(reqUser.role)) return true;
+  if (isSupervisor(project, reqUser._id)) return true;
+  if (reqUser.employeeId) {
+    const member = await findOne('project_members', { projectId: project._id, employeeId: new ObjectId(String(reqUser.employeeId)) });
+    if (member) return true;
+  }
+  if (reqUser.role === 'department_head') {
+    const dept = await getEmployeeDept(reqUser.employeeId);
+    if (dept && project.departments?.includes(dept)) return true;
+  }
+  return false;
+}
+
 async function notifyProjectMembers(projectId, item, excludeId = null) {
   const members = await findMany('project_members', { projectId: new ObjectId(String(projectId)) }, { projection: { employeeId: 1 } });
   const project = await findOne('projects', { _id: new ObjectId(String(projectId)) }, { projection: { createdBy: 1 } });
@@ -56,8 +83,12 @@ const listProjects = async (req, res) => {
   }
 
   if (!HR_ROLES.includes(role)) {
-    // Build a filter that includes: projects I created OR I'm a member of OR (dept head) dept is involved
-    const memberProjects = await findMany('project_members', { employeeId: new ObjectId(String(userId)) }, { projection: { projectId: 1 } });
+    // Build a filter that includes: projects I created OR I'm a member of OR (dept head) dept is involved.
+    // project_members.employeeId is an EMPLOYEE id, not a user id — must match against
+    // req.user.employeeId, never req.user._id (see canAccessProject's comment above).
+    const memberProjects = req.user.employeeId
+      ? await findMany('project_members', { employeeId: new ObjectId(String(req.user.employeeId)) }, { projection: { projectId: 1 } })
+      : [];
     const memberIds = memberProjects.map(m => m.projectId);
 
     const orClauses = [
@@ -66,7 +97,7 @@ const listProjects = async (req, res) => {
     ];
 
     if (role === 'department_head') {
-      const dept = await getEmployeeDept(userId);
+      const dept = await getEmployeeDept(req.user.employeeId);
       if (dept) orClauses.push({ departments: dept });
     }
 
@@ -204,13 +235,13 @@ const getProject = async (req, res) => {
 
   if (HR_ROLES.includes(role) || isSupervisor(project, userId)) {
     myRole = 'supervisor';
-  } else {
-    const member = enrichedMembers.find(m => String(m.employeeId) === userId);
+  } else if (req.user.employeeId) {
+    const member = enrichedMembers.find(m => String(m.employeeId) === String(req.user.employeeId));
     myRole = member?.role ?? null;
   }
 
   if (role === 'department_head') {
-    myDepartment = await getEmployeeDept(userId);
+    myDepartment = await getEmployeeDept(req.user.employeeId);
   }
 
   const deptProgress = {};
@@ -377,11 +408,14 @@ const listSubtasks = async (req, res) => {
 
   if (!HR_ROLES.includes(role) && !isSupervisor(project, userId)) {
     if (role === 'department_head') {
-      const dept = await getEmployeeDept(userId);
+      const dept = await getEmployeeDept(req.user.employeeId);
       if (dept) filter.department = dept;
+    } else if (req.user.employeeId) {
+      // Staff: see subtasks assigned to them — assignedEmployees.employeeId is an
+      // employee id, must match req.user.employeeId, not req.user._id.
+      filter['assignedEmployees.employeeId'] = new ObjectId(String(req.user.employeeId));
     } else {
-      // Staff: see subtasks assigned to them
-      filter['assignedEmployees.employeeId'] = new ObjectId(userId);
+      filter._id = null; // no linked employee record — nothing can be assigned to them
     }
   }
 
@@ -490,7 +524,7 @@ const assignSubtaskEmployees = async (req, res) => {
   const isDeptHead = req.user.role === 'department_head';
 
   if (!isSup && isDeptHead) {
-    const dept = await getEmployeeDept(userId);
+    const dept = await getEmployeeDept(req.user.employeeId);
     if (dept !== subtask.department) {
       return returnFunction(res, 403, false, "You can only assign employees for your department's subtasks.");
     }
@@ -503,9 +537,21 @@ const assignSubtaskEmployees = async (req, res) => {
 
   const assignedEmployees = [];
   for (const empId of ids) {
-    const emp = await findOne('employees', { _id: new ObjectId(String(empId)) }, { projection: { fullName: 1 } });
+    const emp = await findOne('employees', { _id: new ObjectId(String(empId)) }, { projection: { fullName: 1, department: 1 } });
     if (!emp) continue;
     assignedEmployees.push({ employeeId: new ObjectId(String(empId)), name: emp.fullName, status: 'not_started' });
+
+    // A subtask assignee needs to be a real project member — otherwise listProjects
+    // never surfaces this project to them at all (they'd have no way to see the
+    // project, its chat, or anything else about it, even though work was assigned).
+    const existingMember = await findOne('project_members', { projectId: project._id, employeeId: new ObjectId(String(empId)) });
+    if (!existingMember) {
+      await insertOne('project_members', {
+        projectId: project._id, employeeId: new ObjectId(String(empId)),
+        name: emp.fullName ?? '', department: emp.department ?? '',
+        role: 'member', addedAt: new Date(),
+      });
+    }
 
     await createInboxItem({
       recipientId: new ObjectId(String(empId)),
@@ -537,7 +583,7 @@ const submitSubtaskReport = async (req, res) => {
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
 
   if (!isSup && req.user.role === 'department_head') {
-    const dept = await getEmployeeDept(userId);
+    const dept = await getEmployeeDept(req.user.employeeId);
     if (dept !== subtask.department) {
       return returnFunction(res, 403, false, "You can only report on your department's subtasks.");
     }
@@ -638,8 +684,18 @@ const deleteNote = async (req, res) => {
 async function getValidProjectPersonIds(project) {
   const members = await findMany('project_members', { projectId: project._id }, { projection: { employeeId: 1 } });
   const ids = new Set(members.map((m) => String(m.employeeId)));
-  ids.add(String(project.createdBy));
+  ids.add(String(project.createdBy)); // supervisor identified by USER id — may have no employee record at all
   return ids;
+}
+
+// Chat group memberIds mixes two id spaces by construction: the supervisor is stored by
+// their user id (project.createdBy), regular members by employee id (project_members).
+// So "is this logged-in person in this list" must check both req.user._id and
+// req.user.employeeId, not just one.
+function personMatchesIds(reqUser, idList) {
+  const userIdStr = String(reqUser._id);
+  const empIdStr  = reqUser.employeeId ? String(reqUser.employeeId) : null;
+  return (idList || []).some((id) => { const s = String(id); return s === userIdStr || s === empIdStr; });
 }
 
 const listChatGroups = async (req, res) => {
@@ -650,7 +706,13 @@ const listChatGroups = async (req, res) => {
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
 
   const filter = { projectId: project._id };
-  if (!isSup) filter.memberIds = new ObjectId(userId);
+  if (!isSup) {
+    // memberIds may hold this person's user id (if they're the group creator) or
+    // employee id (if they were invited as a regular member) — check both.
+    const candidateIds = [new ObjectId(userId)];
+    if (req.user.employeeId) candidateIds.push(new ObjectId(String(req.user.employeeId)));
+    filter.memberIds = { $in: candidateIds };
+  }
 
   const groups = await findMany('project_chat_groups', filter, { sort: { createdAt: 1 } });
   return returnFunction(res, 200, true, req.locale.success, groups);
@@ -667,13 +729,17 @@ const createChatGroup = async (req, res) => {
   const userId = String(req.user._id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
   const validIds = await getValidProjectPersonIds(project);
+  const empIdStr = req.user.employeeId ? String(req.user.employeeId) : null;
 
-  if (!isSup && !validIds.has(userId)) {
+  if (!isSup && !validIds.has(userId) && !(empIdStr && validIds.has(empIdStr))) {
     return returnFunction(res, 403, false, 'Only project members can create chat groups.');
   }
 
   const cleanMemberIds = new Set(memberIds.map(String).filter((id) => validIds.has(id)));
-  cleanMemberIds.add(userId); // creator is always a member of their own group
+  // Creator is always a member of their own group, represented by whichever id space
+  // they actually appear under in validIds (employee id for a regular member, user id
+  // for the supervisor/HR, who may have no linked employee record at all).
+  cleanMemberIds.add(empIdStr && validIds.has(empIdStr) ? empIdStr : userId);
   if (cleanMemberIds.size < 2) return returnFunction(res, 400, false, 'Select at least one other project member.');
 
   let creatorName = req.user.name || '';
@@ -747,12 +813,15 @@ const getMessages = async (req, res) => {
 
   const userId = String(req.user._id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+  if (!(await canAccessProject(project, req.user))) {
+    return returnFunction(res, 403, false, 'You do not have access to this project.');
+  }
 
   let groupId = null;
   if (req.query.groupId) {
     const group = await findOne('project_chat_groups', { _id: new ObjectId(req.query.groupId) });
     if (!group) return returnFunction(res, 404, false, req.locale.notFound);
-    if (!isSup && !group.memberIds.some((id) => String(id) === userId)) {
+    if (!isSup && !personMatchesIds(req.user, group.memberIds)) {
       return returnFunction(res, 403, false, 'Not a member of this chat group.');
     }
     groupId = group._id;
@@ -782,12 +851,15 @@ const sendMessage = async (req, res) => {
 
   const userId = String(req.user._id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+  if (!(await canAccessProject(project, req.user))) {
+    return returnFunction(res, 403, false, 'You do not have access to this project.');
+  }
 
   let groupId = null;
   if (req.body.groupId) {
     const group = await findOne('project_chat_groups', { _id: new ObjectId(req.body.groupId) });
     if (!group) return returnFunction(res, 404, false, req.locale.notFound);
-    if (!isSup && !group.memberIds.some((id) => String(id) === userId)) {
+    if (!isSup && !personMatchesIds(req.user, group.memberIds)) {
       return returnFunction(res, 403, false, 'Not a member of this chat group.');
     }
     groupId = group._id;
@@ -802,9 +874,11 @@ const sendMessage = async (req, res) => {
   let senderRole = 'member';
   if (isSup) {
     senderRole = 'supervisor';
-  } else {
-    const member = await findOne('project_members', { projectId: new ObjectId(req.params.id), employeeId: new ObjectId(userId) });
+  } else if (req.user.employeeId) {
+    const member = await findOne('project_members', { projectId: new ObjectId(req.params.id), employeeId: new ObjectId(String(req.user.employeeId)) });
     senderRole = member?.role ?? req.user.role ?? 'member';
+  } else {
+    senderRole = req.user.role ?? 'member';
   }
 
   const doc = {

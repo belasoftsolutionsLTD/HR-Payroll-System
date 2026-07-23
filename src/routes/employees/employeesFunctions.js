@@ -7,7 +7,7 @@ const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
-const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const { runAccrual } = require('../../lib/leave/accrualEngine');
 
@@ -72,6 +72,17 @@ const recordJobHistoryIfChanged = async (existing, update, req) => {
     previousValues, newValues, reason: req.body.changeReason || null,
     changedBy: req.user._id, changedByName: req.user.name,
   });
+
+  return changedFields;
+};
+
+// Friendly labels for the employee-facing "your X was updated" notification below —
+// 'status' is deliberately excluded from that notification: a termination is already
+// covered by the offboarding flow + immediate login revocation, and other status
+// transitions (on_leave, etc.) already have their own dedicated messaging elsewhere.
+const FIELD_CHANGE_LABELS = {
+  designation: 'job title', department: 'department', managerId: 'manager',
+  grossPay: 'salary', employmentType: 'employment type',
 };
 
 // ── Status-change side effects ────────────────────────────────────────────────
@@ -337,13 +348,23 @@ const updateEmployee = async (req, res) => {
   if (update.managerId !== undefined) update.managerId = update.managerId ? new ObjectId(update.managerId) : null;
 
   await updateOne('employees', { _id: existing._id }, { $set: update });
-  await recordJobHistoryIfChanged(existing, update, req);
+  const changedFields = await recordJobHistoryIfChanged(existing, update, req);
   if (update.status === 'terminated' && existing.status !== 'terminated') {
     await revokeLoginAccess(existing._id);
     await flagMissingOffboardingIfNeeded(existing);
   }
   if (update.grossPay !== undefined && update.grossPay !== existing.grossPay) {
     await syncBasicPayCompensation(existing._id, update.grossPay, req.user._id, existing.dateOfHire);
+  }
+
+  const notifiableFields = (changedFields || []).filter((f) => f !== 'status');
+  if (notifiableFields.length) {
+    const labels = notifiableFields.map((f) => FIELD_CHANGE_LABELS[f] || f).join(', ');
+    notifyEmployee(existing._id, {
+      title: 'Profile Updated',
+      body: `Your ${labels} ${notifiableFields.length > 1 ? 'have' : 'has'} been updated by HR. Contact HR if you have any questions.`,
+      type: 'general',
+    }).catch(() => {});
   }
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
@@ -704,4 +725,5 @@ module.exports = {
   updateSkills, addCertification, deleteCertification, addEducation, deleteEducation,
   updateEmergencyContacts,
   getHeadcountAnalytics, getTurnoverAnalytics, getTenureAnalytics, getDemographicsAnalytics, getUpcomingAnalytics,
+  logJobHistoryChange,
 };

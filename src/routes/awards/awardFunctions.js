@@ -1,7 +1,7 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
 
 // ── Award Types (templates) ───────────────────────────────────────────────────
 
@@ -583,6 +583,14 @@ const nominateForProgram = async (req, res) => {
     createdAt: new Date(),
   };
   const result = await global.dbo.collection('award_nominations').insertOne(doc);
+
+  const nominee = await findOne('employees', { _id: doc.nomineeId }, { projection: { fullName: 1 } });
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'Award Nomination Submitted',
+    body: `${nominee?.fullName || 'An employee'} was nominated for "${program.name}".`,
+    type: 'general',
+  }).catch(() => {});
+
   return returnFunction(res, 201, true, 'Nomination submitted', { _id: result.insertedId });
 };
 
@@ -636,6 +644,12 @@ const selectWinner = async (req, res) => {
       updatedAt: new Date(),
     });
   }
+
+  notifyEmployee(new ObjectId(winnerId), {
+    title: 'Congratulations — you won an award!',
+    body: `You were selected as the winner of "${program?.name || 'this award'}".`,
+    type: 'general',
+  }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Winner announced!', { winner });
 };
