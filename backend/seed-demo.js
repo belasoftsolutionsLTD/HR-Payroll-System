@@ -130,10 +130,42 @@ async function seed() {
     console.log('ℹ️  Demo dept head user already exists — password reset to Demo@1234');
   }
 
-  // ── 3. Summary ───────────────────────────────────────────────────────────────
+  // ── 3. Demo Super Admin ───────────────────────────────────────────────────────
+  // Not linked to an employee record — super_admin is a system/HR-operator role,
+  // not a managed staff member, same convention this app already uses (the normal
+  // account-creation flow only ever issues hr_manager/department_head/staff roles).
+  const existingAdminUser = await db.collection('users').findOne({ email: 'admin@demo.com' });
+
+  if (!existingAdminUser) {
+    await db.collection('users').insertOne({
+      _id:               new ObjectId(),
+      name:              'Demo Super Admin',
+      email:             'admin@demo.com',
+      password:          hashed,
+      role:              'super_admin',
+      employeeId:        null,
+      isActive:          true,
+      mustResetPassword: false,
+      createdAt:         now,
+      updatedAt:         now,
+    });
+    console.log('✅ Demo super admin user created  →  admin@demo.com / Demo@1234');
+  } else {
+    await db.collection('users').updateOne(
+      { email: 'admin@demo.com' },
+      { $set: { password: hashed, mustResetPassword: false, isActive: true } }
+    );
+    console.log('ℹ️  Demo super admin user already exists — password reset to Demo@1234');
+  }
+
+  // ── 4. Summary ───────────────────────────────────────────────────────────────
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('  DEMO CREDENTIALS');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('  Super Admin');
+  console.log('    Email:    admin@demo.com');
+  console.log('    Password: Demo@1234');
+  console.log('');
   console.log('  Staff Portal');
   console.log('    Email:    staff@demo.com');
   console.log('    Password: Demo@1234');
