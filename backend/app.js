@@ -83,7 +83,11 @@ app.use('/uploads', (req, res, next) => {
 }, express.static(path.join(__dirname, 'uploads')));
 
 // ── Database ─────────────────────────────────────────────────────────────────
-connectDB().then(() => {
+// Exported as `dbReady` below so server.js can hold off calling app.listen() until
+// global.dbo is actually set — route registration below doesn't need the DB to be
+// ready, but any REQUEST handled before this resolves would hit `global.dbo` while
+// it's still undefined.
+const dbReady = connectDB().then(() => {
   initIndexes().catch(e => logger.error('initIndexes failed', { error: e.message }));
   seedDefaultTemplates().catch(e => logger.error('seedDefaultTemplates failed', { error: e.message }));
   startCronJobs();
@@ -141,3 +145,4 @@ app.use('/api/welfare',       decodeToken, getUserData, welfareRoutes);
 app.use(ErrorHandler);
 
 module.exports = app;
+module.exports.dbReady = dbReady;
