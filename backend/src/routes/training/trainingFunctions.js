@@ -447,6 +447,40 @@ const waiveEnrollment = async (req, res) => {
 
 // ── Employee — own enrollments only (scoped to req.user._id) ─────────────────
 
+// Self-service enrollment for the catalog above (browsing is already open to everyone —
+// listCatalog shows every published course regardless of role/department/mandatory, with
+// myEnrollment attached). This is the one narrow additional path beyond assignTraining/
+// automation rules: a published, NON-mandatory course whose targetRoles/targetDepartments
+// (empty = open to all) match the requester can be self-enrolled directly from there.
+// Mandatory/compliance courses deliberately stay assignment/rule-driven — those need due
+// dates and an audit trail of who assigned them and why, which self-serve would undermine.
+// Matches autoEnrollment.js's existing convention of targeting against users.role/
+// users.department (not the employees collection).
+const isEligibleForSelfEnroll = (course, user) => {
+  if (course.status !== 'published' || course.isMandatory) return false;
+  if (course.targetRoles?.length && !course.targetRoles.includes(user.role)) return false;
+  if (course.targetDepartments?.length && !course.targetDepartments.includes(user.department)) return false;
+  return true;
+};
+
+const selfEnroll = async (req, res) => {
+  const course = await findOne('courses', { _id: new ObjectId(req.params.id) });
+  if (!course) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!isEligibleForSelfEnroll(course, req.user)) {
+    return returnFunction(res, 403, false, 'This course is not available for self-enrollment.');
+  }
+
+  const result = await createSingleCourseEnrollment({
+    employeeId: new ObjectId(req.user._id),
+    courseId: course._id,
+    enrolledBy: new ObjectId(req.user._id),
+    enrollmentTrigger: 'self_registered',
+  });
+  if (!result.created) return returnFunction(res, 409, false, 'You are already enrolled in this course.');
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result._id });
+};
+
 const getMyEnrollments = async (req, res) => {
   const filter = { employeeId: new ObjectId(req.user._id) };
   if (req.query.status) filter.status = req.query.status;
@@ -642,11 +676,16 @@ const maybeGenerateCertificate = async (enrollmentId) => {
     const certificateNumber = await generateCertificateNumber(year);
     const expiresAt = course.certificateValidityDays ? new Date(now.getTime() + course.certificateValidityDays * 86400000) : null;
 
+    const settings = await findOne('company_settings', {});
     const pdfUrl = await generateCertificatePDF({
       employeeName: user?.name || 'Employee',
       courseTitle: course.title,
       completedAt: enrollment.completedAt || now,
       certificateNumber,
+      companyName: settings?.companyName || undefined,
+      brandColor: settings?.primaryColor,
+      gradientEndColor: settings?.gradientEnabled ? settings?.gradientEndColor : undefined,
+      logoPath: settings?.logoPath,
     });
 
     const doc = {
@@ -1160,6 +1199,7 @@ module.exports = {
   createLearningPath, listLearningPaths, getLearningPath, updateLearningPath, archiveLearningPath,
   createSingleCourseEnrollment, createLearningPathEnrollment,
   assignTraining, listEnrollments, waiveEnrollment,
+  selfEnroll,
   getMyEnrollments, updateMyProgress, submitQuizAttempt, submitCourseFeedback, getMyLearningPaths,
   generateMyCertificate, getMyCertificates,
   uploadExternalCertificate, getMyExternalCertificates, listExternalCertificates, verifyExternalCertificate,

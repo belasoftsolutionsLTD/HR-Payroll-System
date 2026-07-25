@@ -87,10 +87,12 @@ const getFeedPreview = async (req, res) => {
     sort: { createdAt: -1 },
   });
 
-  const enriched = await Promise.all(posts.map(async (p) => {
-    const author = p.authorId ? await findOne('employees', { _id: p.authorId }, { projection: { fullName: 1 } }) : null;
-    return { ...p, authorName: author?.fullName || 'Unknown' };
-  }));
+  const authorIds = [...new Set(posts.filter(p => p.authorId).map(p => String(p.authorId)))].map(id => new ObjectId(id));
+  const authors = authorIds.length
+    ? await findMany('employees', { _id: { $in: authorIds } }, { projection: { fullName: 1 } })
+    : [];
+  const authorById = Object.fromEntries(authors.map(a => [String(a._id), a]));
+  const enriched = posts.map(p => ({ ...p, authorName: (p.authorId && authorById[String(p.authorId)]?.fullName) || 'Unknown' }));
 
   return returnFunction(res, 200, true, 'ok', enriched);
 };
@@ -165,10 +167,12 @@ const getLiveAttendance = async (req, res) => {
     .sort((a, b) => new Date(b.checkInTime) - new Date(a.checkInTime))
     .slice(0, 5);
 
-  const recentEnriched = await Promise.all(recent.map(async (r) => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1 } });
-    return { name: emp?.fullName || 'Unknown', checkInTime: r.checkInTime };
-  }));
+  const recentEmpIds = [...new Set(recent.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const recentEmps = recentEmpIds.length
+    ? await findMany('employees', { _id: { $in: recentEmpIds } }, { projection: { fullName: 1 } })
+    : [];
+  const recentEmpById = Object.fromEntries(recentEmps.map(e => [String(e._id), e]));
+  const recentEnriched = recent.map(r => ({ name: recentEmpById[String(r.employeeId)]?.fullName || 'Unknown', checkInTime: r.checkInTime }));
 
   return returnFunction(res, 200, true, 'ok', {
     clockedIn,

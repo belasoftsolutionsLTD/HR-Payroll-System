@@ -9,6 +9,7 @@ const { HR_ROLES, MGMT_ROLES, ALL_ROLES } = require('../../constants/roles');
 const {
   listProjects, createProject, getProject, updateProject, completeProject, deleteProject,
   addMembers, removeMember,
+  createInvite, listInvites, revokeInvite,
   listSubtasks, createSubtask, updateSubtask, deleteSubtask,
   assignSubtaskEmployees, submitSubtaskReport,
   listNotes, createNote, deleteNote,
@@ -80,6 +81,10 @@ router.post('/:id/messages', allRoles, projectUpload.single('file'), AsyncHandle
 
 router.post('/:id/members',               mgmtOnly, AsyncHandler(addMembers));
 router.delete('/:id/members/:employeeId', mgmtOnly, AsyncHandler(removeMember));
+
+router.post('/:id/invites',              mgmtOnly, AsyncHandler(createInvite));
+router.get('/:id/invites',               mgmtOnly, AsyncHandler(listInvites));
+router.delete('/:id/invites/:inviteId',  mgmtOnly, AsyncHandler(revokeInvite));
 
 router.put('/:id/complete', allRoles, AsyncHandler(completeProject));
 

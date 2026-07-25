@@ -8,13 +8,10 @@ const CERT_DIR = path.join(
 );
 if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 
-// Brand palette — matches the frontend's brand-* design tokens (tailwind.config.ts) so
-// certificates feel like part of the same system rather than a separate visual language.
-const INDIGO      = '#4F46E5';
-const INDIGO_SOFT = '#E0E7FF';
-const INK         = '#0F172A';
-const SLATE       = '#64748B';
-const GOLD        = '#D4AF37';
+const INK   = '#0F172A';
+const SLATE = '#64748B';
+const FAINT = '#94A3B8';
+const DEFAULT_BRAND = '#4F46E5';
 
 // Draws a five-point star centered at (cx, cy) with given outer/inner radii.
 function drawStar(doc, cx, cy, outerR, innerR, color) {
@@ -32,9 +29,18 @@ function drawStar(doc, cx, cy, outerR, innerR, color) {
 }
 
 // One standard certificate template, reused for every course/training — only the
-// employee name, course title, completion date, and certificate number vary.
-const generateCertificatePDF = ({ employeeName, courseTitle, completedAt, certificateNumber, companyName = 'Bella ERP' }) => {
+// employee name, course title, completion date, and certificate number vary. Brand
+// color and logo come from company_settings so every org's certificates look like
+// their own system rather than a generic stock template — see trainingFunctions.js's
+// maybeGenerateCertificate, which loads those settings before calling this.
+const generateCertificatePDF = ({
+  employeeName, courseTitle, completedAt, certificateNumber,
+  companyName = 'Bella ERP', brandColor, gradientEndColor, logoPath,
+}) => {
   return new Promise((resolve, reject) => {
+    const brand = /^#[0-9a-fA-F]{6}$/.test(brandColor || '') ? brandColor : DEFAULT_BRAND;
+    const gradientEnd = /^#[0-9a-fA-F]{6}$/.test(gradientEndColor || '') ? gradientEndColor : brand;
+
     const doc = new PDFDocument({ size: 'A4', layout: 'landscape', margin: 0 });
     const filename = `certificate-${certificateNumber}.pdf`;
     const filePath = path.join(CERT_DIR, filename);
@@ -43,70 +49,91 @@ const generateCertificatePDF = ({ employeeName, courseTitle, completedAt, certif
 
     const W = doc.page.width;
     const H = doc.page.height;
+    const BAND_H = 96;
 
-    // Background + corner flourishes
     doc.rect(0, 0, W, H).fill('#FFFFFF');
-    doc.circle(0, 0, 160).fill(INDIGO_SOFT);
-    doc.circle(W, H, 160).fill(INDIGO_SOFT);
-    doc.circle(0, 0, 100).fill('#FFFFFF').circle(0, 0, 100).lineWidth(0).fill('#FFFFFF');
 
-    // Frame
-    doc.rect(28, 28, W - 56, H - 56).lineWidth(2.5).strokeColor(INDIGO).stroke();
-    doc.rect(36, 36, W - 72, H - 72).lineWidth(0.75).strokeColor(GOLD).stroke();
+    // Subtle geometric corner accent (opposite corners) instead of a busy double frame —
+    // a single low-opacity wedge in the brand color reads as modern rather than "templatey".
+    doc.save();
+    doc.fillOpacity(0.06);
+    doc.polygon([0, 0], [190, 0], [0, 190]).fill(brand);
+    doc.polygon([W, H], [W - 190, H], [W, H - 190]).fill(brand);
+    doc.restore();
 
-    let y = 78;
-    doc.fontSize(13).font('Helvetica-Bold').fillColor(INDIGO)
-      .text(companyName.toUpperCase(), 0, y, { align: 'center', characterSpacing: 3 });
+    // Single thin frame — one accent line beats the old gold+indigo double-frame combo.
+    doc.rect(24, 24, W - 48, H - 48).lineWidth(1.25).strokeColor(brand).strokeOpacity(0.5).stroke();
+    doc.strokeOpacity(1);
 
-    y += 34;
-    doc.fontSize(38).font('Times-Bold').fillColor(INK)
+    // Header band — real gradient (brand → gradientEnd) if the org has one configured,
+    // otherwise a solid brand-color fill.
+    const gradient = doc.linearGradient(0, 0, W, BAND_H);
+    gradient.stop(0, brand).stop(1, gradientEnd);
+    doc.rect(0, 0, W, BAND_H).fill(gradient);
+
+    const logoAbsPath = logoPath ? path.resolve(logoPath) : null;
+    const hasLogo = logoAbsPath && fs.existsSync(logoAbsPath);
+    let textStartX = 60;
+    if (hasLogo) {
+      try {
+        doc.image(logoAbsPath, 56, BAND_H / 2 - 22, { fit: [44, 44] });
+        textStartX = 112;
+      } catch { /* corrupt/unsupported image — fall back to text-only header */ }
+    }
+    doc.fontSize(20).font('Helvetica-Bold').fillColor('#FFFFFF')
+      .text(companyName, textStartX, BAND_H / 2 - 13, { width: W - textStartX - 60 });
+
+    let y = BAND_H + 56;
+    doc.fontSize(34).font('Times-Bold').fillColor(INK)
       .text('Certificate of Completion', 0, y, { align: 'center' });
 
-    // Decorative rule under the title
-    const ruleW = 220;
-    doc.moveTo(W / 2 - ruleW / 2, y + 54).lineTo(W / 2 + ruleW / 2, y + 54)
-      .lineWidth(1.5).strokeColor(GOLD).stroke();
+    const ruleW = 200;
+    doc.moveTo(W / 2 - ruleW / 2, y + 48).lineTo(W / 2 + ruleW / 2, y + 48)
+      .lineWidth(1.5).strokeColor(brand).stroke();
 
-    y += 78;
-    doc.fontSize(13).font('Helvetica').fillColor(SLATE)
+    y += 70;
+    doc.fontSize(12).font('Helvetica').fillColor(SLATE)
       .text('This certificate is proudly presented to', 0, y, { align: 'center' });
 
     y += 30;
-    doc.fontSize(32).font('Times-BoldItalic').fillColor(INDIGO)
+    doc.fontSize(30).font('Times-BoldItalic').fillColor(brand)
       .text(employeeName, 0, y, { align: 'center' });
 
-    y += 52;
-    doc.fontSize(13).font('Helvetica').fillColor(SLATE)
+    y += 48;
+    doc.fontSize(12).font('Helvetica').fillColor(SLATE)
       .text('for successfully completing the course', 0, y, { align: 'center' });
 
-    y += 28;
-    doc.fontSize(22).font('Times-Bold').fillColor(INK)
+    y += 26;
+    doc.fontSize(20).font('Times-Bold').fillColor(INK)
       .text(courseTitle, 60, y, { align: 'center', width: W - 120 });
 
-    // Seal — bottom right, star inside a double ring
-    const sealCx = W - 130;
-    const sealCy = H - 110;
-    doc.circle(sealCx, sealCy, 42).lineWidth(2).strokeColor(GOLD).stroke();
-    doc.circle(sealCx, sealCy, 36).fillColor(INDIGO).fill();
-    drawStar(doc, sealCx, sealCy, 20, 8, '#FFFFFF');
-    doc.fontSize(7.5).font('Helvetica-Bold').fillColor(GOLD)
-      .text('CERTIFIED', sealCx - 40, sealCy + 48, { width: 80, align: 'center', characterSpacing: 1 });
+    // Footer — three columns: issue date · signature · seal + certificate number
+    const footerY = H - 110;
+    doc.moveTo(60, footerY).lineTo(W - 60, footerY).lineWidth(0.75).strokeColor('#E2E8F0').stroke();
 
-    // Signature line — bottom left
-    const sigX = 90;
-    const sigY = H - 96;
-    doc.moveTo(sigX, sigY).lineTo(sigX + 200, sigY).lineWidth(1).strokeColor(SLATE).stroke();
-    doc.fontSize(10).font('Helvetica-Bold').fillColor(INK)
-      .text('Authorized Signature', sigX, sigY + 6, { width: 200, align: 'center' });
-    doc.fontSize(9).font('Helvetica').fillColor(SLATE)
-      .text(companyName, sigX, sigY + 20, { width: 200, align: 'center' });
-
-    // Footer meta
-    doc.fontSize(10).font('Helvetica').fillColor(SLATE).text(
-      `Completed on ${new Date(completedAt).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' })}`,
-      0, H - 60, { align: 'center' }
+    doc.fontSize(9).font('Helvetica-Bold').fillColor(FAINT).text('DATE ISSUED', 60, footerY + 18, { characterSpacing: 0.5 });
+    doc.fontSize(11).font('Helvetica').fillColor(INK).text(
+      new Date(completedAt).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' }),
+      60, footerY + 32
     );
-    doc.fontSize(8).fillColor('#94A3B8').text(`Certificate No. ${certificateNumber}`, 0, H - 44, { align: 'center' });
+
+    const sigX = W / 2 - 100;
+    doc.moveTo(sigX, footerY + 44).lineTo(sigX + 200, footerY + 44).lineWidth(1).strokeColor(SLATE).stroke();
+    doc.fontSize(10).font('Helvetica-Bold').fillColor(INK).text('Authorized Signature', sigX, footerY + 50, { width: 200, align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor(SLATE).text(companyName, sigX, footerY + 64, { width: 200, align: 'center' });
+
+    // Certificate number sits well clear of the seal's bounding box (seal spans roughly
+    // W-146 to W-18 horizontally) — a prior version had these overlapping.
+    doc.fontSize(9).font('Helvetica-Bold').fillColor(FAINT).text('CERTIFICATE NO.', W - 340, footerY + 18, { width: 170, align: 'right', characterSpacing: 0.5 });
+    doc.fontSize(11).font('Helvetica').fillColor(INK).text(certificateNumber, W - 340, footerY + 32, { width: 170, align: 'right' });
+
+    // Seal — bottom right, star inside a ring, in the brand color
+    const sealCx = W - 82;
+    const sealCy = H - 60;
+    doc.circle(sealCx, sealCy, 32).lineWidth(1.5).strokeColor(brand).strokeOpacity(0.6).stroke();
+    doc.strokeOpacity(1);
+    doc.circle(sealCx, sealCy, 27).fillColor(brand).fill();
+    drawStar(doc, sealCx, sealCy, 15, 6, '#FFFFFF');
 
     doc.end();
     stream.on('finish', () => resolve(`/uploads/certificates/${filename}`));

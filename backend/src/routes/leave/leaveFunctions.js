@@ -49,6 +49,48 @@ const enrichBalance = async (balance) => {
   return { ...balance, leaveType: leaveType || null };
 };
 
+// Batch versions of the two enrichers above — every list/calendar endpoint used to run
+// enrichRequest/enrichBalance per row via Promise.all(rows.map(...)), which meant one
+// (or two) findOne round-trips per row instead of one $in query for the whole page.
+// Harmless at a handful of rows, but this pattern repeats across nearly every leave
+// endpoint and was one of the biggest contributors to "everything feels slow."
+const enrichRequests = async (requests) => {
+  if (!requests.length) return [];
+  const employeeIds  = [...new Set(requests.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const leaveTypeIds = [...new Set(requests.map(r => String(r.leaveTypeId)))].map(id => new ObjectId(id));
+  const [employees, leaveTypes] = await Promise.all([
+    findMany('employees', { _id: { $in: employeeIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } }),
+    findMany('leave_types', { _id: { $in: leaveTypeIds } }, { projection: { name: 1, code: 1, color: 1, isPaid: 1 } }),
+  ]);
+  const empById  = Object.fromEntries(employees.map(e => [String(e._id), e]));
+  const typeById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t]));
+  return requests.map(r => ({
+    ...r,
+    employee: empById[String(r.employeeId)] || null,
+    leaveType: typeById[String(r.leaveTypeId)] || null,
+  }));
+};
+
+const enrichBalances = async (balances, { includeEmployee = false } = {}) => {
+  if (!balances.length) return [];
+  const leaveTypeIds = [...new Set(balances.map(b => String(b.leaveTypeId)))].map(id => new ObjectId(id));
+  const leaveTypes = await findMany('leave_types', { _id: { $in: leaveTypeIds } }, { projection: { name: 1, code: 1, color: 1, isPaid: 1 } });
+  const typeById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t]));
+
+  let empById = {};
+  if (includeEmployee) {
+    const employeeIds = [...new Set(balances.map(b => String(b.employeeId)))].map(id => new ObjectId(id));
+    const employees = await findMany('employees', { _id: { $in: employeeIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+    empById = Object.fromEntries(employees.map(e => [String(e._id), e]));
+  }
+
+  return balances.map(b => ({
+    ...b,
+    leaveType: typeById[String(b.leaveTypeId)] || null,
+    ...(includeEmployee ? { employee: empById[String(b.employeeId)] || null } : {}),
+  }));
+};
+
 const recomputeClosing = async (employeeId, leaveTypeId, year) => {
   const bal = await findOne('leave_balances', { employeeId: new ObjectId(employeeId), leaveTypeId: new ObjectId(leaveTypeId), year });
   if (!bal) return null;
@@ -244,11 +286,7 @@ const getLeaveBalances = async (req, res) => {
   if (scopedIds !== null) filter.employeeId = { $in: scopedIds };
   if (req.query.year) filter.year = Number(req.query.year);
   const balances = await findMany('leave_balances', filter);
-  const enriched = await Promise.all(balances.map(async (b) => {
-    const withType = await enrichBalance(b);
-    const employee = await findOne('employees', { _id: b.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-    return { ...withType, employee: employee || null };
-  }));
+  const enriched = await enrichBalances(balances, { includeEmployee: true });
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -259,7 +297,7 @@ const getEmployeeLeaveBalances = async (req, res) => {
   }
   const year = req.query.year ? Number(req.query.year) : new Date().getFullYear();
   const balances = await findMany('leave_balances', { employeeId: new ObjectId(req.params.employeeId), year });
-  const enriched = await Promise.all(balances.map(enrichBalance));
+  const enriched = await enrichBalances(balances);
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -320,7 +358,7 @@ const listLeaveRequests = async (req, res) => {
     countDocuments('leave_requests', filter),
     findMany('leave_requests', filter, { skip, limit, sort: { createdAt: -1 } }),
   ]);
-  let enriched = await Promise.all(requests.map(enrichRequest));
+  let enriched = await enrichRequests(requests);
 
   if (req.query.department) enriched = enriched.filter(r => r.employee?.department === req.query.department);
   if (req.query.search) {
@@ -762,7 +800,7 @@ const getLeaveCalendar = async (req, res) => {
   if (req.query.leaveTypeId) filter.leaveTypeId = new ObjectId(req.query.leaveTypeId);
 
   let requests = await findMany('leave_requests', filter);
-  let enriched = await Promise.all(requests.map(enrichRequest));
+  let enriched = await enrichRequests(requests);
   if (req.query.departmentId) enriched = enriched.filter(r => r.employee?.department === req.query.departmentId);
 
   return returnFunction(res, 200, true, req.locale.success, enriched);
@@ -774,7 +812,7 @@ const getLeaveCalendar = async (req, res) => {
 
 const getPayrollFeed = async (req, res) => {
   const requests = await findMany('leave_requests', { status: 'approved', payrollRunId: null });
-  const enriched = await Promise.all(requests.map(enrichRequest));
+  const enriched = await enrichRequests(requests);
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -899,7 +937,7 @@ const getMyBalances = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, []);
   const year = req.query.year ? Number(req.query.year) : new Date().getFullYear();
   const balances = await findMany('leave_balances', { employeeId: new ObjectId(req.user.employeeId), year });
-  const enriched = await Promise.all(balances.map(enrichBalance));
+  const enriched = await enrichBalances(balances);
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -908,7 +946,7 @@ const getMyRequests = async (req, res) => {
   const filter = { employeeId: new ObjectId(req.user.employeeId) };
   if (req.query.status) filter.status = req.query.status;
   const requests = await findMany('leave_requests', filter, { sort: { createdAt: -1 } });
-  const enriched = await Promise.all(requests.map(enrichRequest));
+  const enriched = await enrichRequests(requests);
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -938,8 +976,8 @@ const getMyCalendar = async (req, res) => {
 
   const holidays = await findMany('public_holidays', {});
   return returnFunction(res, 200, true, req.locale.success, {
-    mine: await Promise.all(mine.map(enrichRequest)),
-    team: await Promise.all(team.map(enrichRequest)),
+    mine: await enrichRequests(mine),
+    team: await enrichRequests(team),
     holidays,
   });
 };

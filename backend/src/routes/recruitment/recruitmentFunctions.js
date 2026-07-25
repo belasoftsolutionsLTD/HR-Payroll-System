@@ -299,22 +299,19 @@ const hireCandidate = async (application, requisition, actingUser) => {
   return empResult.insertedId.toString();
 };
 
-const moveApplicationStage = async (req, res) => {
-  if (!validateRequiredFields(req, res, ['stageId'])) return;
-
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
-  if (!application) return returnFunction(res, 404, false, req.locale.notFound);
-  if (application.status !== 'active') return returnFunction(res, 400, false, 'Only active applications can be moved.');
-
-  const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
-  if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
-
+// Shared by the plain HR-authenticated move route AND assignInterviewer, which also
+// performs the move as a side effect when it targets a stage the candidate isn't at
+// yet — mirrors extendOffer's existing pattern for the Offer stage: the action that
+// collects the required details (interviewer+schedule / salary+start date) IS what
+// moves the candidate, so there's no path that enters that stage with nothing set.
+// Returns { error } on failure, or { toStage, hiredEmployeeId } on success.
+const moveApplicationStageCore = async (application, requisition, toStageId, actingUser) => {
   const fromIndex = requisition.pipelineStages.findIndex((s) => s.id === application.currentStageId);
-  const toIndex = requisition.pipelineStages.findIndex((s) => s.id === req.body.stageId);
+  const toIndex = requisition.pipelineStages.findIndex((s) => s.id === toStageId);
   const fromStage = requisition.pipelineStages[fromIndex];
   const toStage = requisition.pipelineStages[toIndex];
-  if (!toStage) return returnFunction(res, 400, false, 'Invalid target stage.');
-  if (toStage.id === application.currentStageId) return returnFunction(res, 400, false, 'Application is already at this stage.');
+  if (!toStage) return { error: 'Invalid target stage.' };
+  if (toStage.id === application.currentStageId) return { error: 'Application is already at this stage.' };
 
   const isForwardMove = fromIndex === -1 || toIndex > fromIndex;
   if (isForwardMove && fromStage?.requiresScorecard) {
@@ -326,13 +323,10 @@ const moveApplicationStage = async (req, res) => {
       const submittedIds = new Set(stageScorecards.map((sc) => String(sc.interviewerId)));
       const missing = stageAssignments.filter((a) => !submittedIds.has(String(a.interviewerId)));
       if (missing.length > 0) {
-        return returnFunction(
-          res, 400, false,
-          `Waiting on a scorecard from ${missing.map((m) => m.interviewerName).join(', ')} before moving this candidate forward.`
-        );
+        return { error: `Waiting on a scorecard from ${missing.map((m) => m.interviewerName).join(', ')} before moving this candidate forward.` };
       }
     } else if (stageScorecards.length === 0) {
-      return returnFunction(res, 400, false, `A scorecard must be submitted for "${fromStage.name}" before moving this candidate forward.`);
+      return { error: `A scorecard must be submitted for "${fromStage.name}" before moving this candidate forward.` };
     }
   }
 
@@ -340,7 +334,7 @@ const moveApplicationStage = async (req, res) => {
   const stageHistory = application.stageHistory.map((h, i) => (
     i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
   ));
-  stageHistory.push({ stageId: toStage.id, stageName: toStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) });
+  stageHistory.push({ stageId: toStage.id, stageName: toStage.name, enteredAt: now, movedBy: actingUser?._id ? new ObjectId(actingUser._id) : null });
 
   await updateOne('applications', { _id: application._id }, {
     $set: { currentStageId: toStage.id, stageHistory, updatedAt: now },
@@ -351,10 +345,34 @@ const moveApplicationStage = async (req, res) => {
 
   let hiredEmployeeId = null;
   if (toStage.type === 'hired') {
-    hiredEmployeeId = await hireCandidate(application, requisition, req.user);
+    hiredEmployeeId = await hireCandidate(application, requisition, actingUser);
   }
 
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully, hiredEmployeeId ? { employeeId: hiredEmployeeId } : undefined);
+  return { toStage, hiredEmployeeId };
+};
+
+const moveApplicationStage = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['stageId'])) return;
+
+  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  if (!application) return returnFunction(res, 404, false, req.locale.notFound);
+  if (application.status !== 'active') return returnFunction(res, 400, false, 'Only active applications can be moved.');
+
+  const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
+  if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
+
+  const targetStage = requisition.pipelineStages.find((s) => s.id === req.body.stageId);
+  if (targetStage?.type === 'offer') {
+    return returnFunction(res, 400, false, 'Use "Extend Offer" to move a candidate into the Offer stage — it collects the salary and start date at the same time, instead of leaving them unset.');
+  }
+  if (targetStage?.type === 'interview') {
+    return returnFunction(res, 400, false, 'Use "Assign Interviewer" to move a candidate into an Interview stage — it collects the interviewer, date/time, and location at the same time, instead of leaving them unset.');
+  }
+
+  const result = await moveApplicationStageCore(application, requisition, req.body.stageId, req.user);
+  if (result.error) return returnFunction(res, 400, false, result.error);
+
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully, result.hiredEmployeeId ? { employeeId: result.hiredEmployeeId } : undefined);
 };
 
 const updateApplicationStatus = async (req, res) => {
@@ -420,6 +438,11 @@ const bulkApplicationAction = async (req, res) => {
     if (!stageId) return returnFunction(res, 400, false, 'stageId is required for the shortlist action.');
     targetStage = requisition.pipelineStages.find((s) => s.id === stageId);
     if (!targetStage) return returnFunction(res, 400, false, 'Invalid target stage.');
+    // Same rule as the single-application move — Offer/Interview stages need their
+    // details collected per-candidate (salary+start date / interviewer+schedule), which
+    // a bulk action can't do, so bulk-shortlisting into either isn't offered here.
+    if (targetStage.type === 'offer') return returnFunction(res, 400, false, 'Bulk shortlist can\'t target the Offer stage — extend an offer to each candidate individually.');
+    if (targetStage.type === 'interview') return returnFunction(res, 400, false, 'Bulk shortlist can\'t target an Interview stage — assign an interviewer to each candidate individually.');
   } else if (action === 'hire') {
     targetStage = requisition.pipelineStages.find((s) => s.type === 'hired');
     if (!targetStage) return returnFunction(res, 400, false, 'This requisition has no "hired" stage configured.');
@@ -448,45 +471,12 @@ const bulkApplicationAction = async (req, res) => {
           }).catch(() => {});
         }
       } else {
-        // shortlist / hire — both are a stage move; same forward-move scorecard gate as
-        // the single-application moveApplicationStage endpoint.
-        const fromIndex = requisition.pipelineStages.findIndex((s) => s.id === application.currentStageId);
-        const toIndex = requisition.pipelineStages.findIndex((s) => s.id === targetStage.id);
-        const fromStage = requisition.pipelineStages[fromIndex];
-        if (targetStage.id === application.currentStageId) throw new Error('Already at this stage.');
-
-        const isForwardMove = fromIndex === -1 || toIndex > fromIndex;
-        if (isForwardMove && fromStage?.requiresScorecard) {
-          const stageAssignments = (application.interviewAssignments || []).filter((a) => a.stageId === fromStage.id);
-          const stageScorecards = await findMany('scorecards', { applicationId: application._id, stageId: fromStage.id }, { projection: { interviewerId: 1 } });
-          if (stageAssignments.length > 0) {
-            const submittedIds = new Set(stageScorecards.map((sc) => String(sc.interviewerId)));
-            const missing = stageAssignments.filter((a) => !submittedIds.has(String(a.interviewerId)));
-            if (missing.length > 0) throw new Error(`Waiting on a scorecard from ${missing.map((m) => m.interviewerName).join(', ')}.`);
-          } else if (stageScorecards.length === 0) {
-            throw new Error(`A scorecard must be submitted for "${fromStage.name}" first.`);
-          }
-        }
-
-        const now = new Date();
-        const stageHistory = application.stageHistory.map((h, i) => (
-          i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
-        ));
-        stageHistory.push({ stageId: targetStage.id, stageName: targetStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) });
-
-        await updateOne('applications', { _id: application._id }, {
-          $set: { currentStageId: targetStage.id, stageHistory, updatedAt: now },
-        });
-
-        // Same onEnter/onExit auto-action mechanism (including any stage-configured
-        // candidate email) a single drag-and-drop move already fires — bulk shortlist/hire
-        // sends the same automated email to every selected candidate for free.
-        if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
-        await fireAutoActions({ ...application, currentStageId: targetStage.id }, targetStage, global.dbo, 'onEnter');
-
-        if (action === 'hire') {
-          await hireCandidate({ ...application, currentStageId: targetStage.id }, requisition, req.user);
-        }
+        // shortlist / hire — both are a stage move; same forward-move scorecard gate
+        // (and the same 'hired'-type auto-hire) as the single-application move, via the
+        // shared core. This also sends any stage-configured candidate email for free,
+        // same as a single drag-and-drop move already does.
+        const moveResult = await moveApplicationStageCore(application, requisition, targetStage.id, req.user);
+        if (moveResult.error) throw new Error(moveResult.error);
       }
 
       succeeded.push(id);
@@ -614,6 +604,9 @@ const assignInterviewer = async (req, res) => {
   const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
+  const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
+  if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
+
   const interviewer = await findOne('users', { _id: new ObjectId(req.body.interviewerId) });
   if (!interviewer) return returnFunction(res, 404, false, 'Interviewer account not found.');
 
@@ -621,6 +614,16 @@ const assignInterviewer = async (req, res) => {
     (a) => a.stageId === req.body.stageId && String(a.interviewerId) === req.body.interviewerId
   );
   if (already) return returnFunction(res, 409, false, 'This interviewer is already assigned to this stage.');
+
+  // Assigning an interviewer to a stage the candidate isn't at yet IS the move into that
+  // stage (see moveApplicationStage, which now refuses to move into an Interview stage any
+  // other way) — no candidate ever reaches an Interview stage with zero interviewer/schedule set.
+  let hiredEmployeeId = null;
+  if (req.body.stageId !== application.currentStageId) {
+    const moveResult = await moveApplicationStageCore(application, requisition, req.body.stageId, req.user);
+    if (moveResult.error) return returnFunction(res, 400, false, moveResult.error);
+    hiredEmployeeId = moveResult.hiredEmployeeId;
+  }
 
   const assignment = {
     stageId: req.body.stageId,
@@ -648,10 +651,7 @@ const assignInterviewer = async (req, res) => {
   // Tell the candidate their interview is scheduled, with every logistical detail they
   // need (meeting link, location, time, required documents) — but never who is
   // interviewing them, which is HR/internal-only information.
-  const [candidate, requisition] = await Promise.all([
-    findOne('candidates', { _id: application.candidateId }),
-    findOne('jobRequisitions', { _id: application.requisitionId }),
-  ]);
+  const candidate = await findOne('candidates', { _id: application.candidateId });
   if (candidate?.email) {
     const tokens = candidateTokens(candidate, requisition);
     const when = assignment.scheduledAt.toLocaleString('en-KE', { dateStyle: 'full', timeStyle: 'short' });
@@ -675,7 +675,7 @@ const assignInterviewer = async (req, res) => {
     }).catch(() => {});
   }
 
-  return returnFunction(res, 201, true, 'Interviewer assigned.', assignment);
+  return returnFunction(res, 201, true, 'Interviewer assigned.', { ...assignment, employeeId: hiredEmployeeId });
 };
 
 // HR-triggered reminder email to the candidate ahead of their scheduled interview/assessment

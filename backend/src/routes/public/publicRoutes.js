@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
 const { respondToOfferCore } = require('../recruitment/recruitmentFunctions');
+const { findInviteByToken, acceptInviteCore, declineInviteCore } = require('../projects/projectsFunctions');
 
 const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
@@ -344,6 +345,47 @@ router.post('/offers/:token/respond', AsyncHandler(async (req, res) => {
   await respondToOfferCore(application, req.body.status, null);
 
   return returnFunction(res, 200, true, `Offer ${req.body.status}.`);
+}));
+
+// ── Project invite response (public, token-based — invitee has no account yet) ──
+
+// GET /api/public/project-invites/:token — invitee views the invite before deciding
+router.get('/project-invites/:token', AsyncHandler(async (req, res) => {
+  const invite = await findInviteByToken(req.params.token);
+  if (!invite) return returnFunction(res, 404, false, 'Invite not found or link is invalid.');
+  if (invite.status === 'pending' && new Date(invite.expiresAt) < new Date()) {
+    await updateOne('project_invites', { _id: invite._id }, { $set: { status: 'expired', updatedAt: new Date() } });
+    return returnFunction(res, 410, false, 'This invite has expired.');
+  }
+
+  return returnFunction(res, 200, true, 'Invite found.', {
+    name: invite.name,
+    projectName: invite.projectName,
+    invitedByName: invite.invitedByName,
+    projectRole: invite.projectRole,
+    contractEndDate: invite.contractEndDate,
+    expiresAt: invite.expiresAt,
+    status: invite.status,
+  });
+}));
+
+// POST /api/public/project-invites/:token/respond — invitee accepts or declines
+router.post('/project-invites/:token/respond', AsyncHandler(async (req, res) => {
+  if (!validateRequiredFields(req, res, ['status'])) return;
+  if (!['accepted', 'declined'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be accepted or declined.');
+
+  const invite = await findInviteByToken(req.params.token);
+  if (!invite) return returnFunction(res, 404, false, 'Invite not found or link is invalid.');
+  if (invite.status !== 'pending') return returnFunction(res, 400, false, 'This invite has already been responded to.');
+  if (new Date(invite.expiresAt) < new Date()) return returnFunction(res, 410, false, 'This invite has expired.');
+
+  if (req.body.status === 'accepted') {
+    await acceptInviteCore(invite);
+  } else {
+    await declineInviteCore(invite);
+  }
+
+  return returnFunction(res, 200, true, `Invite ${req.body.status}.`);
 }));
 
 module.exports = router;

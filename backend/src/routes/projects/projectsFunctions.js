@@ -1,13 +1,19 @@
 const { ObjectId } = require('mongodb');
-const path = require('path');
-const fs   = require('fs');
+const path   = require('path');
+const fs     = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { createInboxItem } = require('../inbox/inboxFunctions');
+const { sendEmail } = require('../../services/emailService');
+const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 
 const HR_ROLES   = ['super_admin', 'hr_manager'];
 const MGMT_ROLES = ['super_admin', 'hr_manager', 'department_head'];
+const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
+const INVITE_EXPIRY_DAYS = 7;
 
 const UPLOAD_BASE = path.join(
   process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, '..', '..', '..', 'uploads'),
@@ -393,6 +399,221 @@ const removeMember = async (req, res) => {
     projectId, employeeId: new ObjectId(req.params.employeeId),
   });
   return returnFunction(res, 200, true, 'Member removed.');
+};
+
+// ── Invites (external / not-yet-in-system members, e.g. short-term contractors) ─
+// Every existing project-membership mechanic (chat, subtask assignment, notifications,
+// canAccessProject) is built entirely around project_members.employeeId, which requires
+// a real `employees` record. So inviting someone who isn't in the system yet works by
+// creating that record (plus a `users` login, same shape createAccount uses) the moment
+// they accept — not a parallel access mechanism. `contractEndDate` is mandatory here
+// (unlike on the general employee form) so short engagements self-expire — see
+// deactivateExpiredContractors in lib/tasks/cronTasks.js, which reads this field to
+// auto-deactivate the login and flip employee status once it passes.
+
+const generateInvitePassword = () => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789@#!';
+  return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+};
+
+const createInvite = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'email', 'contractEndDate'])) return;
+  const projectId = new ObjectId(req.params.id);
+  const project   = await findOne('projects', { _id: projectId });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+    return returnFunction(res, 403, false, 'Only the project supervisor can invite members.');
+  }
+
+  const email = String(req.body.email).toLowerCase().trim();
+  const name  = String(req.body.name).trim();
+  const projectRole = req.body.role || 'member';
+  const contractEndDate = new Date(req.body.contractEndDate);
+  if (Number.isNaN(contractEndDate.getTime()) || contractEndDate <= new Date()) {
+    return returnFunction(res, 400, false, 'contractEndDate must be a valid future date.');
+  }
+
+  const existingUser = await findOne('users', { email });
+  if (existingUser) {
+    return returnFunction(res, 409, false, `${email} already has an account — add them as a regular member instead of inviting them.`);
+  }
+  // Only a still-live pending invite blocks a re-invite — one that's pending in name
+  // only (the invitee never clicked through before expiresAt passed) must not lock HR
+  // out of ever inviting that email again.
+  const existingInvite = await findOne('project_invites', { projectId, email, status: 'pending', expiresAt: { $gt: new Date() } });
+  if (existingInvite) return returnFunction(res, 409, false, 'There is already a pending invite for this email on this project.');
+
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + INVITE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+  const doc = {
+    projectId,
+    projectName: project.name,
+    email, name,
+    projectRole,
+    contractEndDate,
+    invitedBy: new ObjectId(String(req.user._id)),
+    invitedByName: req.user.name || 'Supervisor',
+    tokenHash: crypto.createHash('sha256').update(rawToken).digest('hex'),
+    status: 'pending',
+    expiresAt,
+    createdEmployeeId: null,
+    respondedAt: null,
+    createdAt: now, updatedAt: now,
+  };
+  const result = await insertOne('project_invites', doc);
+
+  const inviteUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/project-invite/${rawToken}`;
+  sendEmail({
+    to: email,
+    subject: `You've been invited to join a project at ${COMPANY_NAME}`,
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto;">
+        <h2>Project Invitation</h2>
+        <p>Hi <strong>${name}</strong>,</p>
+        <p>${doc.invitedByName} has invited you to join the project <strong>${project.name}</strong> at ${COMPANY_NAME} through ${contractEndDate.toDateString()}.</p>
+        <p><a href="${inviteUrl}" style="display:inline-block;padding:10px 20px;background:#4f46e5;color:#fff;border-radius:8px;text-decoration:none;">View Invitation</a></p>
+        <p style="color:#888;font-size:13px;">This invite link expires on ${expiresAt.toDateString()}.</p>
+      </div>
+    `,
+  }).catch(() => {});
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const listInvites = async (req, res) => {
+  const projectId = new ObjectId(req.params.id);
+  const project   = await findOne('projects', { _id: projectId });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+    return returnFunction(res, 403, false, 'Only the project supervisor can view invites.');
+  }
+
+  const invites = await findMany('project_invites', { projectId }, { sort: { createdAt: -1 } });
+  return returnFunction(res, 200, true, req.locale.success, invites);
+};
+
+const revokeInvite = async (req, res) => {
+  const projectId = new ObjectId(req.params.id);
+  const project   = await findOne('projects', { _id: projectId });
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+    return returnFunction(res, 403, false, 'Only the project supervisor can revoke invites.');
+  }
+
+  const invite = await findOne('project_invites', { _id: new ObjectId(req.params.inviteId), projectId });
+  if (!invite) return returnFunction(res, 404, false, req.locale.notFound);
+  if (invite.status !== 'pending') return returnFunction(res, 400, false, 'Only pending invites can be revoked.');
+
+  await updateOne('project_invites', { _id: invite._id }, { $set: { status: 'revoked', updatedAt: new Date() } });
+  return returnFunction(res, 200, true, 'Invite revoked.');
+};
+
+// Shared by both the public accept/decline routes (publicRoutes.js) — no logged-in
+// user exists for either action, matching respondToOfferCore's actingUser-less pattern.
+const findInviteByToken = async (rawToken) => {
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  return findOne('project_invites', { tokenHash });
+};
+
+const acceptInviteCore = async (invite) => {
+  const project = await findOne('projects', { _id: invite.projectId });
+  const hireDate = new Date();
+  const staffNumber = await generateStaffNumber(hireDate.getFullYear());
+
+  const empDoc = {
+    fullName: invite.name,
+    firstName: null, lastName: null,
+    email: invite.email,
+    phone: null, nationalId: null,
+    staffNumber,
+    designation: 'Contractor',
+    employmentType: 'contract',
+    department: project?.departments?.[0] || null,
+    jobGroupId: null,
+    dateOfHire: hireDate,
+    dateOfBirth: null,
+    contractEndDate: invite.contractEndDate,
+    probationEndDate: null, confirmationDate: null,
+    terminationDate: null, terminationReason: null,
+    grossPay: null, nextOfKin: null, profilePhoto: null, documents: [],
+    status: 'active',
+    createdAt: hireDate, updatedAt: hireDate,
+  };
+  const empResult = await insertOne('employees', empDoc);
+
+  const rawPassword = generateInvitePassword();
+  const hashedPassword = await bcrypt.hash(rawPassword, 12);
+  await insertOne('users', {
+    name: invite.name,
+    email: invite.email,
+    password: hashedPassword,
+    role: 'staff',
+    employeeId: empResult.insertedId,
+    department: empDoc.department,
+    mustResetPassword: true,
+    isActive: true,
+    createdBy: invite.invitedBy,
+    createdAt: hireDate, updatedAt: hireDate,
+  });
+
+  await insertOne('project_members', {
+    projectId: invite.projectId, employeeId: empResult.insertedId,
+    name: invite.name, department: empDoc.department || '',
+    role: invite.projectRole || 'member', addedAt: hireDate,
+  });
+
+  await updateOne('project_invites', { _id: invite._id }, {
+    $set: { status: 'accepted', respondedAt: hireDate, createdEmployeeId: empResult.insertedId, updatedAt: hireDate },
+  });
+
+  sendEmail({
+    to: invite.email,
+    subject: `Your ${COMPANY_NAME} account is ready`,
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto;">
+        <h2>Welcome to ${COMPANY_NAME}</h2>
+        <p>Hi <strong>${invite.name}</strong>,</p>
+        <p>You've accepted the invitation to join <strong>${invite.projectName}</strong>. Your account is ready:</p>
+        <table style="background:#f5f5f5;padding:16px;border-radius:8px;width:100%;">
+          <tr><td><strong>Email:</strong></td><td>${invite.email}</td></tr>
+          <tr><td><strong>Password:</strong></td><td style="font-family:monospace;font-size:16px;">${rawPassword}</td></tr>
+        </table>
+        <p style="color:#e53e3e;font-size:13px;margin-top:12px;">You will be prompted to set a new password on your first login. Your access ends on ${new Date(invite.contractEndDate).toDateString()}.</p>
+      </div>
+    `,
+  }).catch(() => {});
+
+  if (project?.createdBy) {
+    await createInboxItem({
+      recipientId: project.createdBy,
+      type: 'project', subType: 'project_invite_accepted',
+      title: `${invite.name} accepted your invite to "${invite.projectName}"`,
+      referenceId: invite.projectId, referenceModel: 'projects',
+      requiresAction: false, priority: 'normal', triggeredBy: null,
+    }).catch(() => {});
+  }
+
+  return empResult.insertedId;
+};
+
+const declineInviteCore = async (invite) => {
+  await updateOne('project_invites', { _id: invite._id }, { $set: { status: 'declined', respondedAt: new Date(), updatedAt: new Date() } });
+
+  const project = await findOne('projects', { _id: invite.projectId }, { projection: { createdBy: 1, name: 1 } });
+  if (project?.createdBy) {
+    await createInboxItem({
+      recipientId: project.createdBy,
+      type: 'project', subType: 'project_invite_declined',
+      title: `${invite.name} declined your invite to "${invite.projectName}"`,
+      referenceId: invite.projectId, referenceModel: 'projects',
+      requiresAction: false, priority: 'normal', triggeredBy: null,
+    }).catch(() => {});
+  }
 };
 
 // ── Subtasks ──────────────────────────────────────────────────────────────────
@@ -901,6 +1122,7 @@ const sendMessage = async (req, res) => {
 module.exports = {
   listProjects, createProject, getProject, updateProject, completeProject, deleteProject,
   addMembers, removeMember,
+  createInvite, listInvites, revokeInvite, findInviteByToken, acceptInviteCore, declineInviteCore,
   listSubtasks, createSubtask, updateSubtask, deleteSubtask,
   assignSubtaskEmployees, submitSubtaskReport,
   listNotes, createNote, deleteNote,

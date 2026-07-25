@@ -202,10 +202,12 @@ const getCycleResults = async (req, res) => {
     countDocuments('payroll_results', filter),
     findMany('payroll_results', filter, { skip, limit, sort: { createdAt: 1 } }),
   ]);
-  const enriched = await Promise.all(results.map(async r => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, bankAccountNumber: 1 } });
-    return { ...r, employee: emp ?? null };
-  }));
+  const resultEmpIds = [...new Set(results.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const resultEmps = resultEmpIds.length
+    ? await findMany('employees', { _id: { $in: resultEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, bankAccountNumber: 1 } })
+    : [];
+  const resultEmpById = Object.fromEntries(resultEmps.map(e => [String(e._id), e]));
+  const enriched = results.map(r => ({ ...r, employee: resultEmpById[String(r.employeeId)] ?? null }));
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
@@ -213,10 +215,12 @@ const getCycleResults = async (req, res) => {
 
 const getCycleExceptions = async (req, res) => {
   const results = await findMany('payroll_results', { cycleId: new ObjectId(req.params.id), hasException: true }, {});
-  const enriched = await Promise.all(results.map(async r => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-    return { ...r, employee: emp ?? null };
-  }));
+  const excEmpIds = [...new Set(results.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const excEmps = excEmpIds.length
+    ? await findMany('employees', { _id: { $in: excEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    : [];
+  const excEmpById = Object.fromEntries(excEmps.map(e => [String(e._id), e]));
+  const enriched = results.map(r => ({ ...r, employee: excEmpById[String(r.employeeId)] ?? null }));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 

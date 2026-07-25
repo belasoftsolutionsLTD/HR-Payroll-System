@@ -153,9 +153,17 @@ async function initIndexes() {
     idx('inbox_items', { createdAt: -1 }),
 
     // ── notifications ────────────────────────────────────────────────────────
+    // listNotifications/getNotificationCount/markAllRead/dismissNotification all filter
+    // with $or:[{recipientId},{userId}] — some notifications are written keyed by userId
+    // (messages/communication modules) rather than recipientId, so both fields are real
+    // query paths, not just recipientId. userId had no index at all, forcing a collection
+    // scan on every call — and this endpoint is polled every 30s from every authenticated
+    // page (HrTopBar), so it was one of the bigger contributors to whole-app sluggishness.
     idx('notifications', { recipientId: 1 }),
+    idx('notifications', { userId: 1 }),
     idx('notifications', { isRead: 1 }),
     idx('notifications', { recipientId: 1, isRead: 1 }),
+    idx('notifications', { userId: 1, isRead: 1 }),
     idx('notifications', { createdAt: -1 }),
 
     // ── payroll_cycles ───────────────────────────────────────────────────────

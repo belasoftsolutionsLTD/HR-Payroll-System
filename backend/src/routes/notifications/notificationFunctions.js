@@ -45,6 +45,34 @@ const notifyHRNotification = async (data) => {
   }
 };
 
+// Most notify*() call sites across the codebase (notifyUser/notifyByRoles/notifyEmployee/
+// notifyStaffByAudience in functions/HR/notifyUser.js) never pass a `link`, so `navigateTo`
+// is null on most notifications — the bell shows them as inert text with nothing to click.
+// Rather than hand-adding a link at every one of those call sites (they're spread across
+// nearly every module), this maps a notification's `type` to its module's base route as a
+// read-time fallback — "takes you to the respective module" is exactly what was asked for,
+// and unlike per-call-site links this covers every existing notification immediately, with
+// no backfill migration. A per-record deep link (e.g. straight to one leave request) can
+// still be set explicitly via `link`/`navigateTo` on individual notify() calls — that always
+// wins over this fallback.
+const MODULE_ROUTE_BY_TYPE = {
+  announcement:     '/communications',
+  attendance_alert: '/attendance',
+  expense:          '/expenses',
+  leave:            '/leave',
+  offboarding:      '/offboarding',
+  onboarding:       '/onboarding',
+  payroll:          '/payroll',
+  recruitment:      '/recruitment',
+  task:             '/tasks',
+  task_reminder:    '/tasks',
+  training:         '/training',
+};
+
+const withNavigateFallback = (item) => (
+  item.navigateTo ? item : { ...item, navigateTo: MODULE_ROUTE_BY_TYPE[item.type] || null }
+);
+
 // ── List notifications ────────────────────────────────────────────────────────
 const listNotifications = async (req, res) => {
   const filter = {
@@ -67,7 +95,7 @@ const listNotifications = async (req, res) => {
     findMany('notifications', filter, { skip, limit, sort: { createdAt: -1 } }),
   ]);
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items.map(withNavigateFallback), total, page, limit));
 };
 
 // ── Get unread count ──────────────────────────────────────────────────────────

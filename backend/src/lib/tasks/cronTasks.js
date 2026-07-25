@@ -302,6 +302,40 @@ async function autoMarkAbsent() {
   if (onLeaveNoRecordIds.length) console.log(`[CRON] Auto-marked ${onLeaveNoRecordIds.length} employee(s) as onLeave for ${todayStr}`);
 }
 
+// Contract employees (employmentType:'contract') — including project-invite contractors,
+// see projectsFunctions.js's acceptInviteCore — have their login access end automatically
+// once contractEndDate passes, so a short (e.g. 2-week) engagement is self-cleaning and
+// doesn't rely on anyone remembering to manually offboard them. Scoped to employmentType
+// 'contract' specifically (not "any employee with a past contractEndDate") since that
+// field is a general, already-existing employee field that HR may have set on other
+// employment types for informational tracking only, with no prior expectation that it
+// would ever trigger deactivation.
+async function deactivateExpiredContractors() {
+  if (!global.dbo) return;
+  const now = new Date();
+
+  const expired = await global.dbo.collection('employees').find({
+    employmentType: 'contract',
+    contractEndDate: { $ne: null, $lte: now },
+    status: { $in: ['active', 'on_leave'] },
+  }, { projection: { _id: 1 } }).toArray();
+
+  if (!expired.length) return;
+  const empIds = expired.map(e => e._id);
+
+  await global.dbo.collection('employees').updateMany(
+    { _id: { $in: empIds } },
+    { $set: { status: 'offboarding', updatedAt: now } }
+  );
+
+  const result = await global.dbo.collection('users').updateMany(
+    { employeeId: { $in: empIds }, isActive: true },
+    { $set: { isActive: false, updatedAt: now }, $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' } }
+  );
+
+  console.log(`[CRON] Contract expiry: deactivated ${result.modifiedCount} user account(s), flipped ${empIds.length} employee(s) to 'offboarding'`);
+}
+
 // Leave: 3-day advance reminder before an approved leave starts. Matches by
 // calendar date only (a UTC day range), not time-of-day. leaveStartReminderSent
 // guards against re-sending on the next run once a request has been notified.
@@ -460,6 +494,12 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Offboarding status flip error:', err); }
   });
 
+  // Daily at 00:20 UTC — deactivate login access for contract employees past their contractEndDate
+  cron.schedule('20 0 * * *', async () => {
+    try { await deactivateExpiredContractors(); }
+    catch (err) { console.error('[CRON] Contract expiry deactivation error:', err); }
+  });
+
   // Every hour: detect employees who clocked in but haven't clocked out after 12h
   cron.schedule('0 * * * *', async () => {
     try { await detectMissedClockOuts(); }
@@ -517,4 +557,4 @@ function startCronJobs() {
   console.log('[CRON] All cron jobs scheduled');
 }
 
-module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, autoMarkAbsent, markLateArrivals, detectMissedClockOuts, closeExpiredRequisitions, leaveStartReminder, leaveEndReminder };
+module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, deactivateExpiredContractors, autoMarkAbsent, markLateArrivals, detectMissedClockOuts, closeExpiredRequisitions, leaveStartReminder, leaveEndReminder };

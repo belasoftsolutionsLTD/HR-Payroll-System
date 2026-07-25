@@ -12,6 +12,7 @@ const {
   createQuiz, updateQuiz,
   createLearningPath, listLearningPaths, getLearningPath, updateLearningPath, archiveLearningPath,
   assignTraining, listEnrollments, waiveEnrollment,
+  selfEnroll,
   getMyEnrollments, updateMyProgress, submitQuizAttempt, submitCourseFeedback, getMyLearningPaths,
   generateMyCertificate, getMyCertificates,
   uploadExternalCertificate, getMyExternalCertificates, listExternalCertificates, verifyExternalCertificate,
@@ -116,8 +117,9 @@ router.get('/analytics/leaderboard',     allowRoles(HR), AsyncHandler(getLeaderb
 router.post('/analytics/compliance/remind', allowRoles(HR), AsyncHandler(sendComplianceReminder));
 
 // ── Catalog (employee — own data, published only) ────────────────────────────
-router.get('/catalog',      allowRoles(ALL_ROLES), AsyncHandler(listCatalog));
-router.get('/catalog/:id',  allowRoles(ALL_ROLES), AsyncHandler(getCatalogCourse));
+router.get('/catalog',              allowRoles(ALL_ROLES), AsyncHandler(listCatalog));
+router.get('/catalog/:id',          allowRoles(ALL_ROLES), AsyncHandler(getCatalogCourse));
+router.post('/catalog/:id/enroll', allowRoles(ALL_ROLES), AsyncHandler(selfEnroll));
 router.get('/my/modules/:moduleId/quiz', allowRoles(ALL_ROLES), AsyncHandler(getModuleQuizForLearner));
 
 module.exports = router;
