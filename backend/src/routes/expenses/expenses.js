@@ -55,7 +55,7 @@ router.put('/expense-claims/:id/dispute', allRoles,  AsyncHandler(disputeClaim))
 // authorization is enforced per-level inside approveClaim/rejectClaim (canActOnLevel).
 router.put('/expense-claims/:id/approve',    allRoles,  AsyncHandler(approveClaim));
 router.put('/expense-claims/:id/reject',     allRoles,  AsyncHandler(rejectClaim));
-router.put('/expense-claims/:id/reimburse',  hrOnly,    AsyncHandler(markReimbursed));
+router.put('/expense-claims/:id/reimburse',  hrOnly, upload.single('evidence'), AsyncHandler(markReimbursed));
 
 // ── Legacy expense routes (preserved) ────────────────────────────────────────
 router.get('/expenses',        hrOnly, AsyncHandler(listExpenses));

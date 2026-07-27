@@ -59,12 +59,15 @@ const getOrgChart = async (req, res) => {
 // ── Documents ─────────────────────────────────────────────────────────────────
 
 const getAllDocuments = async (req, res) => {
-  const { docType, search } = req.query;
-  const match = { 'documents.0': { $exists: true } };
-  if (docType) match['documents.docType'] = docType;
+  const { docType, search, department, staffNumber } = req.query;
 
   const pipeline = [
     { $match: { documents: { $exists: true, $not: { $size: 0 } } } },
+    // Department/staff number filter before the unwind — cheaper (skips documents
+    // belonging to non-matching employees entirely) and matches exactly, unlike the
+    // regex search below which is intentionally fuzzy for free-text queries.
+    ...(department ? [{ $match: { department } }] : []),
+    ...(staffNumber ? [{ $match: { staffNumber } }] : []),
     { $unwind: '$documents' },
     ...(docType ? [{ $match: { 'documents.docType': docType } }] : []),
     ...(search ? [{ $match: { $or: [

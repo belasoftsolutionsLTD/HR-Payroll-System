@@ -9,6 +9,10 @@ const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/H
 const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('../../lib/spend/approvalChain');
 const { resolvePolicy } = require('../../lib/spend/policyResolver');
 const { buildSpendScopeFilter, getDirectReportIds } = require('../../lib/spend/orgScope');
+const { sendEmail } = require('../../services/emailService');
+
+const REIMBURSEMENT_METHODS = ['bank_transfer', 'mpesa', 'cash', 'cheque'];
+const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
 
 // ── List Claims ───────────────────────────────────────────────────────────────
 
@@ -564,19 +568,56 @@ const deletePolicyById = async (req, res) => {
 // ── Mark Reimbursed ───────────────────────────────────────────────────────────
 
 const markReimbursed = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['paymentMethod'])) return;
+  if (!REIMBURSEMENT_METHODS.includes(req.body.paymentMethod)) {
+    return returnFunction(res, 400, false, `paymentMethod must be one of: ${REIMBURSEMENT_METHODS.join(', ')}`);
+  }
   const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
   if (claim.status !== 'approved') return returnFunction(res, 400, false, 'Only approved claims can be marked as reimbursed.');
+
+  const now = new Date();
   await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'reimbursed', reimbursedAt: new Date(), updatedAt: new Date() },
+    $set: {
+      status: 'reimbursed',
+      reimbursedAt: now,
+      reimbursedBy: req.user?._id ?? null,
+      reimbursementMethod: req.body.paymentMethod,
+      reimbursementReference: req.body.reference || null,
+      reimbursementEvidenceFilename: req.file?.filename ?? null,
+      reimbursementEvidenceOriginalName: req.file?.originalname ?? null,
+      updatedAt: now,
+    },
   });
+
+  const amountLabel = `${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()}`;
   if (claim.employeeId) {
     notifyEmployee(claim.employeeId, {
       title: 'Expense Claim Reimbursed',
-      body: `Your expense claim of ${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()} has been reimbursed.`,
+      body: `Your expense claim of ${amountLabel} has been reimbursed.`,
       type: 'expense',
     }).catch(() => {});
+
+    // In-app notification alone is easy to miss — reimbursement is money actually
+    // moving, so it gets an email too, same as payroll's payslip-generated flow.
+    const claimant = await findOne('users', { employeeId: new ObjectId(claim.employeeId) }, { projection: { email: 1, name: 1 } });
+    if (claimant?.email) {
+      const methodLabel = req.body.paymentMethod.replace('_', ' ');
+      sendEmail({
+        to: claimant.email,
+        subject: `Your expense claim has been reimbursed`,
+        html: `
+          <div style="font-family:sans-serif;max-width:480px;margin:auto;">
+            <h2>Expense Reimbursed</h2>
+            <p>Hi <strong>${claimant.name || 'there'}</strong>,</p>
+            <p>Your expense claim of <strong>${amountLabel}</strong> has been reimbursed via <strong>${methodLabel}</strong>${req.body.reference ? ` (ref: ${req.body.reference})` : ''}.</p>
+            <p>Regards,<br/>${COMPANY_NAME}</p>
+          </div>
+        `,
+      }).catch(() => {});
+    }
   }
+
   return returnFunction(res, 200, true, 'Claim marked as reimbursed.');
 };
 

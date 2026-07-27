@@ -222,6 +222,16 @@ const getProject = async (req, res) => {
   const project   = await findOne('projects', { _id: projectId });
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
+  // Was reachable by any authenticated user regardless of role — the route-level
+  // `allRoles` middleware only checks you're logged in, not that you're actually on
+  // this project. Every other per-project action in this file (messages, notes,
+  // subtasks) already gates on canAccessProject; this was the one place that didn't,
+  // exposing every member's name/department/job title and all subtasks to anyone who
+  // had (or guessed) a project id.
+  if (!(await canAccessProject(project, req.user))) {
+    return returnFunction(res, 403, false, 'You do not have access to this project.');
+  }
+
   const [members, subtasks] = await Promise.all([
     findMany('project_members', { projectId }),
     findMany('project_subtasks', { projectId }, { sort: { createdAt: 1 } }),

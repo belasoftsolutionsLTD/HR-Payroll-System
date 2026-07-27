@@ -90,6 +90,34 @@ const getCourse = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, { ...course, modules, enrolledCount });
 };
 
+// A course with role/department targeting shouldn't also need HR to separately visit
+// Assignment Center and hand-pick the exact same audience they already specified here —
+// this auto-enrolls every currently active user matching that targeting, the moment it's
+// set (on initial publish, and again on any later edit to targeting on an already-
+// published course — see updateCourse). createSingleCourseEnrollment already no-ops on
+// an existing enrollment, so re-running this is always safe to repeat.
+// Untargeted courses (open to everyone) are deliberately NOT auto-enrolled this way —
+// blasting an enrollment to the entire company by default would be too blunt; those rely
+// on self-enroll (non-mandatory — see isEligibleForSelfEnroll) or a manual/rule-based
+// assignment (mandatory with no targeting — see the notifyByRoles fallback below).
+const autoEnrollTargetedUsers = async (course, actingUserId) => {
+  const filter = { isActive: { $ne: false } };
+  if (course.targetRoles?.length) filter.role = { $in: course.targetRoles };
+  if (course.targetDepartments?.length) filter.department = { $in: course.targetDepartments };
+
+  const users = await findMany('users', filter, { projection: { _id: 1 } });
+  let created = 0;
+  for (const user of users) {
+    const result = await createSingleCourseEnrollment({
+      employeeId: user._id, courseId: course._id, enrolledBy: actingUserId, enrollmentTrigger: 'auto_targeted',
+    });
+    if (result.created) created += 1;
+  }
+  return created;
+};
+
+const isTargeted = (course) => (course.targetRoles?.length > 0) || (course.targetDepartments?.length > 0);
+
 const updateCourse = async (req, res) => {
   const allowed = [
     'title', 'description', 'coverImageUrl', 'category', 'tags', 'skillsTaught',
@@ -99,9 +127,21 @@ const updateCourse = async (req, res) => {
   const update = { updatedAt: new Date() };
   allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
 
-  const result = await updateOne('courses', { _id: new ObjectId(req.params.id) }, { $set: update });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+  const before = await findOne('courses', { _id: new ObjectId(req.params.id) });
+  if (!before) return returnFunction(res, 404, false, req.locale.notFound);
+
+  await updateOne('courses', { _id: before._id }, { $set: update });
+
+  let autoEnrolledCount = 0;
+  const targetingChanged = req.body.targetRoles !== undefined || req.body.targetDepartments !== undefined;
+  if (before.status === 'published' && targetingChanged) {
+    const course = { ...before, ...update };
+    if (isTargeted(course)) autoEnrolledCount = await autoEnrollTargetedUsers(course, req.user._id);
+  }
+
+  return returnFunction(res, 200, true, autoEnrolledCount > 0
+    ? `${req.locale.updatedSuccessfully} ${autoEnrolledCount} matching employee(s) auto-enrolled.`
+    : req.locale.updatedSuccessfully);
 };
 
 const publishCourse = async (req, res) => {
@@ -118,15 +158,20 @@ const publishCourse = async (req, res) => {
 
   await updateOne('courses', { _id: course._id }, { $set: { status: 'published', publishedAt: new Date(), updatedAt: new Date() } });
 
-  if (course.isMandatory) {
+  const targeted = isTargeted(course);
+  const autoEnrolledCount = targeted ? await autoEnrollTargetedUsers(course, req.user._id) : 0;
+
+  // Only still needed when there's no targeting to auto-enroll from — a targeted course
+  // just handled its own audience above, so telling HR to "assign it" would be stale advice.
+  if (course.isMandatory && !targeted) {
     notifyByRoles(['super_admin', 'hr_manager'], {
       title: 'Mandatory Course Published',
-      body: `"${course.title}" is now published and marked mandatory — assign it to the relevant audience.`,
+      body: `"${course.title}" is now published and marked mandatory, with no target roles/departments set — assign it to the relevant audience or add targeting so it enrolls automatically.`,
       type: 'training',
     }).catch(() => {});
   }
 
-  return returnFunction(res, 200, true, 'Course published.');
+  return returnFunction(res, 200, true, targeted ? `Course published. ${autoEnrolledCount} matching employee(s) auto-enrolled.` : 'Course published.');
 };
 
 const archiveCourse = async (req, res) => {
@@ -146,6 +191,16 @@ const addCourseAuthor = async (req, res) => {
 };
 
 // ── Catalog (employee — published courses only) ──────────────────────────────
+
+// Whether a course's targetRoles/targetDepartments (empty = open to all) match the
+// given user — used to decide catalog VISIBILITY (see below), separate from
+// isEligibleForSelfEnroll further down, which additionally requires non-mandatory
+// and gates ENROLLMENT rather than just seeing the course exists.
+const matchesCourseTargeting = (course, user) => {
+  if (course.targetRoles?.length && !course.targetRoles.includes(user.role)) return false;
+  if (course.targetDepartments?.length && !course.targetDepartments.includes(user.department)) return false;
+  return true;
+};
 
 const listCatalog = async (req, res) => {
   const filter = { status: 'published' };
@@ -172,15 +227,24 @@ const listCatalog = async (req, res) => {
     myEnrollment: enrollMap[String(c._id)] || null,
   }));
 
-  return returnFunction(res, 200, true, req.locale.success, enriched);
+  // A course outside your role/department shouldn't even show up as a locked entry —
+  // it should be invisible, same as it not existing. Already being enrolled always
+  // wins over current targeting (e.g. targeting was edited, or you changed department,
+  // after you were assigned) — you never lose visibility into something you're already
+  // partway through.
+  const visible = enriched.filter((c) => c.myEnrollment || matchesCourseTargeting(c, req.user));
+
+  return returnFunction(res, 200, true, req.locale.success, visible);
 };
 
 const getCatalogCourse = async (req, res) => {
   const course = await findOne('courses', { _id: new ObjectId(req.params.id), status: 'published' });
   if (!course) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const modules = await findMany('courseModules', { courseId: course._id }, { sort: { order: 1 } });
   const myEnrollment = await findOne('enrollments', { employeeId: new ObjectId(req.user._id), courseId: course._id });
+  if (!myEnrollment && !matchesCourseTargeting(course, req.user)) return returnFunction(res, 404, false, req.locale.notFound);
+
+  const modules = await findMany('courseModules', { courseId: course._id }, { sort: { order: 1 } });
 
   return returnFunction(res, 200, true, req.locale.success, { ...course, modules, myEnrollment: myEnrollment || null });
 };
@@ -447,19 +511,16 @@ const waiveEnrollment = async (req, res) => {
 
 // ── Employee — own enrollments only (scoped to req.user._id) ─────────────────
 
-// Self-service enrollment for the catalog above (browsing is already open to everyone —
-// listCatalog shows every published course regardless of role/department/mandatory, with
+// Self-service enrollment for the catalog above (browsing already only shows courses
+// matching your role/department — see matchesCourseTargeting/listCatalog — with
 // myEnrollment attached). This is the one narrow additional path beyond assignTraining/
 // automation rules: a published, NON-mandatory course whose targetRoles/targetDepartments
 // (empty = open to all) match the requester can be self-enrolled directly from there.
 // Mandatory/compliance courses deliberately stay assignment/rule-driven — those need due
 // dates and an audit trail of who assigned them and why, which self-serve would undermine.
-// Matches autoEnrollment.js's existing convention of targeting against users.role/
-// users.department (not the employees collection).
 const isEligibleForSelfEnroll = (course, user) => {
   if (course.status !== 'published' || course.isMandatory) return false;
-  if (course.targetRoles?.length && !course.targetRoles.includes(user.role)) return false;
-  if (course.targetDepartments?.length && !course.targetDepartments.includes(user.department)) return false;
+  if (!matchesCourseTargeting(course, user)) return false;
   return true;
 };
 

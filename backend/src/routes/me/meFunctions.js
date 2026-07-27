@@ -52,6 +52,18 @@ const updateMyProfile = async (req, res) => {
   if (patch.email) {
     await updateOne('users', { _id: req.user._id }, { $set: { email: patch.email } });
   }
+
+  // HR previously had no visibility at all into self-service profile edits — bank/mpesa/
+  // KRA PIN changes in particular affect payroll and are worth HR noticing, not just
+  // silently taking effect.
+  const changedFields = Object.keys(patch).filter((k) => k !== 'updatedAt');
+  const employee = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } });
+  notifyByRoles(['super_admin', 'hr_manager'], {
+    title: 'Employee Updated Their Profile',
+    body: `${employee?.fullName ?? 'An employee'} updated: ${changedFields.join(', ')}.`,
+    type: 'general',
+  }).catch(() => {});
+
   return returnFunction(res, 200, true, 'Profile updated.');
 };
 
