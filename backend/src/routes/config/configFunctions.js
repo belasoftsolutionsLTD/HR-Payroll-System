@@ -56,6 +56,12 @@ const updateDepartment = makeUpdate('departments');
 const deleteDepartment = makeDelete('departments');
 const bulkDeleteDepartments = makeBulkDelete('departments');
 
+// ── Branches (name + contact info — a company with multiple physical offices) ──
+const listBranches  = makeList('branches');
+const createBranch  = makeCreate('branches', ['name']);
+const updateBranch  = makeUpdate('branches');
+const deleteBranch  = makeDelete('branches');
+
 // ── Job Groups (with salary range) ───────────────────────────────────────────
 const listJobGroups = makeList('job_groups');
 
@@ -224,6 +230,7 @@ const updateCommunicationSettings = async (req, res) => {
 
 module.exports = {
   listDepartments, createDepartment, updateDepartment, deleteDepartment, bulkDeleteDepartments,
+  listBranches, createBranch, updateBranch, deleteBranch,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,

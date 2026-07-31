@@ -10,6 +10,9 @@ const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('..
 const { resolvePolicy } = require('../../lib/spend/policyResolver');
 const { buildSpendScopeFilter, getDirectReportIds } = require('../../lib/spend/orgScope');
 const { sendEmail } = require('../../services/emailService');
+const { postJournalEntry, resolveSystemAccount } = require('../../lib/accounting/glEngine');
+const { resolvePaymentSystemKey } = require('../../lib/accounting/paymentMethodAccounts');
+const { logPostingFailure } = require('../accounting/accountingPostingFailuresFunctions');
 
 const REIMBURSEMENT_METHODS = ['bank_transfer', 'mpesa', 'cash', 'cheque'];
 const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
@@ -589,6 +592,26 @@ const markReimbursed = async (req, res) => {
       updatedAt: now,
     },
   });
+
+  // A claim pulled into a payroll cycle already has its amount inside that cycle's
+  // Salary Expense line (payroll_results.expenseReimbursements) — posting a second entry
+  // here would double-book it. Only claims reimbursed OUTSIDE of payroll post their own.
+  if (!claim.payrollCycleId) {
+    const payload = {
+      date: new Date(), description: `Expense reimbursement — ${claim.category || 'expense'} (${req.body.paymentMethod})`,
+      source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim._id, referenceModel: 'expense_claims',
+      department: claim.department || null, lines: [],
+    };
+    try {
+      const categoryAcct = await findOne('gl_accounts', { linkedExpenseCategories: claim.category, isActive: { $ne: false } });
+      const expenseAcct = categoryAcct || await resolveSystemAccount('other_expense');
+      const paymentAcct = await resolveSystemAccount(resolvePaymentSystemKey(req.body.paymentMethod));
+      payload.lines = [{ accountId: expenseAcct._id, debit: claim.amount || 0 }, { accountId: paymentAcct._id, credit: claim.amount || 0 }];
+      if (claim.amount > 0) await postJournalEntry({ ...payload, postedBy: req.user?._id ?? null });
+    } catch (err) {
+      await logPostingFailure({ source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim._id, referenceModel: 'expense_claims', attemptedPayload: payload, error: err });
+    }
+  }
 
   const amountLabel = `${claim.currency || 'KES'} ${(claim.amount || 0).toLocaleString()}`;
   if (claim.employeeId) {

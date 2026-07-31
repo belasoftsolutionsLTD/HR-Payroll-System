@@ -2,11 +2,17 @@ const returnFunction = require('../functions/returnFunction');
 
 /**
  * For staff role: silently replaces req.body.employeeId with the current user's
- * own employeeId. HR/manager roles pass through unchanged.
- * Prevents a staff member from submitting forms on behalf of another employee.
+ * own employeeId, whatever was submitted — prevents a staff member from submitting
+ * forms on behalf of another employee.
+ * For every other role: only resolves the 'me' sentinel (used by self-service forms
+ * like "My Timesheet", which any role can open on their own profile) to their linked
+ * employeeId; an explicit employeeId passes through unchanged since HR/managers are
+ * allowed to act on other employees' records via these routes.
  */
 const scopeBodyToSelf = (req, res, next) => {
   if (req.user?.role === 'staff' && req.user.employeeId) {
+    req.body.employeeId = req.user.employeeId.toString();
+  } else if (req.body.employeeId === 'me' && req.user?.employeeId) {
     req.body.employeeId = req.user.employeeId.toString();
   }
   next();

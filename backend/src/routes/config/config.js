@@ -4,6 +4,7 @@ const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   listDepartments, createDepartment, updateDepartment, deleteDepartment, bulkDeleteDepartments,
+  listBranches, createBranch, updateBranch, deleteBranch,
   listJobGroups,   createJobGroup,   updateJobGroup,   deleteJobGroup,
   getCommunicationSettings, updateCommunicationSettings,
   listDesignations, createDesignation, updateDesignation, deleteDesignation,
@@ -30,6 +31,12 @@ router.post('/departments',       allowRoles(ROLES), AsyncHandler(createDepartme
 router.put('/departments/:id',    allowRoles(ROLES), AsyncHandler(updateDepartment));
 router.delete('/departments/:id', allowRoles(ROLES), AsyncHandler(deleteDepartment));
 router.post('/departments/bulk-delete', allowRoles(ROLES), AsyncHandler(bulkDeleteDepartments));
+
+// Branches
+router.get('/branches',        allowRoles(ROLES), AsyncHandler(listBranches));
+router.post('/branches',       allowRoles(ROLES), AsyncHandler(createBranch));
+router.put('/branches/:id',    allowRoles(ROLES), AsyncHandler(updateBranch));
+router.delete('/branches/:id', allowRoles(ROLES), AsyncHandler(deleteBranch));
 
 // Job Groups
 router.get('/job-groups',         allowRoles(ROLES), AsyncHandler(listJobGroups));

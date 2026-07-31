@@ -1,4 +1,6 @@
 const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -27,7 +29,7 @@ function sectionHeader(doc, label, color) {
   hline(doc);
 }
 
-const generatePayslipFromResult = (employee, result, cycle) => {
+const generatePayslipFromResult = (employee, result, cycle, branding = {}) => {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'A4' });
     const buffers = [];
@@ -42,12 +44,21 @@ const generatePayslipFromResult = (employee, result, cycle) => {
 
     // ── Header band ───────────────────────────────────────────────────────────
     doc.rect(0, 0, 595, 90).fill('#1e293b');
-    doc.fontSize(20).font('Helvetica-Bold').fillColor('#f1f5f9').text('BELLA ERP', 50, 25, { align: 'left' });
-    doc.fontSize(11).font('Helvetica').fillColor('#94a3b8').text('PAYSLIP', 50, 50);
+    const { companyName, logoPath } = branding;
+    let textX = 50;
+    const logoAbsPath = logoPath ? path.resolve(logoPath) : null;
+    if (logoAbsPath && fs.existsSync(logoAbsPath)) {
+      try {
+        doc.image(logoAbsPath, 50, 15, { fit: [60, 60] });
+        textX = 122;
+      } catch { /* corrupt/unsupported image — fall back to text-only header */ }
+    }
+    doc.fontSize(20).font('Helvetica-Bold').fillColor('#f1f5f9').text(companyName || 'BELLA ERP', textX, 25, { align: 'left' });
+    doc.fontSize(11).font('Helvetica').fillColor('#94a3b8').text('PAYSLIP', textX, 50);
     doc.fontSize(9).fillColor('#64748b')
        .text(
          `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}  •  Pay Date: ${cycle.payDate ? new Date(cycle.payDate).toLocaleDateString('en-KE') : '—'}`,
-         50, 65,
+         textX, 65,
        );
 
     // ── Employee info block ───────────────────────────────────────────────────

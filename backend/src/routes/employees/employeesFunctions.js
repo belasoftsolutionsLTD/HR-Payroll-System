@@ -267,6 +267,7 @@ const createEmployee = async (req, res) => {
     certifications: [],
     educationHistory: [],
     location:    req.body.location    || null,
+    branchId:    req.body.branchId    ? new ObjectId(req.body.branchId) : null,
     costCenter:  req.body.costCenter  || null,
     managerId:   req.body.managerId   ? new ObjectId(req.body.managerId) : null,
     payGroup:    req.body.payGroup    || 'all',
@@ -346,6 +347,7 @@ const updateEmployee = async (req, res) => {
   if (update.terminationDate) update.terminationDate = new Date(update.terminationDate);
   if (update.jobGroupId) update.jobGroupId = new ObjectId(update.jobGroupId);
   if (update.managerId !== undefined) update.managerId = update.managerId ? new ObjectId(update.managerId) : null;
+  if (update.branchId !== undefined) update.branchId = update.branchId ? new ObjectId(update.branchId) : null;
 
   await updateOne('employees', { _id: existing._id }, { $set: update });
   const changedFields = await recordJobHistoryIfChanged(existing, update, req);

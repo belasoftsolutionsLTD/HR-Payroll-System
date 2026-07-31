@@ -278,6 +278,94 @@ function haversineMeters(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+const SHIFT_TYPE_LABELS = { morning: 'Morning Shift', afternoon: 'Afternoon Shift', night: 'Night Shift', full_day: 'Full-Day Shift', custom: 'Shift' };
+const LOCATION_LABELS = { office: 'Office', remote: 'Remote', field: 'Field', 'client site': 'Client Site' };
+const CLIENT_SITE_GEOFENCE_METERS = 30;
+
+// A timesheet day's Project/Venue/Start/End/Break/Hours are derived from
+// attendance_records (clock-in/out) + that day's shift whenever either exists — that
+// data can never be hand-typed over, so it can't drift from what was actually clocked.
+// But an employee with no shift scheduling at all for a day (no `shifts` doc) has
+// nothing for Project to derive from and would otherwise be stuck seeing a permanent
+// "—" with no way to say what they worked on — `manualOverrides` (date -> {project,
+// venue}) fills exactly that gap, and only that gap: it's ignored the moment a shift
+// exists for the day, same as `descOverrides` for the free-text notes field.
+async function buildTimesheetEntries(empId, weekStartStr, weekEndStr, descOverrides = {}, manualOverrides = {}) {
+  const [clockRecs, shifts] = await Promise.all([
+    global.dbo.collection('attendance_records').find({ employeeId: empId, date: { $gte: weekStartStr, $lte: weekEndStr } }).toArray(),
+    findMany('shifts', { employeeId: empId, date: { $gte: weekStartStr, $lte: weekEndStr } }),
+  ]);
+  const recByDate = Object.fromEntries(clockRecs.map((r) => [r.date, r]));
+  const shiftByDate = Object.fromEntries(shifts.map((s) => [s.date, s]));
+
+  const templateIds = [...new Set(shifts.filter((s) => s.taskTemplateId).map((s) => String(s.taskTemplateId)))];
+  const templates = templateIds.length
+    ? await findMany('shift_task_templates', { _id: { $in: templateIds.map((id) => new ObjectId(id)) } }, { projection: { name: 1 } })
+    : [];
+  const templateNameById = Object.fromEntries(templates.map((t) => [String(t._id), t.name]));
+
+  const dates = [];
+  for (let d = new Date(`${weekStartStr}T00:00:00`); d.toISOString().split('T')[0] <= weekEndStr; d.setDate(d.getDate() + 1)) {
+    dates.push(d.toISOString().split('T')[0]);
+  }
+
+  return dates.map((date) => {
+    const rec = recByDate[date] || null;
+    const shift = shiftByDate[date] || null;
+    const manual = manualOverrides[date] || {};
+
+    let projectName = '';
+    let projectIsAuto = false;
+    if (shift?.taskTemplateId && templateNameById[String(shift.taskTemplateId)]) {
+      projectName = templateNameById[String(shift.taskTemplateId)];
+      projectIsAuto = true;
+    } else if (shift?.shiftType) {
+      projectName = SHIFT_TYPE_LABELS[shift.shiftType] || 'Shift';
+      projectIsAuto = true;
+    } else if (rec?.notes?.trim()) {
+      // No standard shift on file for this day — fall back to whatever notes were
+      // logged at clock-in/manual entry so a handover-style context isn't lost.
+      projectName = rec.notes.trim().slice(0, 80);
+      projectIsAuto = true;
+    } else if (manual.project?.trim()) {
+      projectName = manual.project.trim().slice(0, 80);
+    }
+
+    let venue = '';
+    let venueIsAuto = false;
+    if (shift?.address && typeof shift.addressLat === 'number' && typeof shift.addressLng === 'number'
+      && rec && typeof rec.checkInLat === 'number' && typeof rec.checkInLng === 'number') {
+      const distanceM = haversineMeters(rec.checkInLat, rec.checkInLng, shift.addressLat, shift.addressLng);
+      venue = distanceM <= CLIENT_SITE_GEOFENCE_METERS ? shift.address : (rec.checkInLocation || LOCATION_LABELS[rec.location] || '');
+      venueIsAuto = true;
+    } else if (rec?.checkInLocation) {
+      venue = rec.checkInLocation;
+      venueIsAuto = true;
+    } else if (rec?.location) {
+      venue = LOCATION_LABELS[rec.location] || rec.location;
+      venueIsAuto = true;
+    } else if (shift?.location) {
+      venue = LOCATION_LABELS[shift.location] || shift.location;
+      venueIsAuto = true;
+    } else if (manual.venue?.trim()) {
+      venue = manual.venue.trim().slice(0, 120);
+    }
+
+    return {
+      date,
+      projectName,
+      projectEditable: !projectIsAuto,
+      venue,
+      venueEditable: !venueIsAuto,
+      startTime: rec?.checkInTime || '',
+      endTime: rec?.checkOutTime || '',
+      breakMinutes: rec?.totalBreakMinutes || 0,
+      totalMinutes: rec?.totalWorkMinutes || 0,
+      description: descOverrides[date] ?? '',
+    };
+  });
+}
+
 const clockIn = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee profile linked to your account.');
   const empId = req.user.employeeId;
@@ -629,29 +717,14 @@ const getCurrentTimesheet = async (req, res) => {
     weekStart:  { $gte: monday, $lte: new Date(monday.getTime() + 1000) },
   });
 
+  const weekStr = monday.toISOString().split('T')[0];
+  const sundayStr = sunday.toISOString().split('T')[0];
+  const descOverrides = Object.fromEntries((sheet?.entries || []).map((e) => [e.date, e.description || '']));
+  const manualOverrides = Object.fromEntries((sheet?.entries || []).map((e) => [e.date, { project: e.projectEditable ? e.projectName : '', venue: e.venueEditable ? e.venue : '' }]));
+  const entries = await buildTimesheetEntries(empId, weekStr, sundayStr, descOverrides, manualOverrides);
+  const weekHours = await computeWeeklyHoursFromAttendance(empId, weekStr, sundayStr);
+
   if (!sheet) {
-    // Auto-populate from clock_records for this week
-    const weekStr = monday.toISOString().split('T')[0];
-    const sundayStr = sunday.toISOString().split('T')[0];
-    const clockRecs = await global.dbo.collection('attendance_records')
-      .find({ employeeId: empId, date: { $gte: weekStr, $lte: sundayStr } })
-      .sort({ date: 1 })
-      .toArray();
-
-    const entries = clockRecs.filter(r => r.checkInTime && r.checkOutTime).map(r => ({
-      date: r.date,
-      projectId: null,
-      projectName: 'General',
-      startTime: r.checkInTime,
-      endTime: r.checkOutTime,
-      breakMinutes: r.totalBreakMinutes || 0,
-      totalMinutes: r.totalWorkMinutes || 0,
-      description: '',
-      isLocked: false,
-    }));
-
-    const weekHours = await computeWeeklyHoursFromAttendance(empId, weekStr, sundayStr);
-
     const doc = {
       employeeId: empId,
       weekStart:  monday,
@@ -668,6 +741,20 @@ const getCurrentTimesheet = async (req, res) => {
     };
     const result = await insertOne('timesheets', doc);
     sheet = { ...doc, _id: result.insertedId };
+  } else {
+    // Re-derive from attendance/shift data on every view (not just on first creation)
+    // so a late clock-out or a shift edited after the fact stays reflected — only the
+    // persisted per-day description and manually-entered project/venue survive (folded
+    // into descOverrides/manualOverrides above).
+    sheet = {
+      ...sheet,
+      entries,
+      totalMinutes: weekHours.totalMinutes,
+      totalRegularMinutes: weekHours.totalRegularMinutes,
+      overtimeMinutes: weekHours.totalOvertimeMinutes,
+      overtimeBreakdown: weekHours.overtimeBreakdown,
+      totalBreakMinutes: weekHours.totalBreakMinutes,
+    };
   }
 
   return returnFunction(res, 200, true, req.locale.success, sheet);
@@ -678,14 +765,16 @@ const saveTimesheet = async (req, res) => {
 
   const empId = new ObjectId(req.body.employeeId);
   const weekStart = new Date(req.body.weekStart);
-  const entries = (req.body.entries || []).map(e => ({
-    ...e,
-    totalMinutes: e.totalMinutes || 0,
-    breakMinutes: e.breakMinutes || 0,
-  }));
-
   const weekStartStr = weekStart.toISOString().split('T')[0];
   const weekEndStr = new Date(weekStart.getTime() + 6 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+  // Project/Venue/Start/End/Break/Hours are system-captured from clock-in/out + that
+  // day's shift whenever either exists — never client-supplied over real data. A staff
+  // member can always submit a per-day description, and additionally a manual
+  // project/venue for any day that has no shift on file at all (see buildTimesheetEntries).
+  const descOverrides = req.body.descriptions && typeof req.body.descriptions === 'object' ? req.body.descriptions : {};
+  const manualOverrides = req.body.manualEntries && typeof req.body.manualEntries === 'object' ? req.body.manualEntries : {};
+  const entries = await buildTimesheetEntries(empId, weekStartStr, weekEndStr, descOverrides, manualOverrides);
   const weekHours = await computeWeeklyHoursFromAttendance(empId, weekStartStr, weekEndStr);
 
   await global.dbo.collection('timesheets').updateOne(
@@ -857,9 +946,31 @@ const getShifts = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
+// Free, no-API-key geocoding via OpenStreetMap's Nominatim — same service this app
+// already uses for reverse-geocoding in ClockInContext.tsx. Best-effort only: a shift
+// still saves fine with no coordinates if this fails or times out, it just won't show
+// a map on that shift's detail view. A custom User-Agent is required by Nominatim's
+// usage policy (unauthenticated requests without one get blocked).
+const geocodeAddress = async (address) => {
+  if (!address?.trim()) return null;
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(url, { headers: { 'User-Agent': `${process.env.COMPANY_NAME || 'School ERP'} HR System` }, signal: controller.signal });
+    clearTimeout(timeout);
+    const results = await res.json();
+    if (!results?.length) return null;
+    return { lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon) };
+  } catch {
+    return null;
+  }
+};
+
 const createShift = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'date', 'startTime', 'endTime'])) return;
 
+  const coords = await geocodeAddress(req.body.address);
   const doc = {
     employeeId: new ObjectId(req.body.employeeId),
     date:       req.body.date,
@@ -868,7 +979,11 @@ const createShift = async (req, res) => {
     endTime:    req.body.endTime,
     breakMinutes: Number(req.body.breakMinutes) || 0,
     location:   req.body.location || 'office',
+    address:    req.body.address || null,
+    addressLat: coords?.lat ?? null,
+    addressLng: coords?.lng ?? null,
     notes:      req.body.notes || '',
+    taskTemplateId: req.body.taskTemplateId ? new ObjectId(req.body.taskTemplateId) : null,
     assignedBy: new ObjectId(req.user._id),
     createdAt:  new Date(),
   };
@@ -879,6 +994,8 @@ const createShift = async (req, res) => {
     { $set: shiftFields, $setOnInsert: { createdAt: new Date() } },
     { upsert: true }
   );
+  const saved = await findOne('shifts', { employeeId: doc.employeeId, date: doc.date });
+  if (saved) await materializeShiftTasks(saved._id, saved.taskTemplateId);
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, doc);
 };
 
@@ -887,6 +1004,17 @@ const updateShift = async (req, res) => {
   delete update._id;
   update.updatedAt = new Date();
   if (update.employeeId) update.employeeId = new ObjectId(update.employeeId);
+  if (update.address !== undefined) {
+    const existing = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+    if (update.address?.trim() && update.address !== existing?.address) {
+      const coords = await geocodeAddress(update.address);
+      update.addressLat = coords?.lat ?? null;
+      update.addressLng = coords?.lng ?? null;
+    } else if (!update.address?.trim()) {
+      update.addressLat = null;
+      update.addressLng = null;
+    }
+  }
   await updateOne('shifts', { _id: new ObjectId(req.params.id) }, { $set: update });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
@@ -894,6 +1022,168 @@ const updateShift = async (req, res) => {
 const deleteShift = async (req, res) => {
   await global.dbo.collection('shifts').deleteOne({ _id: new ObjectId(req.params.id) });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// ── Shift task checklists (field/client-visit shifts — see location: 'field'/'client site') ──
+// A named, reusable checklist (e.g. "Site Opening Checklist") is defined once by HR, then
+// materialized into a per-shift copy of tasks the moment a shift referencing it is
+// created — so each shift instance tracks its own completion independently, and later
+// edits to the template never retroactively change a shift that's already in progress.
+
+const listShiftTaskTemplates = async (req, res) => {
+  const templates = await findMany('shift_task_templates', { isActive: true }, { sort: { name: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, templates);
+};
+
+const createShiftTaskTemplate = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['name', 'tasks'])) return;
+  if (!Array.isArray(req.body.tasks) || !req.body.tasks.filter(Boolean).length) {
+    return returnFunction(res, 400, false, 'At least one task is required.');
+  }
+  const doc = {
+    name: req.body.name.trim(),
+    tasks: req.body.tasks.map((t) => String(t).trim()).filter(Boolean),
+    isActive: true,
+    createdBy: req.user._id,
+    createdAt: new Date(), updatedAt: new Date(),
+  };
+  const result = await insertOne('shift_task_templates', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+};
+
+const updateShiftTaskTemplate = async (req, res) => {
+  const update = { updatedAt: new Date() };
+  if (req.body.name !== undefined) update.name = req.body.name.trim();
+  if (Array.isArray(req.body.tasks)) update.tasks = req.body.tasks.map((t) => String(t).trim()).filter(Boolean);
+  if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
+  await updateOne('shift_task_templates', { _id: new ObjectId(req.params.id) }, { $set: update });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteShiftTaskTemplate = async (req, res) => {
+  await updateOne('shift_task_templates', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
+};
+
+// Idempotent — only materializes once per shift, so re-saving/editing a shift that
+// already has tasks (e.g. changing its time) never duplicates or resets progress.
+const materializeShiftTasks = async (shiftId, taskTemplateId) => {
+  if (!taskTemplateId) return;
+  const existing = await findOne('shift_tasks', { shiftId: new ObjectId(shiftId) });
+  if (existing) return;
+  const template = await findOne('shift_task_templates', { _id: new ObjectId(taskTemplateId) });
+  if (!template?.tasks?.length) return;
+  const now = new Date();
+  const docs = template.tasks.map((title, i) => ({
+    shiftId: new ObjectId(shiftId), title, order: i,
+    completed: false, completedAt: null, completedBy: null,
+    createdAt: now,
+  }));
+  await global.dbo.collection('shift_tasks').insertMany(docs);
+};
+
+// Any real assigned party (the shift's own employee) or MGMT — never a stranger who
+// just knows the shift id.
+const canAccessShift = (shift, reqUser) => {
+  if (['super_admin', 'hr_manager', 'department_head'].includes(reqUser.role)) return true;
+  return !!reqUser.employeeId && String(shift.employeeId) === String(reqUser.employeeId);
+};
+
+const getShiftTasks = async (req, res) => {
+  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
+  const tasks = await findMany('shift_tasks', { shiftId: shift._id }, { sort: { order: 1 } });
+  return returnFunction(res, 200, true, req.locale.success, tasks);
+};
+
+const updateShiftTask = async (req, res) => {
+  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
+  const completed = !!req.body.completed;
+  await updateOne('shift_tasks', { _id: new ObjectId(req.params.taskId), shiftId: shift._id }, {
+    $set: { completed, completedAt: completed ? new Date() : null, completedBy: completed ? req.user._id : null },
+  });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+// ── Shift notes (progress / incident) ─────────────────────────────────────────
+// Incidents notify the manager and HR immediately — same urgency as a shift
+// application — progress notes are just a log, no one needs paging for those.
+
+const getShiftNotes = async (req, res) => {
+  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
+  const notes = await findMany('shift_notes', { shiftId: shift._id }, { sort: { createdAt: -1 } });
+  return returnFunction(res, 200, true, req.locale.success, notes);
+};
+
+const createShiftNote = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['type', 'text'])) return;
+  if (!['progress', 'incident'].includes(req.body.type)) return returnFunction(res, 400, false, "type must be 'progress' or 'incident'.");
+  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
+
+  const emp = req.user.employeeId ? await findOne('employees', { _id: new ObjectId(req.user.employeeId) }, { projection: { fullName: 1 } }) : null;
+  const doc = {
+    shiftId: shift._id,
+    employeeId: shift.employeeId,
+    authorName: emp?.fullName || req.user.name || 'Staff',
+    type: req.body.type,
+    text: req.body.text.trim(),
+    createdAt: new Date(),
+  };
+  const result = await insertOne('shift_notes', doc);
+
+  if (req.body.type === 'incident') {
+    const inboxItem = {
+      type: 'shift', subType: 'shift_incident',
+      title: `Incident logged by ${doc.authorName}`,
+      subtitle: `Shift ${shift.date} ${shift.startTime}–${shift.endTime}: ${doc.text.slice(0, 80)}`,
+      referenceId: result.insertedId, referenceModel: 'shift_notes',
+      requiresAction: true, triggeredBy: req.user._id,
+    };
+    await notifyManager(shift.employeeId, inboxItem).catch(() => {});
+    await notifyHR(inboxItem).catch(() => {});
+  }
+
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+};
+
+// Handover: the incoming employee on a shift needs to see what the PREVIOUS shift at the
+// same place logged (an incident, an unfinished task, "pick up from here"), even though
+// they weren't the author and canAccessShift would otherwise block them from that other
+// shift's own notes. Match by address first (exact place), falling back to taskTemplateId
+// (same recurring checklist/site) when no address was set on either shift.
+const getShiftHandoverNotes = async (req, res) => {
+  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
+
+  const matchFilter = { _id: { $ne: shift._id }, date: { $lt: shift.date } };
+  if (shift.address?.trim()) {
+    matchFilter.address = shift.address;
+  } else if (shift.taskTemplateId) {
+    matchFilter.taskTemplateId = shift.taskTemplateId;
+  } else {
+    return returnFunction(res, 200, true, req.locale.success, { previousShift: null, notes: [] });
+  }
+
+  const previousShift = await findOne('shifts', matchFilter, { sort: { date: -1 } });
+  if (!previousShift) return returnFunction(res, 200, true, req.locale.success, { previousShift: null, notes: [] });
+
+  const [notes, prevEmp] = await Promise.all([
+    findMany('shift_notes', { shiftId: previousShift._id }, { sort: { createdAt: -1 } }),
+    findOne('employees', { _id: previousShift.employeeId }, { projection: { fullName: 1 } }),
+  ]);
+
+  return returnFunction(res, 200, true, req.locale.success, {
+    previousShift: { _id: previousShift._id, date: previousShift.date, employeeName: prevEmp?.fullName || 'A previous staff member' },
+    notes,
+  });
 };
 
 // ── Attendance report (monthly grid) ─────────────────────────────────────────
@@ -1158,18 +1448,23 @@ async function getEffectiveScheduleForEmployee(employeeId, dateStr) {
 }
 
 const bulkCreateShifts = async (req, res) => {
-  const { employeeIds, dates, shiftType, startTime, endTime, breakMinutes, location, notes, isOpen } = req.body;
+  const { employeeIds, dates, shiftType, startTime, endTime, breakMinutes, location, address, notes, isOpen, taskTemplateId } = req.body;
   const open = isOpen === true || isOpen === 'true';
   if (!open && (!Array.isArray(employeeIds) || employeeIds.length === 0)) return returnFunction(res, 400, false, 'No employees selected.');
   if (!Array.isArray(dates) || dates.length === 0) return returnFunction(res, 400, false, 'No dates selected.');
 
+  const coords = await geocodeAddress(address);
   const shiftBase = {
     shiftType:    shiftType || 'full_day',
     startTime:    startTime || '08:00',
     endTime:      endTime   || '17:00',
     breakMinutes: Number(breakMinutes) || 60,
     location:     location || 'office',
+    address:      address || null,
+    addressLat:   coords?.lat ?? null,
+    addressLng:   coords?.lng ?? null,
     notes:        notes || '',
+    taskTemplateId: taskTemplateId ? new ObjectId(taskTemplateId) : null,
     createdBy:    new ObjectId(req.user._id),
     createdAt:    new Date(),
   };
@@ -1186,7 +1481,10 @@ const bulkCreateShifts = async (req, res) => {
       }
     }
   }
-  await global.dbo.collection('shifts').insertMany(docs);
+  const result = await global.dbo.collection('shifts').insertMany(docs);
+  if (taskTemplateId) {
+    await Promise.all(Object.values(result.insertedIds).map((id) => materializeShiftTasks(id, taskTemplateId)));
+  }
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { count: docs.length });
 };
 
@@ -1493,4 +1791,7 @@ module.exports = {
   exportAttendanceReportCSV,
   getPayrollFeed, markPayrollFeedProcessed,
   bulkApproveTimesheets,
+  listShiftTaskTemplates, createShiftTaskTemplate, updateShiftTaskTemplate, deleteShiftTaskTemplate,
+  getShiftTasks, updateShiftTask,
+  getShiftNotes, createShiftNote, getShiftHandoverNotes,
 };

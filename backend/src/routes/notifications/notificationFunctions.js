@@ -2,6 +2,7 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
+const { STAFF } = require('../../constants/roles');
 
 // ── Internal helper — called by all modules when events occur ─────────────────
 const createNotification = async ({
@@ -69,9 +70,33 @@ const MODULE_ROUTE_BY_TYPE = {
   training:         '/training',
 };
 
-const withNavigateFallback = (item) => (
-  item.navigateTo ? item : { ...item, navigateTo: MODULE_ROUTE_BY_TYPE[item.type] || null }
-);
+// A plain 'staff' account is only ever allowed on /staff-portal plus /my/training,
+// /my/onboarding, /my/offboarding, /my/leave (enforced in (hr)/layout.tsx) — every other
+// route in MODULE_ROUTE_BY_TYPE above bounces them straight back to /staff-portal on
+// arrival. That made the bell look completely inert for staff: click a notification,
+// it marks read and "navigates," and you land right back where you started. Everything
+// without a real staff-facing route falls back to /staff-portal itself rather than a
+// route that will just redirect them again.
+const STAFF_MODULE_ROUTE_BY_TYPE = {
+  ...MODULE_ROUTE_BY_TYPE,
+  announcement:     '/staff-portal',
+  attendance_alert: '/staff-portal',
+  expense:          '/staff-portal',
+  leave:            '/my/leave',
+  offboarding:      '/my/offboarding',
+  onboarding:       '/my/onboarding',
+  payroll:          '/staff-portal',
+  recruitment:      '/staff-portal',
+  task:             '/staff-portal',
+  task_reminder:    '/staff-portal',
+  training:         '/my/training',
+};
+
+const withNavigateFallback = (item, role) => {
+  if (item.navigateTo) return item;
+  const map = role === STAFF ? STAFF_MODULE_ROUTE_BY_TYPE : MODULE_ROUTE_BY_TYPE;
+  return { ...item, navigateTo: map[item.type] || null };
+};
 
 // ── List notifications ────────────────────────────────────────────────────────
 const listNotifications = async (req, res) => {
@@ -95,7 +120,7 @@ const listNotifications = async (req, res) => {
     findMany('notifications', filter, { skip, limit, sort: { createdAt: -1 } }),
   ]);
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items.map(withNavigateFallback), total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items.map((item) => withNavigateFallback(item, req.user.role)), total, page, limit));
 };
 
 // ── Get unread count ──────────────────────────────────────────────────────────

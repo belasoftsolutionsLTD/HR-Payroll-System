@@ -8,6 +8,11 @@ const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('..
 const { resolvePolicy } = require('../../lib/spend/policyResolver');
 const { buildSpendScopeFilter, canAccessRecord } = require('../../lib/spend/orgScope');
 const { sendEmail } = require('../../services/emailService');
+const { postJournalEntry, resolveSystemAccount } = require('../../lib/accounting/glEngine');
+const { resolvePaymentSystemKey, GENERIC_PAYMENT_SYSTEM_KEYS } = require('../../lib/accounting/paymentMethodAccounts');
+const { logPostingFailure } = require('../accounting/accountingPostingFailuresFunctions');
+
+const round2 = (n) => Math.round(n * 100) / 100;
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  CORPORATE CARDS
@@ -594,6 +599,26 @@ const generatePONumber = async () => {
   return `PO-${year}-${String(result.seq).padStart(5, '0')}`;
 };
 
+// Short, scannable department code for the invoice-numbering scheme below —
+// "Human Resources" -> "HR", "Technology" -> "TEC" — purely cosmetic, not part of the
+// uniqueness guarantee (the counter is what makes the number unique).
+function departmentCode(deptName) {
+  if (!deptName) return 'GEN';
+  const words = deptName.trim().split(/\s+/);
+  return (words.length === 1 ? words[0].slice(0, 3) : words.map((w) => w[0]).join('').slice(0, 4)).toUpperCase();
+}
+
+// Our own internal reference for a vendor invoice tied to a PO — deliberately separate
+// from the vendor's own invoice number (which we still capture as-is) so a glance at
+// this number alone says "this is a PO invoice, from this department": PO-TEC-2026-00007.
+const generatePOInvoiceNumber = async (deptName) => {
+  const year = new Date().getFullYear();
+  const result = await global.dbo.collection('counters').findOneAndUpdate(
+    { _id: `po_invoice_number_${year}` }, { $inc: { seq: 1 } }, { upsert: true, returnDocument: 'after' }
+  );
+  return `PO-${departmentCode(deptName)}-${year}-${String(result.seq).padStart(5, '0')}`;
+};
+
 const convertRequisitionToPO = async (req, res) => {
   const pr = await findOne('purchase_requests', { _id: new ObjectId(req.params.id) });
   if (!pr) return returnFunction(res, 404, false, req.locale.notFound);
@@ -721,17 +746,13 @@ const sendPurchaseOrder = async (req, res) => {
   const po = await findOne('purchase_orders', { _id: new ObjectId(req.params.id) });
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (po.status !== 'draft') return returnFunction(res, 400, false, 'Only a draft purchase order can be sent.');
-  await updateOne('purchase_orders', { _id: new ObjectId(req.params.id) }, { $set: { status: 'sent', updatedAt: new Date() } });
+  await updateOne('purchase_orders', { _id: new ObjectId(req.params.id) }, { $set: { status: 'pending', updatedAt: new Date() } });
   return returnFunction(res, 200, true, 'Purchase order sent to vendor.');
 };
 
-const acknowledgePurchaseOrder = async (req, res) => {
-  const po = await findOne('purchase_orders', { _id: new ObjectId(req.params.id) });
-  if (!po) return returnFunction(res, 404, false, req.locale.notFound);
-  if (po.status !== 'sent') return returnFunction(res, 400, false, 'Only a sent purchase order can be acknowledged.');
-  await updateOne('purchase_orders', { _id: new ObjectId(req.params.id) }, { $set: { status: 'acknowledged', updatedAt: new Date() } });
-  return returnFunction(res, 200, true, 'Purchase order acknowledged.');
-};
+// There is no standalone "acknowledge" action — a vendor acknowledges a PO by sending
+// us their invoice for it, which is what actually moves the PO forward (see
+// createVendorInvoice, which sets status: 'pendingDelivery').
 
 const cancelPurchaseOrder = async (req, res) => {
   const po = await findOne('purchase_orders', { _id: new ObjectId(req.params.id) });
@@ -765,8 +786,8 @@ const createGoodsReceipt = async (req, res) => {
 
   const po = await findOne('purchase_orders', { _id: new ObjectId(purchaseOrderId) });
   if (!po) return returnFunction(res, 404, false, 'Purchase order not found.');
-  if (!['sent', 'acknowledged', 'partiallyReceived'].includes(po.status)) {
-    return returnFunction(res, 400, false, 'This purchase order is not awaiting receipt.');
+  if (!['pendingDelivery', 'partiallyReceived'].includes(po.status)) {
+    return returnFunction(res, 400, false, 'This purchase order is not awaiting receipt — a vendor invoice must be recorded first.');
   }
 
   const receiptItems = items.map((it) => {
@@ -824,6 +845,20 @@ const createGoodsReceipt = async (req, res) => {
     }).catch(() => {});
   }
 
+  // Acknowledge delivery back to the vendor by email — the counterpart to the
+  // invoice-received email sent in createVendorInvoice, closing the loop on both ends.
+  const vendor = po.vendorId ? await findOne('vendors', { _id: po.vendorId }) : null;
+  if (vendor?.email) {
+    const lines = receiptItems.map((it) =>
+      `<li>${it.description} — received ${it.receivedQuantity}/${it.orderedQuantity}${it.condition !== 'good' ? ` (${it.condition})` : ''}</li>`
+    ).join('');
+    sendEmail({
+      to: vendor.email,
+      subject: `Delivery received — PO ${po.poNumber || po._id}`,
+      html: `<p>Dear ${vendor.contactName || vendor.name},</p><p>We acknowledge receipt of your delivery against purchase order <strong>${po.poNumber || po._id}</strong>:</p><ul>${lines}</ul>${status === 'disputed' ? '<p>Note: one or more items were flagged on receipt (damaged or short-shipped) — our team will be in touch.</p>' : ''}`,
+    }).catch(() => {});
+  }
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, poStatus });
 };
 
@@ -863,16 +898,22 @@ const createVendorInvoice = async (req, res) => {
 
   const po = await findOne('purchase_orders', { _id: new ObjectId(purchaseOrderId) });
   if (!po) return returnFunction(res, 404, false, 'Purchase order not found.');
+  // A vendor invoice IS how a PO gets acknowledged in this pipeline — see sendPurchaseOrder
+  // (draft -> pending) and this function's status update below (pending -> pendingDelivery).
+  if (po.status !== 'pending') {
+    return returnFunction(res, 400, false, 'This purchase order is not awaiting a vendor invoice — it must be sent first, and can only receive one invoice.');
+  }
 
   const invoiceItems = items.map((it) => ({
     description: it.description, quantity: Number(it.quantity) || 0,
     unitPrice: Number(it.unitPrice) || 0, totalPrice: (Number(it.quantity) || 0) * (Number(it.unitPrice) || 0),
   }));
   const totalAmount = invoiceItems.reduce((s, it) => s + it.totalPrice, 0);
+  const poInvoiceNumber = await generatePOInvoiceNumber(po.departmentId);
 
   const doc = {
     purchaseOrderId: po._id, vendorId: new ObjectId(vendorId),
-    invoiceNumber, invoiceDate: new Date(invoiceDate), dueDate: new Date(dueDate),
+    invoiceNumber, poInvoiceNumber, invoiceDate: new Date(invoiceDate), dueDate: new Date(dueDate),
     items: invoiceItems, totalAmount, currency: currency || po.currency || 'KES',
     status: 'received', threeWayMatchStatus: 'pending', discrepancyNotes: null,
     fileUrl: req.body.fileUrl || null,
@@ -880,17 +921,54 @@ const createVendorInvoice = async (req, res) => {
     createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('vendor_invoices', doc);
-  await updateOne('purchase_orders', { _id: po._id }, { $set: { invoiceId: result.insertedId, updatedAt: new Date() } });
+  await updateOne('purchase_orders', { _id: po._id }, {
+    $set: { invoiceId: result.insertedId, status: 'pendingDelivery', updatedAt: new Date() },
+  });
+
+  // The liability trigger for THIS pipeline — the invoice is recorded before the goods
+  // receipt here (opposite ordering from Inventory's own PO system), and posts to the
+  // SAME Accounts Payable account Inventory's PO receipts use: two separate, unlinked
+  // source systems, one shared ledger account, per the product decision on AP sourcing.
+  // Spending's PO pipeline has no perpetual-inventory asset to debit (unrelated to
+  // inventory_items/avgCost), so it's booked as Procurement Expense instead.
+  {
+    const jePayload = {
+      date: doc.invoiceDate, description: `Vendor invoice ${invoiceNumber} — ${poInvoiceNumber}`, source: 'spending_vendor_invoice', sourceModule: 'spending',
+      referenceId: result.insertedId, referenceModel: 'vendor_invoices', department: po.departmentId || null, lines: [],
+    };
+    try {
+      const expenseAcct = await resolveSystemAccount('procurement_expense');
+      const apAcct = await resolveSystemAccount('accounts_payable');
+      jePayload.lines = [{ accountId: expenseAcct._id, debit: round2(totalAmount) }, { accountId: apAcct._id, credit: round2(totalAmount) }];
+      await postJournalEntry({ ...jePayload, postedBy: req.user?._id ?? null });
+    } catch (err) {
+      await logPostingFailure({ source: 'spending_vendor_invoice', sourceModule: 'spending', referenceId: result.insertedId, referenceModel: 'vendor_invoices', attemptedPayload: jePayload, error: err });
+    }
+  }
 
   notifyHR({
     type: 'procurement', subType: 'vendor_invoice_received',
-    title: `Vendor invoice received — #${invoiceNumber}`,
+    title: `Vendor invoice received — ${poInvoiceNumber}`,
     subtitle: `${doc.currency} ${totalAmount.toLocaleString()} — needs 3-way match`,
     referenceId: result.insertedId, referenceModel: 'vendor_invoices',
     requiresAction: true, triggeredBy: req.user?._id ?? null,
   }).catch(() => {});
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  // Acknowledge the invoice back to the vendor by email — the counterpart to the
+  // delivery-received email sent in createGoodsReceipt.
+  const vendor = await findOne('vendors', { _id: new ObjectId(vendorId) });
+  if (vendor?.email) {
+    sendEmail({
+      to: vendor.email,
+      subject: `Invoice received — ${poInvoiceNumber}`,
+      html: `<p>Dear ${vendor.contactName || vendor.name},</p><p>We have received your invoice <strong>#${invoiceNumber}</strong> against purchase order <strong>${po.poNumber || po._id}</strong> for ${doc.currency} ${totalAmount.toLocaleString()}, due ${new Date(dueDate).toLocaleDateString()}. Our reference for this invoice is <strong>${poInvoiceNumber}</strong>.</p><p>It is now under review and will be matched against the delivered goods before approval for payment.</p>`,
+    }).catch(() => {});
+  }
+
+  // The default frontend toast reads this message field directly (apiCallFunction.tsx) —
+  // surfacing our auto-generated reference here means the modal needs no bespoke
+  // success-detail screen just to show it.
+  return returnFunction(res, 201, true, `Invoice recorded — internal reference ${poInvoiceNumber}`, { _id: result.insertedId, poInvoiceNumber });
 };
 
 // Three-way match: compare the invoice against the PO (ordered) and the goods receipts
@@ -963,12 +1041,37 @@ const disputeVendorInvoice = async (req, res) => {
   return returnFunction(res, 200, true, 'Invoice marked as disputed.');
 };
 
+// paymentMethod/paymentReference weren't captured here before — a real gap, since there
+// was no way to show how a vendor was actually paid. Extended directly on this handler
+// (reusing its own 'approved'-status guard) rather than building a parallel Accounting-
+// only payment endpoint that would have to duplicate that guard.
 const payVendorInvoice = async (req, res) => {
+  if (!validateRequiredFields(req, res, ['paymentMethod', 'paymentReference'])) return;
+  if (!Object.keys(GENERIC_PAYMENT_SYSTEM_KEYS).includes(req.body.paymentMethod)) {
+    return returnFunction(res, 400, false, `paymentMethod must be one of: ${Object.keys(GENERIC_PAYMENT_SYSTEM_KEYS).join(', ')}`);
+  }
   const invoice = await findOne('vendor_invoices', { _id: new ObjectId(req.params.id) });
   if (!invoice) return returnFunction(res, 404, false, req.locale.notFound);
   if (invoice.status !== 'approved') return returnFunction(res, 400, false, 'Invoice must be approved before it can be paid.');
-  await updateOne('vendor_invoices', { _id: invoice._id }, { $set: { status: 'paid', paidAt: new Date(), updatedAt: new Date() } });
+  await updateOne('vendor_invoices', { _id: invoice._id }, {
+    $set: { status: 'paid', paidAt: new Date(), paymentMethod: req.body.paymentMethod, paymentReference: req.body.paymentReference, updatedAt: new Date() },
+  });
   await updateOne('purchase_orders', { _id: invoice.purchaseOrderId }, { $set: { status: 'paid', updatedAt: new Date() } });
+
+  const po = await findOne('purchase_orders', { _id: invoice.purchaseOrderId }, { projection: { departmentId: 1 } });
+  const jePayload = {
+    date: new Date(), description: `Vendor payment — ${invoice.invoiceNumber} (${req.body.paymentReference})`, source: 'spending_vendor_payment', sourceModule: 'spending',
+    referenceId: invoice._id, referenceModel: 'vendor_invoices', department: po?.departmentId || null, lines: [],
+  };
+  try {
+    const apAcct = await resolveSystemAccount('accounts_payable');
+    const paymentAcct = await resolveSystemAccount(resolvePaymentSystemKey(req.body.paymentMethod));
+    jePayload.lines = [{ accountId: apAcct._id, debit: round2(invoice.totalAmount) }, { accountId: paymentAcct._id, credit: round2(invoice.totalAmount) }];
+    await postJournalEntry({ ...jePayload, postedBy: req.user?._id ?? null });
+  } catch (err) {
+    await logPostingFailure({ source: 'spending_vendor_payment', sourceModule: 'spending', referenceId: invoice._id, referenceModel: 'vendor_invoices', attemptedPayload: jePayload, error: err });
+  }
+
   return returnFunction(res, 200, true, 'Invoice marked as paid.');
 };
 
@@ -1034,7 +1137,7 @@ module.exports = {
   listVendors, getVendor, createVendor, updateVendor, deleteVendor, approveVendor, rejectVendor,
   listProcurementPolicies, getProcurementPolicy, createProcurementPolicy, updateProcurementPolicy, deleteProcurementPolicy,
   convertRequisitionToPO,
-  listPurchaseOrders, getPurchaseOrder, updatePurchaseOrder, sendPurchaseOrder, acknowledgePurchaseOrder, cancelPurchaseOrder,
+  listPurchaseOrders, getPurchaseOrder, updatePurchaseOrder, sendPurchaseOrder, cancelPurchaseOrder,
   listGoodsReceipts, getGoodsReceipt, createGoodsReceipt,
   listVendorInvoices, getVendorInvoice, createVendorInvoice, matchVendorInvoice, approveVendorInvoice, disputeVendorInvoice, payVendorInvoice,
   getProcurementOverview, getProcurementSpend, getVendorAnalytics, getCycleTimeAnalytics,

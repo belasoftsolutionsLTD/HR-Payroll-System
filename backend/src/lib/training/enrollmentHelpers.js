@@ -37,6 +37,7 @@ const createSingleCourseEnrollment = async ({ employeeId, courseId, learningPath
     title: 'New Training Assigned',
     body: 'You have been assigned a new course.',
     type: 'training',
+    link: `/my/training/courses/${courseId}`,
   }).catch(() => {});
   return { created: true, _id: result.insertedId };
 };
@@ -74,6 +75,7 @@ const createLearningPathEnrollment = async ({ employeeId, learningPathId, enroll
     title: 'New Learning Path Assigned',
     body: `You have been enrolled in "${path_.name}".`,
     type: 'training',
+    link: `/my/training/learning-paths/${learningPathId}`,
   }).catch(() => {});
 
   return { created: true, _id: result.insertedId };

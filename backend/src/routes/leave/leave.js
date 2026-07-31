@@ -10,7 +10,7 @@ const {
   createAccrualPolicy, listAccrualPolicies, getAccrualPolicy, updateAccrualPolicy, deleteAccrualPolicy,
   runAccrualPolicies, runYearEndCarryForward,
   getLeaveBalances, getEmployeeLeaveBalances, adjustLeaveBalance,
-  listLeaveRequests, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
+  listLeaveRequests, exportLeaveRequestsCSV, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
   approveLeaveRequest, rejectLeaveRequest, cancelLeaveRequest,
   counterOfferLeaveRequest, acceptCounterOffer, disputeCounterOffer,
   revokeLeaveRequest, disputeLeaveRequest, resolveDispute,
@@ -67,6 +67,7 @@ router.get('/balances/:employeeId',  allRoles, AsyncHandler(getEmployeeLeaveBala
 
 // ── Leave Requests — HR/manager views, role-scoped inside handlers ─────────────
 router.get('/requests',                    allRoles, AsyncHandler(listLeaveRequests));
+router.get('/requests/export',             allRoles, AsyncHandler(exportLeaveRequestsCSV));
 router.get('/requests/:id',                allRoles, AsyncHandler(getLeaveRequest));
 // approve/reject use allRoles at the route level because a Level 1 approver is
 // often a plain "staff" user acting as a manager via employees.managerId — the

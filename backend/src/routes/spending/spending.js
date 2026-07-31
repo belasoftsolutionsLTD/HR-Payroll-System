@@ -13,7 +13,7 @@ const {
   listVendors, getVendor, createVendor, updateVendor, deleteVendor, approveVendor, rejectVendor,
   listProcurementPolicies, getProcurementPolicy, createProcurementPolicy, updateProcurementPolicy, deleteProcurementPolicy,
   convertRequisitionToPO,
-  listPurchaseOrders, getPurchaseOrder, updatePurchaseOrder, sendPurchaseOrder, acknowledgePurchaseOrder, cancelPurchaseOrder,
+  listPurchaseOrders, getPurchaseOrder, updatePurchaseOrder, sendPurchaseOrder, cancelPurchaseOrder,
   listGoodsReceipts, getGoodsReceipt, createGoodsReceipt,
   listVendorInvoices, getVendorInvoice, createVendorInvoice, matchVendorInvoice, approveVendorInvoice, disputeVendorInvoice, payVendorInvoice,
   getProcurementOverview, getProcurementSpend, getVendorAnalytics, getCycleTimeAnalytics,
@@ -100,7 +100,6 @@ router.get('/procurement-orders',              deptHeadUp, AsyncHandler(listPurc
 router.get('/procurement-orders/:id',          deptHeadUp, AsyncHandler(getPurchaseOrder));
 router.patch('/procurement-orders/:id',        hrOnly,     AsyncHandler(updatePurchaseOrder));
 router.put('/procurement-orders/:id/send',        hrOnly,  AsyncHandler(sendPurchaseOrder));
-router.put('/procurement-orders/:id/acknowledge', hrOnly,  AsyncHandler(acknowledgePurchaseOrder));
 router.delete('/procurement-orders/:id',       hrOnly,     AsyncHandler(cancelPurchaseOrder));
 
 // ── Procurement — Goods Receipts (any role can log a delivery they received) ──

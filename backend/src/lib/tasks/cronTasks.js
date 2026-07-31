@@ -1,10 +1,69 @@
 const cron = require('node-cron');
 const { ObjectId } = require('mongodb');
 const { triggerTasksFromTemplate } = require('./triggerTasksFromTemplate');
-const { notifyEmployee, notifyUser } = require('../../functions/HR/notifyUser');
+const { notifyEmployee, notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { runAccrual, runYearEndCarryOver } = require('../leave/accrualEngine');
 const { getEffectiveScheduleForEmployee } = require('../../routes/attendance/attendanceFunctions');
 const { runDueScheduledReports } = require('../../routes/reports/reportFunctions');
+const { getLowStockLevels } = require('../../routes/inventory/inventoryLocationsFunctions');
+const { updateOne } = require('../../functions/Database/commonDBFunctions');
+
+// Re-notifying on every hourly/daily tick for a level that's been low for a week would
+// bury HR's inbox — only re-alert once the last alert is more than 20h old, same
+// "sentFlag timestamp" idempotency idiom leaveStartReminder/detectMissedClockOuts use.
+const LOW_STOCK_REALERT_MS = 20 * 60 * 60 * 1000;
+
+async function checkLowStockAlerts() {
+  if (!global.dbo) return;
+  const lowLevels = await getLowStockLevels(null); // null = unrestricted, company-wide sweep
+  const now = Date.now();
+  const dueForAlert = lowLevels.filter((l) => !l.lastLowStockAlertAt || (now - new Date(l.lastLowStockAlertAt).getTime()) > LOW_STOCK_REALERT_MS);
+  if (!dueForAlert.length) return;
+
+  for (const level of dueForAlert) {
+    await notifyByRoles(['super_admin', 'hr_manager'], {
+      title: 'Low stock alert',
+      body: `${level.item?.name ?? 'An item'} (${level.item?.sku ?? ''}) at ${level.location?.name ?? 'a location'} is at ${level.quantity} ${level.item?.unitOfMeasure ?? 'units'}, at/below its reorder point of ${level.reorderPoint}.`,
+      type: 'inventory',
+      link: `/inventory?tab=items`,
+    }).catch(() => {});
+    await updateOne('inventory_stock_levels', { itemId: level.itemId, locationId: level.locationId }, { $set: { lastLowStockAlertAt: new Date() } });
+  }
+}
+
+// employees.certifications[] (Skills & Qualifications tab) has always had an expiryDate
+// field but no notification behind it — pull-based only via getUpcomingAnalytics. This is
+// the smallest addition that gives it one, reused as-is by Logistics for driver license
+// expiry rather than building a parallel tracking system. Same single-fixed-offset +
+// sent-flag idempotency pattern as leaveStartReminder (30 days ahead, once per cert).
+async function checkExpiringCertifications() {
+  if (!global.dbo) return;
+  const target = new Date();
+  target.setUTCDate(target.getUTCDate() + 30);
+  const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
+  const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+  const employees = await global.dbo.collection('employees').find({
+    certifications: { $elemMatch: { expiryDate: { $gte: dayStart, $lt: dayEnd }, alertSent: { $ne: true } } },
+  }, { projection: { fullName: 1, certifications: 1 } }).toArray();
+  if (!employees.length) return;
+
+  for (const emp of employees) {
+    const due = emp.certifications.filter((c) => c.expiryDate && new Date(c.expiryDate) >= dayStart && new Date(c.expiryDate) < dayEnd && !c.alertSent);
+    for (const cert of due) {
+      notifyEmployee(emp._id, {
+        title: 'Certification Expiring Soon',
+        body: `Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.`,
+        type: 'general',
+      }).catch(() => {});
+      await global.dbo.collection('employees').updateOne(
+        { _id: emp._id },
+        { $set: { 'certifications.$[cert].alertSent': true } },
+        { arrayFilters: [{ 'cert.id': cert.id }] }
+      );
+    }
+  }
+}
 
 async function dailyTaskJobs() {
   if (!global.dbo) return;
@@ -542,6 +601,12 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Training automation rule error:', err); }
   });
 
+  // Daily at 08:20 UTC — employees.certifications[] expiring in 30 days (driver licenses, etc.)
+  cron.schedule('20 8 * * *', async () => {
+    try { await checkExpiringCertifications(); }
+    catch (err) { console.error('[CRON] Certification expiry check error:', err); }
+  });
+
   // Daily at 00:15 UTC — auto-close requisitions past their application deadline
   cron.schedule('15 0 * * *', async () => {
     try { await closeExpiredRequisitions(); }
@@ -554,7 +619,15 @@ function startCronJobs() {
     catch (err) { console.error('[CRON] Scheduled report error:', err); }
   });
 
+  // Every 2 hours — sweep inventory_stock_levels for anything at/below its reorder
+  // point and notify HR (idempotency guard inside checkLowStockAlerts avoids re-paging
+  // for the same low item more than once every ~20h).
+  cron.schedule('0 */2 * * *', async () => {
+    try { await checkLowStockAlerts(); }
+    catch (err) { console.error('[CRON] Low stock alert error:', err); }
+  });
+
   console.log('[CRON] All cron jobs scheduled');
 }
 
-module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, deactivateExpiredContractors, autoMarkAbsent, markLateArrivals, detectMissedClockOuts, closeExpiredRequisitions, leaveStartReminder, leaveEndReminder };
+module.exports = { startCronJobs, dailyTaskJobs, checkOverdueTraining, runTrainingAutomationRules, flipOffboardingEmployeeStatus, deactivateExpiredContractors, autoMarkAbsent, markLateArrivals, detectMissedClockOuts, closeExpiredRequisitions, leaveStartReminder, leaveEndReminder, checkLowStockAlerts, checkExpiringCertifications };

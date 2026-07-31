@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const { ObjectId } = require('mongodb');
 const archiver = require('archiver');
 const returnFunction = require('../../functions/returnFunction');
@@ -13,6 +15,10 @@ const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpe
 const { isPayrollReady, getMissingCriticalFields } = require('../employees/employeesFunctions');
 const { resolveConceptPass1, resolveConceptPass2 } = require('../../lib/payroll/resolveConceptPayItems');
 const { logCompensationChange } = require('./payrollCompensationsFunctions');
+const { postJournalEntry, resolveSystemAccount } = require('../../lib/accounting/glEngine');
+const { logPostingFailure } = require('../accounting/accountingPostingFailuresFunctions');
+
+const round2 = (n) => Math.round(n * 100) / 100;
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -660,12 +666,14 @@ async function closeCycleInternal(req, res, cycle) {
   const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
   const period = `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}`;
   const notifyMessage = `Your payslip for ${period} has been generated. You can view and download it from your portal.`;
+  const companySettings = await findOne('company_settings', {});
+  const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   // Generate payslips for each employee
   for (const result of results) {
     try {
       const emp = await findOne('employees', { _id: result.employeeId }, { projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccountNumber: 1 } });
-      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle);
+      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle, branding);
       // Store PDF reference (in production: upload to storage, store URL)
       const payslipDoc = {
         employeeId:  result.employeeId,
@@ -683,6 +691,22 @@ async function closeCycleInternal(req, res, cycle) {
       await updateOne('payroll_results', { _id: result._id }, {
         $set: { payslipUrl: `/api/payroll/payslips/${slip.insertedId}/pdf`, payslipSentAt: new Date(), status: 'paid', updatedAt: new Date() },
       });
+
+      // Also land a copy under the employee's Documents (Payslips folder) — the payslip
+      // module keeps its own base64 copy in `payslips` for the dedicated payslip UI, but
+      // Documents' download flow (downloadDocument) reads from disk via employee.documents[],
+      // so a real file has to exist there too for the Payslips folder to actually show it.
+      try {
+        const uploadDir = process.env.UPLOAD_DIR || 'uploads';
+        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+        const filePath = path.join(uploadDir, `payslip-${slip.insertedId}.pdf`);
+        fs.writeFileSync(filePath, pdfBuffer);
+        await updateOne('employees', { _id: result.employeeId }, { $push: { documents: {
+          docId: new ObjectId(), docType: 'payslip', fileName: `Payslip - ${period}.pdf`, filePath, uploadedAt: new Date(),
+        } } });
+      } catch (docErr) {
+        console.error(`Payslip document upload failed for employee ${result.employeeId}:`, docErr.message);
+      }
 
       // Notify the employee (in-app + email) — separate from the manual emailPayslips action.
       notifyEmployee(result.employeeId, {
@@ -709,6 +733,45 @@ async function closeCycleInternal(req, res, cycle) {
   await updateOne('payroll_cycles', { _id: cycle._id }, {
     $set: { status: 'closed', closedAt: new Date(), closedBy: req.user?._id ?? null, updatedAt: new Date() },
   });
+
+  // Salary Expense / Salary Payable, net-pay-denominated (statutory withholdings and
+  // employer contributions are not separately booked as GL liabilities in v1 — everything
+  // nets through at the net-pay figure). Never blocks the close itself. Lines are split
+  // per department so a department_head's 'viewer' reports scope correctly later.
+  {
+    const employeeIds = [...new Set(results.map((r) => String(r.employeeId)))].map((id) => new ObjectId(id));
+    const employees = employeeIds.length ? await findMany('employees', { _id: { $in: employeeIds } }, { projection: { department: 1 } }) : [];
+    const deptByEmployee = Object.fromEntries(employees.map((e) => [String(e._id), e.department || null]));
+
+    const netByDept = {};
+    for (const r of results) {
+      const dept = deptByEmployee[String(r.employeeId)] || null;
+      netByDept[dept] = round2((netByDept[dept] || 0) + (r.netPay || 0));
+    }
+    const totalNet = round2(Object.values(netByDept).reduce((s, v) => s + v, 0));
+
+    if (totalNet > 0) {
+      const payload = {
+        date: new Date(), description: `Payroll cycle closed — ${period}`, source: 'payroll_cycle_close', sourceModule: 'payroll',
+        referenceId: cycle._id, referenceModel: 'payroll_cycles', lines: [],
+      };
+      try {
+        const expenseAcct = await resolveSystemAccount('salary_expense');
+        const payableAcct = await resolveSystemAccount('salary_payable');
+        const lines = [];
+        for (const [dept, amount] of Object.entries(netByDept)) {
+          if (amount <= 0) continue;
+          const department = dept === 'null' ? null : dept;
+          lines.push({ accountId: expenseAcct._id, debit: amount, department });
+          lines.push({ accountId: payableAcct._id, credit: amount, department });
+        }
+        payload.lines = lines;
+        await postJournalEntry({ ...payload, postedBy: req.user?._id ?? null });
+      } catch (err) {
+        await logPostingFailure({ source: 'payroll_cycle_close', sourceModule: 'payroll', referenceId: cycle._id, referenceModel: 'payroll_cycles', attemptedPayload: payload, error: err });
+      }
+    }
+  }
 
   return returnFunction(res, 200, true, 'Cycle closed and payslips distributed.');
 }
@@ -803,6 +866,8 @@ const emailPayslips = async (req, res) => {
 
   let sent = 0, skipped = 0, failed = 0;
   const period = `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}`;
+  const companySettings = await findOne('company_settings', {});
+  const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   for (const result of results) {
     try {
@@ -815,7 +880,7 @@ const emailPayslips = async (req, res) => {
 
       if (!user?.email) { skipped++; continue; }
 
-      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle);
+      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle, branding);
       const cur       = cycle.currency || 'KES';
       const netFmt    = `${cur} ${(result.netPay || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`;
 
@@ -869,6 +934,8 @@ const downloadPayslipsZip = async (req, res) => {
 
   const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
   if (!results.length) return returnFunction(res, 400, false, 'No payroll results found for this cycle.');
+  const companySettings = await findOne('company_settings', {});
+  const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="payslips-${cycle._id}.zip"`);
@@ -888,7 +955,7 @@ const downloadPayslipsZip = async (req, res) => {
   for (const result of results) {
     try {
       const emp = await findOne('employees', { _id: result.employeeId }, { projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccountNumber: 1 } });
-      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle);
+      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle, branding);
       const filename = `payslip-${emp?.staffNumber ?? result.employeeId}-${cycle.period.year}-${String(cycle.period.month).padStart(2, '0')}.pdf`;
       archive.append(pdfBuffer, { name: filename });
     } catch (err) {

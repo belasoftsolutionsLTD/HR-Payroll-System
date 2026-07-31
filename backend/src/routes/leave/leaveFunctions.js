@@ -369,6 +369,51 @@ const listLeaveRequests = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
+// CSV export of leave requests over a date range — same filter/scoping rules as
+// listLeaveRequests, minus pagination, so HR (or a scoped manager/dept_head) can pull a
+// raw list of who took what leave, when, for how long, and its outcome.
+const csvEscape = (v) => {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+const exportLeaveRequestsCSV = async (req, res) => {
+  const scopedIds = await getScopedEmployeeIds(req.user);
+  const filter = {};
+  if (scopedIds !== null) filter.employeeId = { $in: scopedIds };
+  if (req.query.status) filter.status = req.query.status;
+  if (req.query.leaveTypeId) filter.leaveTypeId = new ObjectId(req.query.leaveTypeId);
+  if (req.query.startDate || req.query.endDate) {
+    filter.startDate = {};
+    if (req.query.startDate) filter.startDate.$gte = new Date(req.query.startDate);
+    if (req.query.endDate) filter.startDate.$lte = new Date(req.query.endDate);
+  }
+
+  const requests = await findMany('leave_requests', filter, { sort: { startDate: -1 } });
+  let enriched = await enrichRequests(requests);
+  if (req.query.department) enriched = enriched.filter((r) => r.employee?.department === req.query.department);
+
+  const header = 'StaffNo,Name,Department,LeaveType,StartDate,EndDate,TotalDays,Status,LastUpdated';
+  const rows = enriched.map((r) => [
+    r.employee?.staffNumber || '',
+    r.employee?.fullName || '',
+    r.employee?.department || '',
+    r.leaveType?.name || '',
+    r.startDate ? new Date(r.startDate).toISOString().split('T')[0] : '',
+    r.endDate ? new Date(r.endDate).toISOString().split('T')[0] : '',
+    r.totalDays ?? '',
+    r.status || '',
+    r.updatedAt ? new Date(r.updatedAt).toISOString().split('T')[0] : '',
+  ].map(csvEscape).join(','));
+  const csv = [header, ...rows].join('\n');
+
+  const from = req.query.startDate || 'all';
+  const to = req.query.endDate || 'time';
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="leave-requests-${from}-to-${to}.csv"`);
+  return res.send(csv);
+};
+
 const getLeaveRequest = async (req, res) => {
   const request = await findOne('leave_requests', { _id: new ObjectId(req.params.id) });
   if (!request) return returnFunction(res, 404, false, req.locale.notFound);
@@ -442,7 +487,7 @@ const createLeaveRequest = async (req, res) => {
 
   if (approvalChain.length) {
     const firstApprover = approvalChain[0];
-    notifyEmployee(employee._id, { title: 'Leave Request Submitted', body: `Your ${leaveType.name} request (${totalDays} day(s)) is pending approval.`, type: 'leave' }).catch(() => {});
+    notifyEmployee(employee._id, { title: 'Leave Request Submitted', body: `Your ${leaveType.name} request (${totalDays} day(s)) is pending approval.`, type: 'leave', link: `/my/leave/requests/${result.insertedId}` }).catch(() => {});
     const inboxItem = {
       type: 'leave', subType: 'leave_request', title: `Leave request: ${employee.fullName}`,
       subtitle: `${leaveType.name} · ${totalDays} day(s) · ${new Date(startDate).toDateString()} - ${new Date(endDate).toDateString()}`,
@@ -455,7 +500,7 @@ const createLeaveRequest = async (req, res) => {
     notifyManager(employee._id, inboxItem).catch(() => {});
     notifyHR(inboxItem).catch(() => {});
   } else {
-    notifyEmployee(employee._id, { title: 'Leave Request Approved', body: `Your ${leaveType.name} request was auto-approved (no approval required for this leave type).`, type: 'leave' }).catch(() => {});
+    notifyEmployee(employee._id, { title: 'Leave Request Approved', body: `Your ${leaveType.name} request was auto-approved (no approval required for this leave type).`, type: 'leave', link: `/my/leave/requests/${result.insertedId}` }).catch(() => {});
   }
 
   return returnFunction(res, 201, true, 'Leave request submitted.', {
@@ -505,7 +550,7 @@ const approveLeaveRequest = async (req, res) => {
     await updateOne('leave_requests', { _id: request._id }, {
       $set: { approvalChain: updatedChain, currentApprovalLevel: nextLevel.level, updatedAt: now },
     });
-    notifyEmployee(request.employeeId, { title: 'Leave Request Update', body: 'Your leave request was approved at one level and is now awaiting the next approver.', type: 'leave' }).catch(() => {});
+    notifyEmployee(request.employeeId, { title: 'Leave Request Update', body: 'Your leave request was approved at one level and is now awaiting the next approver.', type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
     await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'approved', performedBy: req.user._id, performedByName: req.user.name, comment: `Level ${request.currentApprovalLevel} approved` });
     return returnFunction(res, 200, true, 'Approved at this level. Awaiting next approver.');
   }
@@ -524,7 +569,7 @@ const approveLeaveRequest = async (req, res) => {
   }
 
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'approved', performedBy: req.user._id, performedByName: req.user.name, comment: 'Final approval' });
-  notifyEmployee(request.employeeId, { title: 'Leave Request Approved', body: 'Your leave request has been fully approved.', type: 'leave' }).catch(() => {});
+  notifyEmployee(request.employeeId, { title: 'Leave Request Approved', body: 'Your leave request has been fully approved.', type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Leave request approved.');
 };
@@ -549,7 +594,7 @@ const rejectLeaveRequest = async (req, res) => {
   await restorePendingBalance(request);
 
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'rejected', performedBy: req.user._id, performedByName: req.user.name, comment: req.body.rejectionReason });
-  notifyEmployee(request.employeeId, { title: 'Leave Request Rejected', body: req.body.rejectionReason, type: 'leave' }).catch(() => {});
+  notifyEmployee(request.employeeId, { title: 'Leave Request Rejected', body: req.body.rejectionReason, type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Leave request rejected.');
 };
@@ -706,7 +751,7 @@ const revokeLeaveRequest = async (req, res) => {
   await recomputeClosing(request.employeeId, request.leaveTypeId, year);
 
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'revoked', performedBy: req.user._id, performedByName: req.user.name });
-  notifyEmployee(request.employeeId, { title: 'Leave Approval Revoked', body: 'Your previously approved leave has been revoked by HR.', type: 'leave' }).catch(() => {});
+  notifyEmployee(request.employeeId, { title: 'Leave Approval Revoked', body: 'Your previously approved leave has been revoked by HR.', type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
   return returnFunction(res, 200, true, 'Leave request revoked.');
 };
 
@@ -766,6 +811,7 @@ const resolveDispute = async (req, res) => {
       title: 'Leave Dispute Resolved',
       body: `Your dispute was ${resolution}. Your leave has been approved for ${finalDays} day(s).`,
       type: 'leave',
+      link: `/my/leave/requests/${request._id}`,
     }).catch(() => {});
     return returnFunction(res, 200, true, 'Dispute resolved.');
   }
@@ -783,7 +829,7 @@ const resolveDispute = async (req, res) => {
   }
 
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'disputeResolved', performedBy: req.user._id, performedByName: req.user.name, comment: `${resolution}: ${comment || ''}` });
-  notifyEmployee(request.employeeId, { title: 'Leave Dispute Resolved', body: `Your dispute was ${resolution}.`, type: 'leave' }).catch(() => {});
+  notifyEmployee(request.employeeId, { title: 'Leave Dispute Resolved', body: `Your dispute was ${resolution}.`, type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
   return returnFunction(res, 200, true, 'Dispute resolved.');
 };
 
@@ -988,7 +1034,7 @@ module.exports = {
   createAccrualPolicy, listAccrualPolicies, getAccrualPolicy, updateAccrualPolicy, deleteAccrualPolicy,
   runAccrualPolicies, runYearEndCarryForward,
   getLeaveBalances, getEmployeeLeaveBalances, adjustLeaveBalance,
-  listLeaveRequests, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
+  listLeaveRequests, exportLeaveRequestsCSV, getLeaveRequest, createLeaveRequest, updateMyDraftRequest,
   approveLeaveRequest, rejectLeaveRequest, cancelLeaveRequest,
   counterOfferLeaveRequest, acceptCounterOffer, disputeCounterOffer,
   revokeLeaveRequest, disputeLeaveRequest, resolveDispute,

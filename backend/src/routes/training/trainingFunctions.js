@@ -168,6 +168,7 @@ const publishCourse = async (req, res) => {
       title: 'Mandatory Course Published',
       body: `"${course.title}" is now published and marked mandatory, with no target roles/departments set — assign it to the relevant audience or add targeting so it enrolls automatically.`,
       type: 'training',
+      link: `/training/courses/${course._id}`,
     }).catch(() => {});
   }
 
@@ -764,6 +765,7 @@ const maybeGenerateCertificate = async (enrollmentId) => {
       title: 'Certificate Earned',
       body: `You've earned a certificate for completing "${course.title}".`,
       type: 'training',
+      link: '/my/training/certificates',
     }).catch(() => {});
 
     return { ...doc, _id: result.insertedId };
@@ -863,6 +865,7 @@ const verifyExternalCertificate = async (req, res) => {
     title: `External Certificate ${req.body.status === 'verified' ? 'Verified' : 'Rejected'}`,
     body: `Your certificate "${cert.name}" was ${req.body.status}.`,
     type: 'training',
+    link: '/my/training/certificates',
   }).catch(() => {});
 
   return returnFunction(res, 200, true, `Certificate ${req.body.status}.`);

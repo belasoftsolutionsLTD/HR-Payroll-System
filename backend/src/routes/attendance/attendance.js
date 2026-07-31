@@ -20,6 +20,9 @@ const {
   exportAttendanceReportCSV,
   getPayrollFeed, markPayrollFeedProcessed,
   bulkApproveTimesheets,
+  listShiftTaskTemplates, createShiftTaskTemplate, updateShiftTaskTemplate, deleteShiftTaskTemplate,
+  getShiftTasks, updateShiftTask,
+  getShiftNotes, createShiftNote, getShiftHandoverNotes,
 } = require('./attendanceFunctions');
 
 const MGMT     = ['super_admin', 'hr_manager', 'department_head'];
@@ -63,6 +66,19 @@ router.post('/shifts',           allowRoles(MGMT), AsyncHandler(createShift));
 router.post('/shifts/bulk',      allowRoles(MGMT), AsyncHandler(bulkCreateShifts));
 router.put('/shifts/:id',        allowRoles(MGMT), AsyncHandler(updateShift));
 router.delete('/shifts/:id',     allowRoles(MGMT), AsyncHandler(deleteShift));
+
+// ── Shift task checklist templates (HR-managed, e.g. field/client-visit shifts) ──
+router.get('/shift-task-templates',        allowRoles(MGMT), AsyncHandler(listShiftTaskTemplates));
+router.post('/shift-task-templates',       allowRoles(MGMT), AsyncHandler(createShiftTaskTemplate));
+router.patch('/shift-task-templates/:id',  allowRoles(MGMT), AsyncHandler(updateShiftTaskTemplate));
+router.delete('/shift-task-templates/:id', allowRoles(MGMT), AsyncHandler(deleteShiftTaskTemplate));
+
+// ── Per-shift tasks & notes (the assigned employee, or MGMT — see canAccessShift) ──
+router.get('/shifts/:id/tasks',       allowRoles(ALL), AsyncHandler(getShiftTasks));
+router.patch('/shifts/:id/tasks/:taskId', allowRoles(ALL), AsyncHandler(updateShiftTask));
+router.get('/shifts/:id/notes',       allowRoles(ALL), AsyncHandler(getShiftNotes));
+router.post('/shifts/:id/notes',      allowRoles(ALL), AsyncHandler(createShiftNote));
+router.get('/shifts/:id/handover',    allowRoles(ALL), AsyncHandler(getShiftHandoverNotes));
 
 // ── HR / Management ───────────────────────────────────────────────────────────
 // allowRoles(ALL) — scoping (dept_head → dept, staff-as-manager → direct reports,

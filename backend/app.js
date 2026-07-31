@@ -48,6 +48,11 @@ const itRoutes            = require('./src/routes/it/it');
 const notificationRoutes  = require('./src/routes/notifications/notifications');
 const trainingRoutes      = require('./src/routes/training/training');
 const welfareRoutes       = require('./src/routes/welfare/welfare');
+const inventoryRoutes     = require('./src/routes/inventory/inventory');
+const posRoutes           = require('./src/routes/pos/pos');
+const crmRoutes           = require('./src/routes/crm/crm');
+const accountingRoutes    = require('./src/routes/accounting/accounting');
+const logisticsRoutes     = require('./src/routes/logistics/logistics');
 
 const path = require('path');
 const app = express();
@@ -140,6 +145,11 @@ app.use('/api/it',            decodeToken, getUserData, itRoutes);
 app.use('/api/notifications', decodeToken, getUserData, notificationRoutes);
 app.use('/api/training',      decodeToken, getUserData, trainingRoutes);
 app.use('/api/welfare',       decodeToken, getUserData, welfareRoutes);
+app.use('/api/inventory',     decodeToken, getUserData, inventoryRoutes);
+app.use('/api/pos',           decodeToken, getUserData, posRoutes);
+app.use('/api/crm',           decodeToken, getUserData, crmRoutes);
+app.use('/api/accounting',    decodeToken, getUserData, accountingRoutes);
+app.use('/api/logistics',     decodeToken, getUserData, logisticsRoutes);
 
 // ── Global error handler (must be last) ──────────────────────────────────────
 app.use(ErrorHandler);
