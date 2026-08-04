@@ -4,6 +4,7 @@ const { validateRequiredFields, getPagination, paginatedResponse } = require('..
 const { findMany, findOne, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyHR, notifyManager } = require('../inbox/inboxFunctions');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { calculateLeaveDays } = require('../../lib/leave/dayCalculator');
 const { resolveApprovalChain } = require('../../lib/leave/approvalChain');
 const { checkEligibility, checkMinNotice, checkMaxConsecutive, checkOverlap, checkTeamOverlap } = require('../../lib/leave/eligibilityCheck');
@@ -485,9 +486,23 @@ const createLeaveRequest = async (req, res) => {
 
   await logAudit({ leaveRequestId: result.insertedId, employeeId: employee._id, action: 'submitted', performedBy: req.user._id, performedByName: employee.fullName, newValue: { status, totalDays } });
 
+  const employeeUser = await findOne('users', { employeeId: employee._id }, { projection: { email: 1 } });
+  const emailTokens = {
+    employeeName: employee.fullName, leaveType: leaveType.name, totalDays,
+    startDate: new Date(startDate).toDateString(), endDate: new Date(endDate).toDateString(),
+  };
+  const reviewUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/leave/requests/${result.insertedId}`;
+
   if (approvalChain.length) {
     const firstApprover = approvalChain[0];
     notifyEmployee(employee._id, { title: 'Leave Request Submitted', body: `Your ${leaveType.name} request (${totalDays} day(s)) is pending approval.`, type: 'leave', link: `/my/leave/requests/${result.insertedId}` }).catch(() => {});
+    if (employeeUser?.email) {
+      sendTemplatedEmail({
+        trigger: 'leaveRequestSubmitted', to: employeeUser.email, tokens: emailTokens,
+        fallbackSubject: 'Your leave request has been submitted',
+        fallbackHtml: `<p>Dear ${employee.fullName},</p><p>Your ${leaveType.name} request for ${totalDays} day(s), from ${emailTokens.startDate} to ${emailTokens.endDate}, has been submitted and is pending approval.</p>`,
+      }).catch(() => {});
+    }
     const inboxItem = {
       type: 'leave', subType: 'leave_request', title: `Leave request: ${employee.fullName}`,
       subtitle: `${leaveType.name} · ${totalDays} day(s) · ${new Date(startDate).toDateString()} - ${new Date(endDate).toDateString()}`,
@@ -499,8 +514,28 @@ const createLeaveRequest = async (req, res) => {
     // unnoticed by anyone until it's disputed (the only other place HR was notified).
     notifyManager(employee._id, inboxItem).catch(() => {});
     notifyHR(inboxItem).catch(() => {});
+
+    // Approver previously only got an in-app inbox item — easy to miss, and this is
+    // the one point in the whole leave flow where someone other than the employee
+    // needs to actually take action, so it gets its own email too.
+    const approverUser = await findOne('users', { _id: firstApprover.approverId }, { projection: { email: 1 } });
+    if (approverUser?.email) {
+      const tokens = { ...emailTokens, approverName: firstApprover.approverName || 'there', reviewUrl };
+      sendTemplatedEmail({
+        trigger: 'leaveRequestAwaitingApproval', to: approverUser.email, tokens,
+        fallbackSubject: `Leave request awaiting your approval — ${employee.fullName}`,
+        fallbackHtml: `<p>Dear ${tokens.approverName},</p><p>${employee.fullName} has requested ${leaveType.name} for ${totalDays} day(s), from ${emailTokens.startDate} to ${emailTokens.endDate}.</p><p><a href="${reviewUrl}">Review this request</a></p>`,
+      }).catch(() => {});
+    }
   } else {
     notifyEmployee(employee._id, { title: 'Leave Request Approved', body: `Your ${leaveType.name} request was auto-approved (no approval required for this leave type).`, type: 'leave', link: `/my/leave/requests/${result.insertedId}` }).catch(() => {});
+    if (employeeUser?.email) {
+      sendTemplatedEmail({
+        trigger: 'leaveRequestApproved', to: employeeUser.email, tokens: emailTokens,
+        fallbackSubject: 'Your leave request has been approved',
+        fallbackHtml: `<p>Dear ${employee.fullName},</p><p>Your ${leaveType.name} request for ${totalDays} day(s), from ${emailTokens.startDate} to ${emailTokens.endDate}, has been approved.</p>`,
+      }).catch(() => {});
+    }
   }
 
   return returnFunction(res, 201, true, 'Leave request submitted.', {
@@ -552,6 +587,25 @@ const approveLeaveRequest = async (req, res) => {
     });
     notifyEmployee(request.employeeId, { title: 'Leave Request Update', body: 'Your leave request was approved at one level and is now awaiting the next approver.', type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
     await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'approved', performedBy: req.user._id, performedByName: req.user.name, comment: `Level ${request.currentApprovalLevel} approved` });
+
+    const [nextApproverUser, emp, leaveType] = await Promise.all([
+      findOne('users', { _id: nextLevel.approverId }, { projection: { email: 1 } }),
+      findOne('employees', { _id: request.employeeId }, { projection: { fullName: 1 } }),
+      findOne('leave_types', { _id: request.leaveTypeId }, { projection: { name: 1 } }),
+    ]);
+    if (nextApproverUser?.email) {
+      const reviewUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/leave/requests/${request._id}`;
+      const tokens = {
+        approverName: nextLevel.approverName || 'there', employeeName: emp?.fullName || 'An employee',
+        leaveType: leaveType?.name || 'leave', totalDays: request.totalDays,
+        startDate: new Date(request.startDate).toDateString(), endDate: new Date(request.endDate).toDateString(), reviewUrl,
+      };
+      sendTemplatedEmail({
+        trigger: 'leaveRequestAwaitingApproval', to: nextApproverUser.email, tokens,
+        fallbackSubject: `Leave request awaiting your approval — ${tokens.employeeName}`,
+        fallbackHtml: `<p>Dear ${tokens.approverName},</p><p>${tokens.employeeName} has requested ${tokens.leaveType} for ${tokens.totalDays} day(s), from ${tokens.startDate} to ${tokens.endDate}.</p><p><a href="${reviewUrl}">Review this request</a></p>`,
+      }).catch(() => {});
+    }
     return returnFunction(res, 200, true, 'Approved at this level. Awaiting next approver.');
   }
 
@@ -570,6 +624,25 @@ const approveLeaveRequest = async (req, res) => {
 
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'approved', performedBy: req.user._id, performedByName: req.user.name, comment: 'Final approval' });
   notifyEmployee(request.employeeId, { title: 'Leave Request Approved', body: 'Your leave request has been fully approved.', type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
+
+  {
+    const [approvedEmployeeUser, emp, leaveType] = await Promise.all([
+      findOne('users', { employeeId: request.employeeId }, { projection: { email: 1 } }),
+      findOne('employees', { _id: request.employeeId }, { projection: { fullName: 1 } }),
+      findOne('leave_types', { _id: request.leaveTypeId }, { projection: { name: 1 } }),
+    ]);
+    if (approvedEmployeeUser?.email) {
+      const tokens = {
+        employeeName: emp?.fullName || 'there', leaveType: leaveType?.name || 'leave', totalDays: request.totalDays,
+        startDate: new Date(request.startDate).toDateString(), endDate: new Date(request.endDate).toDateString(),
+      };
+      sendTemplatedEmail({
+        trigger: 'leaveRequestApproved', to: approvedEmployeeUser.email, tokens,
+        fallbackSubject: 'Your leave request has been approved',
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>Your ${tokens.leaveType} request for ${tokens.totalDays} day(s), from ${tokens.startDate} to ${tokens.endDate}, has been approved.</p>`,
+      }).catch(() => {});
+    }
+  }
 
   return returnFunction(res, 200, true, 'Leave request approved.');
 };
@@ -595,6 +668,22 @@ const rejectLeaveRequest = async (req, res) => {
 
   await logAudit({ leaveRequestId: request._id, employeeId: request.employeeId, action: 'rejected', performedBy: req.user._id, performedByName: req.user.name, comment: req.body.rejectionReason });
   notifyEmployee(request.employeeId, { title: 'Leave Request Rejected', body: req.body.rejectionReason, type: 'leave', link: `/my/leave/requests/${request._id}` }).catch(() => {});
+
+  {
+    const [rejectedEmployeeUser, emp, leaveType] = await Promise.all([
+      findOne('users', { employeeId: request.employeeId }, { projection: { email: 1 } }),
+      findOne('employees', { _id: request.employeeId }, { projection: { fullName: 1 } }),
+      findOne('leave_types', { _id: request.leaveTypeId }, { projection: { name: 1 } }),
+    ]);
+    if (rejectedEmployeeUser?.email) {
+      const tokens = { employeeName: emp?.fullName || 'there', leaveType: leaveType?.name || 'leave', rejectionReason: req.body.rejectionReason };
+      sendTemplatedEmail({
+        trigger: 'leaveRequestRejected', to: rejectedEmployeeUser.email, tokens,
+        fallbackSubject: 'Your leave request was not approved',
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>Your ${tokens.leaveType} request was not approved.</p><p>Reason: ${tokens.rejectionReason}</p>`,
+      }).catch(() => {});
+    }
+  }
 
   return returnFunction(res, 200, true, 'Leave request rejected.');
 };

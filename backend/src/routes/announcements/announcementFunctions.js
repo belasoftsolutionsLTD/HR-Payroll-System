@@ -3,6 +3,43 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+// Mirrors createAnnouncement's audience-resolution branches but collects real email
+// addresses instead of firing in-app notifications — kept as its own pass rather than
+// threading email-sending into each existing branch, so the in-app logic above stays
+// untouched and this can be read/tested as one self-contained fan-out.
+const emailAnnouncementAudience = async ({ audiences, deptTargets, empTargets, jobGroupTargets, employmentTypeTargets, title, body }) => {
+  const emails = new Set();
+  const addByRole = async (roles) => {
+    const users = await findMany('users', { role: { $in: roles }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    users.forEach(u => u.email && emails.add(u.email));
+  };
+  const addByEmployeeFilter = async (filter) => {
+    const emps = await findMany('employees', filter, { projection: { _id: 1 } });
+    if (!emps.length) return;
+    const users = await findMany('users', { employeeId: { $in: emps.map(e => e._id) } }, { projection: { email: 1 } });
+    users.forEach(u => u.email && emails.add(u.email));
+  };
+
+  if (audiences.includes('all')) {
+    await addByRole(['staff', 'department_head']);
+  } else {
+    if (audiences.includes('staff')) await addByRole(['staff']);
+    if (audiences.includes('department_head')) await addByRole(['department_head']);
+    for (const dept of deptTargets) await addByEmployeeFilter({ department: dept, status: { $in: ['active', 'on_leave'] } });
+    if (empTargets.length) await addByEmployeeFilter({ _id: { $in: empTargets.map(id => new ObjectId(id)) }, status: { $in: ['active', 'on_leave'] } });
+    for (const jgId of jobGroupTargets) await addByEmployeeFilter({ jobGroupId: new ObjectId(jgId), status: { $in: ['active', 'on_leave'] } });
+    for (const et of employmentTypeTargets) await addByEmployeeFilter({ employmentType: et, status: { $in: ['active', 'on_leave'] } });
+  }
+
+  const tokens = { title, body };
+  emails.forEach(email => sendTemplatedEmail({
+    trigger: 'announcementPublished', to: email, tokens,
+    fallbackSubject: `📢 ${title}`,
+    fallbackHtml: `<p>${body}</p>`,
+  }).catch(() => {}));
+};
 
 // ── HR: create announcement ───────────────────────────────────────────────────
 // audiences: array — any combo of 'all' | 'staff' | 'department_head' | 'hr_only' |
@@ -80,6 +117,8 @@ const createAnnouncement = async (req, res) => {
       emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
     }
   }
+
+  emailAnnouncementAudience({ audiences, deptTargets, empTargets, jobGroupTargets, employmentTypeTargets, title, body }).catch(() => {});
 
   return returnFunction(res, 201, true, 'Announcement published.', { _id: result.insertedId });
 };

@@ -5,6 +5,7 @@ const { findMany, findOne, insertOne, updateOne } = require('../../functions/Dat
 const { parseAttendanceCSV } = require('../../services/csvService');
 const { notifyManager, notifyHR } = require('../inbox/inboxFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
 
 const HR_ROLE_LIST = [SUPER_ADMIN, HR_MANAGER];
@@ -1571,6 +1572,21 @@ const resolveShiftApplication = async (req, res) => {
     body: status === 'approved' ? 'Your shift application was approved.' : 'Your shift application was not approved.',
     type: 'general',
   }).catch(() => {});
+
+  {
+    const [empUser, emp] = await Promise.all([
+      findOne('users', { employeeId: app.employeeId }, { projection: { email: 1 } }),
+      findOne('employees', { _id: app.employeeId }, { projection: { fullName: 1 } }),
+    ]);
+    if (empUser?.email) {
+      const tokens = { employeeName: emp?.fullName || 'there', status };
+      sendTemplatedEmail({
+        trigger: 'shiftApplicationResolved', to: empUser.email, tokens,
+        fallbackSubject: `Shift application ${status}`,
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>${status === 'approved' ? 'Your shift application was approved.' : 'Your shift application was not approved.'}</p>`,
+      }).catch(() => {});
+    }
+  }
 
   return returnFunction(res, 200, true, status === 'approved' ? 'Application approved.' : 'Application rejected.');
 };

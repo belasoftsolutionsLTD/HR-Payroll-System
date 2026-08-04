@@ -3,6 +3,7 @@ const { ObjectId } = require('mongodb');
 const { findMany, findOne } = require('../../functions/Database/commonDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const crypto = require('crypto');
 
 // ── HELPERS ────────────────────────────────────────────────────────────────────
@@ -514,6 +515,16 @@ const submitTrustReport = async (req, res) => {
   };
 
   await global.dbo.collection('trust_reports').insertOne(doc);
+
+  {
+    const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const tokens = { category, trackingCode };
+    hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+      trigger: 'trustReportSubmitted', to: u.email, tokens,
+      fallbackSubject: '🔒 New anonymous trust report',
+      fallbackHtml: `<p>Category: ${category}. Use tracking code ${trackingCode} to reference it.</p>`,
+    }).catch(() => {}));
+  }
 
   notifyByRoles(['super_admin', 'hr_manager'], {
     type: 'general',

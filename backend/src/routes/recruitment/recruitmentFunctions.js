@@ -11,7 +11,7 @@ const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator
 const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
 const { sendEmail } = require('../../services/emailService');
 const { fireAutoActions } = require('../../lib/recruitment/autoActions');
-const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 const REQUISITION_STATUSES = ['draft', 'pendingApproval', 'open', 'onHold', 'filled', 'closed'];
 const APPLICATION_STATUSES = ['active', 'rejected', 'withdrawn', 'hired'];

@@ -6,6 +6,13 @@ const {
 } = require('../../functions/Database/commonDBFunctions');
 const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+const emailUserByTrigger = async (userId, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const user = await findOne('users', { _id: userId }, { projection: { email: 1 } });
+  if (!user?.email) return;
+  return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
+};
 const { generateCertificatePDF } = require('../../lib/training/generateCertificate');
 const {
   recomputeProgress, createSingleCourseEnrollment, createLearningPathEnrollment, maybeAdvanceLearningPath,
@@ -767,6 +774,8 @@ const maybeGenerateCertificate = async (enrollmentId) => {
       type: 'training',
       link: '/my/training/certificates',
     }).catch(() => {});
+    emailUserByTrigger(enrollment.employeeId, 'trainingCertificateEarned', { courseTitle: course.title },
+      'Certificate Earned', `<p>Congratulations! You've earned a certificate for completing "${course.title}".</p>`);
 
     return { ...doc, _id: result.insertedId };
   } catch {
@@ -867,6 +876,9 @@ const verifyExternalCertificate = async (req, res) => {
     type: 'training',
     link: '/my/training/certificates',
   }).catch(() => {});
+  emailUserByTrigger(cert.employeeId, 'trainingCertificateReviewed', { certName: cert.name, status: req.body.status },
+    `External Certificate ${req.body.status === 'verified' ? 'Verified' : 'Rejected'}`,
+    `<p>Your certificate "${cert.name}" was ${req.body.status}.</p>`);
 
   return returnFunction(res, 200, true, `Certificate ${req.body.status}.`);
 };
@@ -1105,6 +1117,8 @@ const sendComplianceReminder = async (req, res) => {
       type: 'training',
       link: '/my/training',
     }).catch(() => {});
+    emailUserByTrigger(employeeId, 'trainingReminder', { message: req.body.message || 'This is a reminder to complete your assigned training.' },
+      'Training Reminder', `<p>${req.body.message || 'This is a reminder to complete your assigned training.'}</p>`);
     return returnFunction(res, 200, true, 'Reminder sent.');
   }
 
@@ -1117,6 +1131,8 @@ const sendComplianceReminder = async (req, res) => {
       type: 'training',
       link: '/my/training',
     }).catch(() => {});
+    emailUserByTrigger(new ObjectId(id), 'trainingReminder', { message: 'You have overdue training — please complete it as soon as possible.' },
+      'Training Reminder', '<p>You have overdue training — please complete it as soon as possible.</p>');
   }
   return returnFunction(res, 200, true, `Reminder sent to ${uniqueIds.length} employee(s).`);
 };

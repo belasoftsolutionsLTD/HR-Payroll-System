@@ -6,7 +6,19 @@ const { runAccrual, runYearEndCarryOver } = require('../leave/accrualEngine');
 const { getEffectiveScheduleForEmployee } = require('../../routes/attendance/attendanceFunctions');
 const { runDueScheduledReports } = require('../../routes/reports/reportFunctions');
 const { getLowStockLevels } = require('../../routes/inventory/inventoryLocationsFunctions');
-const { updateOne } = require('../../functions/Database/commonDBFunctions');
+const { updateOne, findOne, findMany } = require('../../functions/Database/commonDBFunctions');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+const emailEmployee = async (employeeId, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const user = await findOne('users', { employeeId: new ObjectId(employeeId) }, { projection: { email: 1 } });
+  if (!user?.email) return;
+  return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
+};
+const emailUser = async (userId, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const user = await findOne('users', { _id: new ObjectId(userId) }, { projection: { email: 1 } });
+  if (!user?.email) return;
+  return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
+};
 
 // Re-notifying on every hourly/daily tick for a level that's been low for a week would
 // bury HR's inbox — only re-alert once the last alert is more than 20h old, same
@@ -27,6 +39,18 @@ async function checkLowStockAlerts() {
       type: 'inventory',
       link: `/inventory?tab=items`,
     }).catch(() => {});
+    {
+      const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+      const tokens = {
+        itemName: level.item?.name ?? 'An item', sku: level.item?.sku ?? '', locationName: level.location?.name ?? 'a location',
+        quantity: level.quantity, unitOfMeasure: level.item?.unitOfMeasure ?? 'units', reorderPoint: level.reorderPoint,
+      };
+      hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+        trigger: 'inventoryLowStockAlert', to: u.email, tokens,
+        fallbackSubject: 'Low stock alert',
+        fallbackHtml: `<p>${tokens.itemName} (${tokens.sku}) at ${tokens.locationName} is at ${tokens.quantity} ${tokens.unitOfMeasure}, at/below its reorder point of ${tokens.reorderPoint}.</p>`,
+      }).catch(() => {}));
+    }
     await updateOne('inventory_stock_levels', { itemId: level.itemId, locationId: level.locationId }, { $set: { lastLowStockAlertAt: new Date() } });
   }
 }
@@ -56,6 +80,9 @@ async function checkExpiringCertifications() {
         body: `Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.`,
         type: 'general',
       }).catch(() => {});
+      emailEmployee(emp._id, 'certificationExpiring', { certName: cert.name, expiryDate: new Date(cert.expiryDate).toISOString().split('T')[0] },
+        'Certification Expiring Soon',
+        `<p>Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.</p>`);
       await global.dbo.collection('employees').updateOne(
         { _id: emp._id },
         { $set: { 'certifications.$[cert].alertSent': true } },
@@ -133,6 +160,8 @@ async function dailyTaskJobs() {
       body:  `Make sure to complete this task by ${task.dueDate}`,
       type:  'task_reminder',
     });
+    emailEmployee(task.assignedTo, 'taskDueTomorrow', { taskTitle: task.title, dueDate: task.dueDate },
+      `Due tomorrow: "${task.title}"`, `<p>Make sure to complete this task by ${task.dueDate}.</p>`);
   }
 
   console.log(`[CRON] Daily task jobs done — overdue marked, ${newHires?.length ?? 0} onboarding triggers checked, ${dueTomorrow.length} reminders sent`);
@@ -165,6 +194,8 @@ async function detectMissedClockOuts() {
       type:  'attendance_alert',
       link:  '/staff-portal',
     }).catch(() => {});
+    emailEmployee(rec.employeeId, 'missingClockOut', {}, 'Missing clock-out',
+      '<p>You clocked in earlier today but never clocked out. Please update your attendance.</p>');
   }
 
   if (missed.length > 0) {
@@ -423,6 +454,8 @@ async function leaveStartReminder() {
       body: `Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.`,
       type: 'leave',
     }).catch(() => {});
+    emailEmployee(r.employeeId, 'upcomingLeaveReminder', { leaveType: nameById[String(r.leaveTypeId)] || 'leave', startDate: dateStr },
+      'Upcoming Leave', `<p>Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.</p>`);
     await global.dbo.collection('leave_requests').updateOne({ _id: r._id }, { $set: { leaveStartReminderSent: true, updatedAt: new Date() } });
   }
   console.log(`[CRON] Sent ${upcoming.length} leave-start reminder(s)`);
@@ -455,6 +488,8 @@ async function leaveEndReminder() {
       body: `Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.`,
       type: 'leave',
     }).catch(() => {});
+    emailEmployee(r.employeeId, 'leaveWelcomeBack', { leaveType: nameById[String(r.leaveTypeId)] || 'leave', endDate: dateStr },
+      'Welcome Back', `<p>Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.</p>`);
     await global.dbo.collection('leave_requests').updateOne({ _id: r._id }, { $set: { leaveEndReminderSent: true, updatedAt: new Date() } });
   }
   console.log(`[CRON] Sent ${ended.length} leave-end reminder(s)`);
@@ -492,6 +527,8 @@ async function checkOverdueTraining() {
       type: 'training',
       link: '/my/training',
     }).catch(() => {});
+    emailUser(enr.employeeId, 'trainingOverdue', { courseTitle: titleMap[String(enr.courseId)] || 'A required course' },
+      'Training Overdue', `<p>"${titleMap[String(enr.courseId)] || 'A required course'}" was due and is now overdue — please complete it.</p>`);
   }
 
   console.log(`[CRON] Marked ${overdue.length} training enrollment(s) overdue`);

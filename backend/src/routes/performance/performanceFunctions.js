@@ -3,8 +3,19 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, aggregate } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+const emailEmployeeByTrigger = async (employeeId, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const user = await findOne('users', { employeeId: new ObjectId(employeeId) }, { projection: { email: 1 } });
+  if (!user?.email) return;
+  return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
+};
+const emailUserByTrigger = async (userId, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const user = await findOne('users', { _id: new ObjectId(userId) }, { projection: { email: 1 } });
+  if (!user?.email) return;
+  return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
+};
 const { evaluateRulesForUser } = require('../../lib/training/autoEnrollment');
-const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
 
 // ── Existing appraisal functions (keep) ───────────────────────────────────────
 
@@ -132,6 +143,12 @@ const reviewAppraisal = async (req, res) => {
       : `Your appraisal for ${existing.reviewPeriod} was rejected by HR and will need to be redone.${comment ? ` Reason: ${comment}` : ''}`,
     type: 'general',
   }).catch(() => {});
+  emailEmployeeByTrigger(existing.employeeId, 'appraisalDecision',
+    { reviewPeriod: existing.reviewPeriod, decision, comment: comment || '' },
+    decision === 'approved' ? 'Appraisal Approved' : 'Appraisal Rejected',
+    decision === 'approved'
+      ? `<p>Your appraisal for ${existing.reviewPeriod} has been approved by HR.</p>`
+      : `<p>Your appraisal for ${existing.reviewPeriod} was rejected by HR and will need to be redone.${comment ? ` Reason: ${comment}` : ''}</p>`);
 
   // Let the department_head who submitted it know the outcome of their submission too.
   notifyUser(existing.reviewerId, {
@@ -139,6 +156,10 @@ const reviewAppraisal = async (req, res) => {
     body: `Your submitted appraisal for ${empName} (${existing.reviewPeriod}) was ${decision} by HR.${comment ? ` Comment: ${comment}` : ''}`,
     type: 'general',
   }).catch(() => {});
+  emailUserByTrigger(existing.reviewerId, 'appraisalDecisionReviewer',
+    { empName, reviewPeriod: existing.reviewPeriod, decision, comment: comment || '' },
+    decision === 'approved' ? 'Appraisal Approved' : 'Appraisal Rejected',
+    `<p>Your submitted appraisal for ${empName} (${existing.reviewPeriod}) was ${decision} by HR.${comment ? ` Comment: ${comment}` : ''}</p>`);
 
   return returnFunction(res, 200, true, `Appraisal ${decision}.`);
 };
@@ -640,6 +661,16 @@ const launchCycle = async (req, res) => {
     type: 'general',
   });
 
+  {
+    const allUsers = await findMany('users', { isActive: { $ne: false } }, { projection: { email: 1 } });
+    const tokens = { cycleName: cycle.name };
+    allUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+      trigger: 'reviewCycleLaunched', to: u.email, tokens,
+      fallbackSubject: `Review Cycle Launched: ${cycle.name}`,
+      fallbackHtml: `<p>A new performance review cycle, "${cycle.name}", has started. Please complete your self-review.</p>`,
+    }).catch(() => {}));
+  }
+
   return returnFunction(res, 200, true, 'Review cycle launched successfully.');
 };
 
@@ -920,6 +951,17 @@ const submitReview = async (req, res) => {
       type: 'general',
       link: `/employees/${review.employeeId}`,
     }).catch(() => {});
+
+    const hrUsers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const tokens = {
+      managerName: req.user.name || 'A manager', recommendationLabel: recommendation === 'promote' ? 'a promotion' : 'a performance improvement plan',
+      employeeName: flaggedEmployee?.fullName || 'an employee',
+    };
+    hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+      trigger: 'performanceRecommendation', to: u.email, tokens,
+      fallbackSubject: recommendation === 'promote' ? 'Promotion Recommended' : 'PIP Recommended',
+      fallbackHtml: `<p>${tokens.managerName} recommended ${tokens.recommendationLabel} for ${tokens.employeeName}.</p>`,
+    }).catch(() => {}));
   }
 
   // Previously this always flipped selfReviewStatus regardless of reviewType, so a
@@ -1105,6 +1147,10 @@ const giveFeedback = async (req, res) => {
     body: doc.isAnonymous ? 'Someone left you anonymous feedback.' : `${req.user.name} gave you ${doc.type} feedback.`,
     type: 'general',
   });
+  emailEmployeeByTrigger(req.body.recipientId, 'feedbackReceived',
+    { fromLabel: doc.isAnonymous ? 'Someone' : req.user.name, feedbackType: doc.type },
+    'You received new feedback',
+    `<p>${doc.isAnonymous ? 'Someone left you anonymous feedback.' : `${req.user.name} gave you ${doc.type} feedback.`}</p>`);
 
   return returnFunction(res, 201, true, 'Feedback sent.', { _id: result.insertedId });
 };
@@ -1183,6 +1229,8 @@ const createOneOnOne = async (req, res) => {
     body: `A 1-on-1 meeting has been scheduled for ${doc.scheduledAt.toLocaleDateString()}.`,
     type: 'general',
   });
+  emailEmployeeByTrigger(employeeId, 'oneOnOneScheduled', { scheduledDate: doc.scheduledAt.toLocaleDateString() },
+    '1-on-1 Scheduled', `<p>A 1-on-1 meeting has been scheduled for ${doc.scheduledAt.toLocaleDateString()}.</p>`);
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
@@ -1348,6 +1396,9 @@ const createPIP = async (req, res) => {
     body: 'A performance improvement plan has been created for you. Please speak with your manager.',
     type: 'general',
   });
+  emailEmployeeByTrigger(employeeId, 'pipStarted', {},
+    'Performance Improvement Plan Started',
+    '<p>A performance improvement plan has been created for you. Please speak with your manager.</p>');
   notifyByRoles(['hr_manager', 'super_admin'], {
     title: 'PIP Created',
     body: `${req.user.name || 'A manager'} started a performance improvement plan.`,
@@ -1421,6 +1472,9 @@ const closePIP = async (req, res) => {
     body: `Your performance improvement plan has been closed. Outcome: ${outcome === 'passed' ? 'Passed' : 'Not Met'}.`,
     type: 'general',
   });
+  emailEmployeeByTrigger(pip.employeeId, 'pipClosed', { outcomeLabel: outcome === 'passed' ? 'Passed' : 'Not Met' },
+    'Performance Improvement Plan Closed',
+    `<p>Your performance improvement plan has been closed. Outcome: ${outcome === 'passed' ? 'Passed' : 'Not Met'}.</p>`);
   notifyByRoles(['hr_manager', 'super_admin'], {
     title: 'PIP Closed',
     body: `A performance improvement plan was closed with outcome: ${outcome}.`,

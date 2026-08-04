@@ -9,6 +9,7 @@ const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboar
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
 const { notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { runAccrual } = require('../../lib/leave/accrualEngine');
 
 const DEPARTMENTS = ['Administration','Human Resources','Finance & Accounts','Information Technology','Operations','Sales & Marketing','Customer Service','Legal & Compliance','Procurement','Logistics & Supply Chain','Research & Development','Communications','Health & Safety','Facilities Management','Executive'];
@@ -104,6 +105,14 @@ const flagMissingOffboardingIfNeeded = async (employee) => {
     body: `${employee.fullName} was marked terminated but has no offboarding record. Start one from the Offboarding module.`,
     type: 'offboarding',
   }).catch(() => {});
+
+  const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+  const tokens = { employeeName: employee.fullName };
+  hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+    trigger: 'offboardingNotStarted', to: u.email, tokens,
+    fallbackSubject: `Offboarding not started — ${tokens.employeeName}`,
+    fallbackHtml: `<p>${tokens.employeeName} was marked terminated but has no offboarding record. Start one from the Offboarding module.</p>`,
+  }).catch(() => {}));
 };
 
 // Kenyan mobile format: 254 followed by 9 digits, Safaricom/Airtel/Telkom ranges start with 7 or 1.
@@ -367,6 +376,16 @@ const updateEmployee = async (req, res) => {
       body: `Your ${labels} ${notifiableFields.length > 1 ? 'have' : 'has'} been updated by HR. Contact HR if you have any questions.`,
       type: 'general',
     }).catch(() => {});
+
+    const empUser = await findOne('users', { employeeId: existing._id }, { projection: { email: 1 } });
+    if (empUser?.email) {
+      const tokens = { employeeName: existing.fullName, fields: labels, plural: notifiableFields.length > 1 ? 'have' : 'has' };
+      sendTemplatedEmail({
+        trigger: 'employeeProfileUpdated', to: empUser.email, tokens,
+        fallbackSubject: 'Your profile has been updated',
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>Your ${tokens.fields} ${tokens.plural} been updated by HR. Contact HR if you have any questions.</p>`,
+      }).catch(() => {});
+    }
   }
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);

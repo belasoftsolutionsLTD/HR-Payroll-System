@@ -2,6 +2,21 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+const emailAwardGranted = async (employeeId, awardName, notes) => {
+  const [empUser, emp] = await Promise.all([
+    global.dbo.collection('users').findOne({ employeeId: new ObjectId(employeeId) }, { projection: { email: 1 } }),
+    global.dbo.collection('employees').findOne({ _id: new ObjectId(employeeId) }, { projection: { fullName: 1 } }),
+  ]);
+  if (!empUser?.email) return;
+  const tokens = { employeeName: emp?.fullName || 'there', awardName, notes: notes || '' };
+  return sendTemplatedEmail({
+    trigger: 'awardGranted', to: empUser.email, tokens,
+    fallbackSubject: `Congratulations — you received "${awardName}"!`,
+    fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>Congratulations! You've been awarded "${awardName}"${notes ? ': ' + notes : '.'}</p>`,
+  }).catch(() => {});
+};
 
 // ── Award Types (templates) ───────────────────────────────────────────────────
 
@@ -97,6 +112,7 @@ const grantAward = async (req, res) => {
     body: `Congratulations! You've been awarded "${awardType.name}"${notes ? ': ' + notes : '.'}`,
     type: 'general',
   }).catch(() => {});
+  emailAwardGranted(employeeId, awardType.name, notes);
   return returnFunction(res, 201, true, 'Award granted.', { _id: result.insertedId });
 };
 
@@ -138,6 +154,7 @@ const bulkGrantAward = async (req, res) => {
       type: 'general',
     }).catch(() => {})
   ));
+  employees.forEach(emp => emailAwardGranted(emp._id, awardType.name, notes));
   return returnFunction(res, 201, true, `Award granted to ${docs.length} employee(s).`, { count: docs.length });
 };
 
@@ -650,6 +667,7 @@ const selectWinner = async (req, res) => {
     body: `You were selected as the winner of "${program?.name || 'this award'}".`,
     type: 'general',
   }).catch(() => {});
+  emailAwardGranted(winnerId, program?.name || 'this award', 'You were selected as the winner.');
 
   return returnFunction(res, 200, true, 'Winner announced!', { winner });
 };

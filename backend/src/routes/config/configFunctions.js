@@ -5,6 +5,18 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyStaffByAudience } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+// Mirrors notifyStaffByAudience's own resolution (functions/HR/notifyUser.js) — kept as
+// its own pass rather than modifying that shared helper, since other callers of
+// notifyStaffByAudience don't necessarily want an email fired too.
+const emailStaffByAudience = async (audience, department, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const employeeFilter = audience === 'department' && department ? { department } : {};
+  const employees = await findMany('employees', employeeFilter, { projection: { _id: 1 } });
+  if (!employees.length) return;
+  const users = await findMany('users', { employeeId: { $in: employees.map(e => e._id) } }, { projection: { email: 1 } });
+  users.filter(u => u.email).forEach(u => sendTemplatedEmail({ trigger, to: u.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {}));
+};
 
 // ── Generic CRUD factory ─────────────────────────────────────────────────────
 
@@ -199,6 +211,9 @@ const createScheduledEvent = async (req, res) => {
     body:  bodyText,
     type:  'general',
   });
+  emailStaffByAudience(audience || 'all', department || null, 'scheduledEventCreated',
+    { typeLabel, eventTitle: title, bodyText },
+    `${typeLabel}: ${title}`, `<p>${bodyText}</p>`).catch(() => {});
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };

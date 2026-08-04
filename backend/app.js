@@ -53,6 +53,7 @@ const posRoutes           = require('./src/routes/pos/pos');
 const crmRoutes           = require('./src/routes/crm/crm');
 const accountingRoutes    = require('./src/routes/accounting/accounting');
 const logisticsRoutes     = require('./src/routes/logistics/logistics');
+const emailTemplatesRoutes = require('./src/routes/settings/emailTemplates');
 
 const path = require('path');
 const app = express();
@@ -150,6 +151,7 @@ app.use('/api/pos',           decodeToken, getUserData, posRoutes);
 app.use('/api/crm',           decodeToken, getUserData, crmRoutes);
 app.use('/api/accounting',    decodeToken, getUserData, accountingRoutes);
 app.use('/api/logistics',     decodeToken, getUserData, logisticsRoutes);
+app.use('/api/email-templates', decodeToken, getUserData, emailTemplatesRoutes);
 
 // ── Global error handler (must be last) ──────────────────────────────────────
 app.use(ErrorHandler);

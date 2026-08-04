@@ -7,7 +7,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const crypto = require('crypto');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { respondToOfferCore } = require('../recruitment/recruitmentFunctions');
 const { findInviteByToken, acceptInviteCore, declineInviteCore } = require('../projects/projectsFunctions');
 
@@ -190,7 +190,7 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
       }).catch(() => {});
     }
 
-    const hrManagers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] } }, { projection: { _id: 1 } });
+    const hrManagers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] } }, { projection: { _id: 1, email: 1 } });
     if (hrManagers.length) {
       notifyHR({
         type: 'recruitment', subType: 'new_application',
@@ -204,6 +204,13 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
         body: `${fullName} applied for ${requisition.title} via the careers site.`,
         type: 'recruitment',
       }).catch(() => {});
+
+      const tokens = { candidateName: fullName, jobTitle: requisition.title };
+      hrManagers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+        trigger: 'careersApplicationReceived', to: u.email, tokens,
+        fallbackSubject: 'New Application Received',
+        fallbackHtml: `<p>${tokens.candidateName} applied for ${tokens.jobTitle} via the careers site.</p>`,
+      }).catch(() => {}));
     }
 
     return returnFunction(res, 201, true, 'Application submitted successfully. We will be in touch.', { _id: result.insertedId });

@@ -1,5 +1,6 @@
 const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { notifyUser } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 // Shared between trainingFunctions.js (HR assignment + employee progress routes) and
 // autoEnrollment.js (rule engine) — kept in its own module so neither has to require
@@ -39,6 +40,19 @@ const createSingleCourseEnrollment = async ({ employeeId, courseId, learningPath
     type: 'training',
     link: `/my/training/courses/${courseId}`,
   }).catch(() => {});
+  (async () => {
+    const [user, course] = await Promise.all([
+      findOne('users', { _id: employeeId }, { projection: { email: 1, name: 1 } }),
+      findOne('courses', { _id: courseId }, { projection: { title: 1 } }),
+    ]);
+    if (!user?.email) return;
+    const tokens = { employeeName: user.name || 'there', courseTitle: course?.title || 'a new course' };
+    sendTemplatedEmail({
+      trigger: 'trainingCourseAssigned', to: user.email, tokens,
+      fallbackSubject: 'New training assigned',
+      fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>You have been assigned a new course: "${tokens.courseTitle}".</p>`,
+    }).catch(() => {});
+  })().catch(() => {});
   return { created: true, _id: result.insertedId };
 };
 
@@ -77,6 +91,16 @@ const createLearningPathEnrollment = async ({ employeeId, learningPathId, enroll
     type: 'training',
     link: `/my/training/learning-paths/${learningPathId}`,
   }).catch(() => {});
+  (async () => {
+    const user = await findOne('users', { _id: employeeId }, { projection: { email: 1, name: 1 } });
+    if (!user?.email) return;
+    const tokens = { employeeName: user.name || 'there', pathName: path_.name };
+    sendTemplatedEmail({
+      trigger: 'trainingPathAssigned', to: user.email, tokens,
+      fallbackSubject: 'New learning path assigned',
+      fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>You have been enrolled in "${tokens.pathName}".</p>`,
+    }).catch(() => {});
+  })().catch(() => {});
 
   return { created: true, _id: result.insertedId };
 };

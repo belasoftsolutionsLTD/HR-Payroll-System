@@ -7,7 +7,7 @@ const { sendEmail } = require('../../services/emailService');
 const { HR_MANAGER, DEPT_HEAD, STAFF } = require('../../constants/roles');
 const { evaluateRulesForUser } = require('../../lib/training/autoEnrollment');
 
-const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Bella ERP';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const generatePassword = () => {

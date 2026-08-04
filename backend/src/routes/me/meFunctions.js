@@ -4,7 +4,7 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-const { sendTemplatedEmail } = require('../../lib/recruitment/emailTemplateHelpers');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const { notifyHR } = require('../inbox/inboxFunctions');
@@ -63,6 +63,16 @@ const updateMyProfile = async (req, res) => {
     body: `${employee?.fullName ?? 'An employee'} updated: ${changedFields.join(', ')}.`,
     type: 'general',
   }).catch(() => {});
+
+  {
+    const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const tokens = { employeeName: employee?.fullName ?? 'An employee', fields: changedFields.join(', ') };
+    hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+      trigger: 'employeeSelfServiceProfileUpdated', to: u.email, tokens,
+      fallbackSubject: 'Employee Updated Their Profile',
+      fallbackHtml: `<p>${tokens.employeeName} updated: ${tokens.fields}.</p>`,
+    }).catch(() => {}));
+  }
 
   return returnFunction(res, 200, true, 'Profile updated.');
 };
@@ -475,6 +485,15 @@ const applyInternal = async (req, res) => {
     referenceId: result.insertedId, referenceModel: 'applications',
     requiresAction: true, triggeredBy: req.user._id,
   }).catch(() => {});
+  {
+    const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const tokens = { employeeName: employee.fullName, jobTitle: requisition.title };
+    hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+      trigger: 'internalApplicationReceived', to: u.email, tokens,
+      fallbackSubject: 'New Internal Application Received',
+      fallbackHtml: `<p>${tokens.employeeName} applied for ${tokens.jobTitle}.</p>`,
+    }).catch(() => {}));
+  }
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'New Internal Application Received',
     body: `${employee.fullName} applied for ${requisition.title}.`,

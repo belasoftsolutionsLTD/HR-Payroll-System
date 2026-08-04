@@ -3,6 +3,18 @@ const returnFunction = require('../../functions/returnFunction');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
 const { triggerTasksFromTemplate } = require('../../lib/tasks/triggerTasksFromTemplate');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+const emailTaskAssigned = async (employeeId, employeeName, title, dueDate, priority) => {
+  const empUser = await findOne('users', { employeeId }, { projection: { email: 1 } });
+  if (!empUser?.email) return;
+  const tokens = { employeeName, taskTitle: title, dueInfo: dueDate ? `Due ${dueDate} · ` : '', priority: priority || 'medium' };
+  return sendTemplatedEmail({
+    trigger: 'taskAssigned', to: empUser.email, tokens,
+    fallbackSubject: `New task: ${title}`,
+    fallbackHtml: `<p>Dear ${employeeName},</p><p>You've been assigned a new task: "${title}". ${tokens.dueInfo}${tokens.priority} priority.</p>`,
+  }).catch(() => {});
+};
 
 const HR   = ['super_admin', 'hr_manager'];
 const MGMT = ['super_admin', 'hr_manager', 'department_head'];
@@ -225,6 +237,7 @@ const createTask = async (req, res) => {
       body:  `${dueDate ? `Due ${dueDate} · ` : ''}${priority || 'medium'} priority`,
       type:  'task',
     }));
+    employees.forEach(emp => emailTaskAssigned(emp._id, emp.fullName, title, dueDate, priority));
     return returnFunction(res, 201, true, `Assigned to ${employees.length} employees.`);
   }
 
@@ -247,6 +260,7 @@ const createTask = async (req, res) => {
     body:  `${dueDate ? `Due ${dueDate} · ` : ''}${priority || 'medium'} priority`,
     type:  'task',
   });
+  emailTaskAssigned(employee._id, employee.fullName, title, dueDate, priority);
 
   return returnFunction(res, 201, true, 'Task created.', { _id: result.insertedId });
 };
@@ -326,6 +340,16 @@ const completeTask = async (req, res) => {
       body: `"${task.title}" was marked complete by ${req.user?.name || 'the assignee'} and needs your sign-off.`,
       type: 'general',
     }).catch(() => {});
+
+    const approverUser = await findOne('users', { employeeId: task.approverId }, { projection: { email: 1 } });
+    if (approverUser?.email) {
+      const tokens = { taskTitle: task.title, assigneeName: req.user?.name || 'the assignee' };
+      sendTemplatedEmail({
+        trigger: 'taskApprovalNeeded', to: approverUser.email, tokens,
+        fallbackSubject: `Task awaiting your approval — ${task.title}`,
+        fallbackHtml: `<p>"${tokens.taskTitle}" was marked complete by ${tokens.assigneeName} and needs your sign-off.</p>`,
+      }).catch(() => {});
+    }
   }
 
   return returnFunction(res, 200, true, 'Task completed.');

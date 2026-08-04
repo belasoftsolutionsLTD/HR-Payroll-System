@@ -4,6 +4,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { initiateOnboarding, notifyStakeholder } = require('../../lib/onboarding/autoAssignTasks');
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
 const { matchesGroupAssignment } = require('../../lib/payroll/conceptTargeting');
@@ -272,6 +273,18 @@ const setRecordCompensation = async (req, res) => {
     body: 'Your salary and payment details have been set up by HR as part of your onboarding.',
     type: 'onboarding',
   }).catch(() => {});
+
+  {
+    const empUser = await findOne('users', { employeeId: employee._id }, { projection: { email: 1 } });
+    if (empUser?.email) {
+      const tokens = { employeeName: employee.fullName };
+      sendTemplatedEmail({
+        trigger: 'onboardingCompensationSetup', to: empUser.email, tokens,
+        fallbackSubject: 'Your compensation has been set up',
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>Your salary and payment details have been set up by HR as part of your onboarding.</p>`,
+      }).catch(() => {});
+    }
+  }
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };

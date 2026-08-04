@@ -2,7 +2,7 @@ const { ObjectId } = require('mongodb');
 const { findOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { notifyUser } = require('../../functions/HR/notifyUser');
 const { sendEmail } = require('../../services/emailService');
-const { renderTemplate } = require('./emailTemplateHelpers');
+const { renderTemplate } = require('../../services/emailTemplateService');
 
 // direction: 'onEnter' | 'onExit' — called from the stage-move handler after writing stageHistory
 async function fireAutoActions(application, stage, db, direction) {

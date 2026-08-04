@@ -1,11 +1,12 @@
-const { findOne } = require('../../functions/Database/commonDBFunctions');
-const { sendEmail } = require('../../services/emailService');
+const { findOne } = require('../functions/Database/commonDBFunctions');
+const { sendEmail } = require('./emailService');
 
 const renderTemplate = (body, tokens) => body.replace(/\{\{(\w+)\}\}/g, (_, key) => tokens[key] ?? '');
 
-// Looks up the saved emailTemplate for a given trigger (applicationReceived/stageAdvance/
-// rejection/offerExtended/nurture) and sends it with token substitution. Falls back to the
-// given subject/html if no template has been configured for that trigger yet.
+// Looks up the saved emailTemplate for a given trigger (see emailTriggerCatalog.js for
+// the full registered list) and sends it with token substitution. Falls back to the
+// given subject/html if no template has been configured for that trigger yet — every
+// call site works out of the box even before an admin customizes anything in Settings.
 const sendTemplatedEmail = async ({ trigger, to, tokens, fallbackSubject, fallbackHtml, attachments }) => {
   if (!to) return;
   const template = await findOne('emailTemplates', { trigger });

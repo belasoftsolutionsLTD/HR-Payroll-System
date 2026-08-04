@@ -5,6 +5,13 @@ const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../
 const { completeInventoryTransfer } = require('../../lib/inventory/inventoryIntegration');
 const { getInventoryAccessLevel, getScopedLocationFilter } = require('../../lib/inventory/inventoryAccess');
 const { notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+
+const emailRequester = async (userId, trigger, tokens, fallbackSubject, fallbackHtml) => {
+  const user = await findOne('users', { _id: new ObjectId(userId) }, { projection: { email: 1 } });
+  if (!user?.email) return;
+  return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
+};
 
 // Attaches *Name fields for whichever of requestedBy/approvedBy/rejectedBy/receivedBy
 // are present on a transfer — without this the UI has no way to show who did what.
@@ -123,6 +130,8 @@ const approveTransfer = async (req, res) => {
     title: 'Transfer approved', body: 'Your stock transfer request was approved and is ready to be received.',
     type: 'inventory', link: `/inventory/transfers/${transfer._id}`,
   }).catch(() => {});
+  emailRequester(transfer.requestedBy, 'inventoryTransferApproved', {}, 'Transfer approved',
+    '<p>Your stock transfer request was approved and is ready to be received.</p>');
   return returnFunction(res, 200, true, 'Transfer approved.');
 };
 
@@ -140,6 +149,8 @@ const rejectTransfer = async (req, res) => {
     body: req.body.reason ? `Your stock transfer request was rejected. Reason: ${req.body.reason}` : 'Your stock transfer request was rejected.',
     type: 'inventory', link: `/inventory/transfers/${transfer._id}`,
   }).catch(() => {});
+  emailRequester(transfer.requestedBy, 'inventoryTransferRejected', { reason: req.body.reason || '' }, 'Transfer rejected',
+    req.body.reason ? `<p>Your stock transfer request was rejected. Reason: ${req.body.reason}</p>` : '<p>Your stock transfer request was rejected.</p>');
   return returnFunction(res, 200, true, 'Transfer rejected.');
 };
 

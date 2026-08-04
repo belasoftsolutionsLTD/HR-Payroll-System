@@ -4,6 +4,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { logCompensationChange } = require('../payroll/payrollCompensationsFunctions');
 
 // Welfare schemes are a thin, named layer over the existing Payroll Concepts engine —
@@ -165,6 +166,18 @@ const addMember = async (req, res) => {
     type: 'general',
   }).catch(() => {});
 
+  {
+    const empUser = await findOne('users', { employeeId: employee._id }, { projection: { email: 1 } });
+    if (empUser?.email) {
+      const tokens = { employeeName: employee.fullName, schemeName: scheme.name, action: 'enrolled in' };
+      sendTemplatedEmail({
+        trigger: 'welfareMembershipChanged', to: empUser.email, tokens,
+        fallbackSubject: `Welfare scheme update — ${scheme.name}`,
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>You have been ${tokens.action} the "${scheme.name}" welfare scheme.</p>`,
+      }).catch(() => {});
+    }
+  }
+
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
 };
 
@@ -186,6 +199,21 @@ const removeMember = async (req, res) => {
     body: `Your membership in the "${scheme.name}" welfare scheme has ended.`,
     type: 'general',
   }).catch(() => {});
+
+  {
+    const [empUser, emp] = await Promise.all([
+      findOne('users', { employeeId: compensation.employeeId }, { projection: { email: 1 } }),
+      findOne('employees', { _id: compensation.employeeId }, { projection: { fullName: 1 } }),
+    ]);
+    if (empUser?.email) {
+      const tokens = { employeeName: emp?.fullName || 'there', schemeName: scheme.name, action: 'removed from' };
+      sendTemplatedEmail({
+        trigger: 'welfareMembershipChanged', to: empUser.email, tokens,
+        fallbackSubject: `Welfare scheme update — ${scheme.name}`,
+        fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>You have been ${tokens.action} the "${scheme.name}" welfare scheme.</p>`,
+      }).catch(() => {});
+    }
+  }
 
   return returnFunction(res, 200, true, 'Member removed from scheme.');
 };

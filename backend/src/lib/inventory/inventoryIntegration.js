@@ -6,6 +6,7 @@ const { findOne, findMany, updateOne } = require('../../functions/Database/commo
 const { createStockMovement } = require('../../routes/inventory/inventoryMovementsFunctions');
 const { transferLotStock } = require('../../routes/inventory/inventoryLotsFunctions');
 const { notifyUser } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 // Called by POS at the moment of sale. Uses the item's current weighted-average cost as
 // the movement's unitCost (a sale doesn't change valuation, it just realizes it), and
@@ -104,6 +105,14 @@ async function completeInventoryTransfer(transferId, performedBy) {
     title: 'Transfer received', body: 'Your stock transfer has arrived and been received.',
     type: 'inventory', link: `/inventory/transfers/${transfer._id}`,
   }).catch(() => {});
+  (async () => {
+    const user = await findOne('users', { _id: transfer.requestedBy }, { projection: { email: 1 } });
+    if (!user?.email) return;
+    sendTemplatedEmail({
+      trigger: 'inventoryTransferReceived', to: user.email, tokens: {},
+      fallbackSubject: 'Transfer received', fallbackHtml: '<p>Your stock transfer has arrived and been received.</p>',
+    }).catch(() => {});
+  })().catch(() => {});
 
   return transfer;
 }

@@ -4,6 +4,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
+const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { initiateOffboarding, notifyStakeholder } = require('../../lib/offboarding/autoAssignTasks');
 const { getOpenSpendItems } = require('../../lib/spend/clearanceCheck');
 const { generateExperienceLetter, generateRelievingLetter, generateClearanceCertificate } = require('../../lib/offboarding/generateDocument');
@@ -337,6 +338,16 @@ const triggerFinalPay = async (req, res) => {
     body: `${employee?.fullName ?? 'An employee'}'s final pay needs to be processed (last working day ${new Date(record.lastWorkingDay).toDateString()}). Create an off-cycle payroll run from the Payroll module.`,
     type: 'offboarding',
   }).catch(() => {});
+
+  {
+    const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const tokens = { employeeName: employee?.fullName ?? 'An employee', lastWorkingDay: new Date(record.lastWorkingDay).toDateString() };
+    hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
+      trigger: 'offboardingFinalPayRequired', to: u.email, tokens,
+      fallbackSubject: `Final pay required — ${tokens.employeeName}`,
+      fallbackHtml: `<p>${tokens.employeeName}'s final pay needs to be processed (last working day ${tokens.lastWorkingDay}). Create an off-cycle payroll run from the Payroll module.</p>`,
+    }).catch(() => {}));
+  }
 
   return returnFunction(res, 200, true, 'Final pay flagged for Payroll.');
 };
