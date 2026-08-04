@@ -152,7 +152,9 @@ const listEmployees = async (req, res) => {
   }
 
   if (department) filter.department = department;
-  if (designation) filter.designation = designation;
+  // Substring, case-insensitive — callers like Logistics' driver picker filter by role
+  // keyword (e.g. "driver") rather than an exact, HR-typed job title string.
+  if (designation) filter.designation = { $regex: designation.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
   if (employmentType) filter.employmentType = employmentType;
   if (status) filter.status = status;
   if (search) filter.$or = [
@@ -181,7 +183,9 @@ const exportEmployeesCSV = async (req, res) => {
   const { designation, employmentType, status, search, department } = req.query;
   const filter = {};
   if (department) filter.department = department;
-  if (designation) filter.designation = designation;
+  // Substring, case-insensitive — callers like Logistics' driver picker filter by role
+  // keyword (e.g. "driver") rather than an exact, HR-typed job title string.
+  if (designation) filter.designation = { $regex: designation.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
   if (employmentType) filter.employmentType = employmentType;
   if (status) filter.status = status;
   if (search) filter.$or = [
