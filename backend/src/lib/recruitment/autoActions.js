@@ -31,7 +31,7 @@ async function fireAutoActions(application, stage, db, direction) {
         const tokens = {
           candidateName: `${candidate.firstName} ${candidate.lastName}`,
           jobTitle: requisition?.title || '',
-          companyName: process.env.COMPANY_NAME || 'Bella ERP',
+          companyName: process.env.COMPANY_NAME || 'Bela ERP',
         };
         await sendEmail({
           to: candidate.email,

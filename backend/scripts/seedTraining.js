@@ -101,7 +101,7 @@ async function seed() {
       difficultyLevel: 'beginner', estimatedDurationMinutes: 40, targetDepartments: [], targetRoles: [],
       description: 'Everything a new employee needs to know in their first two weeks.',
       modules: [
-        { title: 'Welcome to Bella ERP', type: 'text', content: { markdown: 'Welcome aboard! Here is what to expect in your first weeks.' } },
+        { title: 'Welcome to Bela ERP', type: 'text', content: { markdown: 'Welcome aboard! Here is what to expect in your first weeks.' } },
         { title: 'Tools & Systems Overview', type: 'video', content: { url: 'https://example.com/videos/tools.mp4', durationMinutes: 12 } },
         { title: 'Benefits Overview', type: 'document', content: { fileUrl: 'https://example.com/docs/benefits.pdf', fileName: 'benefits.pdf' } },
         { title: 'Onboarding Check', type: 'quiz', quiz: true },

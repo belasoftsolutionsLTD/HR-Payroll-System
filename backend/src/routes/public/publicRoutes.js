@@ -180,7 +180,7 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
     const fullName = `${candidate.firstName} ${candidate.lastName}`;
 
     if (candidate.email) {
-      const tokens = { candidateName: fullName, jobTitle: requisition.title, companyName: process.env.COMPANY_NAME || 'Bella ERP' };
+      const tokens = { candidateName: fullName, jobTitle: requisition.title, companyName: process.env.COMPANY_NAME || 'Bela ERP' };
       sendTemplatedEmail({
         trigger: 'applicationReceived',
         to: candidate.email,
@@ -226,7 +226,7 @@ router.get('/jobs/:id/pdf', async (req, res) => {
     if (!job) return returnFunction(res, 404, false, 'Job not found');
 
     const settings = await findOne('company_settings', {});
-    const companyName = settings?.companyName || 'Bella ERP';
+    const companyName = settings?.companyName || 'Bela ERP';
     const primaryHex  = settings?.primaryColor || '#0A1931';
 
     // parse hex to r,g,b for pdfkit fill

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bella-backend
+    name: bela-backend
     runtime: node
     rootDir: backend
     plan: free

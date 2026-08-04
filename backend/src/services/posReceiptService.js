@@ -38,7 +38,7 @@ const generateReceiptPDF = (sale, { companyName, location, logoPath } = {}) => {
         textX = 86;
       } catch { /* corrupt/unsupported image — fall back to text-only header */ }
     }
-    doc.font('Helvetica-Bold').fontSize(13).fillColor('#1e293b').text(companyName || 'Bella ERP', textX, 50, { width: textX === 86 ? 164 : 200 });
+    doc.font('Helvetica-Bold').fontSize(13).fillColor('#1e293b').text(companyName || 'Bela ERP', textX, 50, { width: textX === 86 ? 164 : 200 });
     doc.font('Helvetica').fontSize(8).fillColor('#64748b').text(location?.name || '', { width: textX === 86 ? 164 : 200 });
     doc.moveDown(0.5);
     hline(doc);
