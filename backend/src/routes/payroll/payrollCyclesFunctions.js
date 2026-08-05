@@ -277,8 +277,27 @@ const calculateProration = (emp, periodStart, periodEnd) => {
   return { factor: Math.min(1, workedDays / totalDays), isProRata: workedDays < totalDays, reason, workedDays, totalDays };
 };
 
+// Atomically claims the cycle before running the real (long-running) lock logic, so two
+// near-simultaneous requests — a double-click, or two HR users — can't both pass the
+// status check and race each other into calculating duplicate/conflicting results. The
+// claim is released in a finally block so a mid-run crash can't leave the cycle stuck.
 async function lockCycleInternal(req, res, cycle) {
   if (cycle.status !== 'review') return returnFunction(res, 400, false, 'Cycle must be in Review to lock.');
+  const claim = await global.dbo.collection('payroll_cycles').updateOne(
+    { _id: cycle._id, status: 'review', isLocking: { $ne: true } },
+    { $set: { isLocking: true } }
+  );
+  if (claim.modifiedCount !== 1) {
+    return returnFunction(res, 409, false, 'This cycle is already being locked by another request.');
+  }
+  try {
+    return await doLockCycleInternal(req, res, cycle);
+  } finally {
+    await global.dbo.collection('payroll_cycles').updateOne({ _id: cycle._id }, { $set: { isLocking: false } }).catch(() => {});
+  }
+}
+
+async function doLockCycleInternal(req, res, cycle) {
 
   // A hand-picked target list (typical for off-cycle bonus/correction runs) bypasses the
   // usual pay-group/frequency matching entirely. Otherwise: active employees, plus anyone
@@ -553,6 +572,14 @@ async function lockCycleInternal(req, res, cycle) {
       (adjustedGross - totalStatutory - totalDeds - leaveDeductionTotal + expenseReimbursements + nonTaxableJgAllowanceTotal) * 100
     ) / 100;
 
+    // Deductions exceeding gross pay is never a valid state to silently finalize — this
+    // would otherwise flow undetected all the way into a real bank-payment file (see
+    // exportBankFile's matching guard). 'error' severity, unlike the 'warning' checks
+    // above, actually blocks closeCycleInternal until HR resolves it.
+    if (adjustedNet < 0) {
+      exceptions.push({ type: 'negative_net_pay', message: `Net pay is negative (${adjustedNet.toFixed(2)}) — deductions exceed what this employee earned this cycle.`, severity: 'error' });
+    }
+
     const resultDoc = {
       cycleId:      cycle._id,
       employeeId:   emp._id,
@@ -654,13 +681,39 @@ const closeCycle = async (req, res) => {
   return closeCycleInternal(req, res, cycle);
 };
 
+// Same atomic-claim pattern as lockCycleInternal above — see that comment.
 async function closeCycleInternal(req, res, cycle) {
   if (cycle.status !== 'locked') return returnFunction(res, 400, false, 'Cycle must be locked to close.');
+  const claim = await global.dbo.collection('payroll_cycles').updateOne(
+    { _id: cycle._id, status: 'locked', isClosing: { $ne: true } },
+    { $set: { isClosing: true } }
+  );
+  if (claim.modifiedCount !== 1) {
+    return returnFunction(res, 409, false, 'This cycle is already being closed by another request.');
+  }
+  try {
+    return await doCloseCycleInternal(req, res, cycle);
+  } finally {
+    await global.dbo.collection('payroll_cycles').updateOne({ _id: cycle._id }, { $set: { isClosing: false } }).catch(() => {});
+  }
+}
+
+async function doCloseCycleInternal(req, res, cycle) {
 
   // Block close if any results are still pending approval
   const pendingCount = await countDocuments('payroll_results', { cycleId: cycle._id, status: 'pending' });
   if (pendingCount > 0) {
     return returnFunction(res, 400, false, `Cannot close cycle: ${pendingCount} payroll result(s) are still pending approval. Approve or remove them first.`);
+  }
+
+  // Block close if any result still has an unresolved error-severity exception (missing
+  // bank/M-Pesa details, negative net pay) — 'warning' severity is informational and
+  // doesn't block; 'error' means this payslip cannot correctly be paid as calculated.
+  // Approving a result doesn't clear its exceptions, so this check is independent of
+  // (and layered on top of) the pending-approval gate above.
+  const errorExceptionCount = await countDocuments('payroll_results', { cycleId: cycle._id, 'exceptions.severity': 'error' });
+  if (errorExceptionCount > 0) {
+    return returnFunction(res, 400, false, `Cannot close cycle: ${errorExceptionCount} payroll result(s) have an unresolved error (missing bank/M-Pesa details, or negative net pay). Fix these employees' records and re-lock the cycle first.`);
   }
 
   const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
@@ -808,6 +861,15 @@ const exportBankFile = async (req, res) => {
 
   const results = await findMany('payroll_results', { cycleId: cycle._id, status: { $in: ['approved', 'paid'] } }, {});
   if (!results.length) return returnFunction(res, 400, false, 'No approved payroll results to export.');
+
+  // Never let a broken payment instruction (negative/zero net pay from a deduction
+  // config error) reach the file HR actually uploads to the bank — block the whole
+  // export rather than silently drop rows, so nobody accidentally goes unpaid without
+  // HR noticing. Same "error" exceptions closeCycleInternal blocks on.
+  const badRows = results.filter(r => r.netPay <= 0 || (r.exceptions || []).some(e => e.severity === 'error'));
+  if (badRows.length) {
+    return returnFunction(res, 400, false, `Cannot export bank file: ${badRows.length} result(s) have a negative/zero net pay or an unresolved error. Fix these employees' records and re-lock the cycle before exporting.`);
+  }
 
   const rows = await Promise.all(results.map(async r => {
     const emp = await findOne('employees', { _id: r.employeeId }, {

@@ -25,9 +25,13 @@ const KENYA_DEFAULT = {
       name: 'NSSF',
       enabled: true,
       type: 'tiered_cap',
+      // Tier I / Tier II limits per the NSSF Act 2013 phased schedule — last confirmed
+      // step is the Feb 2025 revision (LEL 8,000 / UEL 72,000). Verify against current
+      // NSSF/KRA guidance before relying on this for a real payroll run; these limits
+      // are legislated to step up further and this default won't auto-update.
       tiers: [
-        { limit: 7000,  rate: 6 },
-        { limit: 29000, rate: 6 },
+        { limit: 8000,  rate: 6 },
+        { limit: 64000, rate: 6 },
       ],
       cap: null,
     },
@@ -38,6 +42,7 @@ const KENYA_DEFAULT = {
       type: 'flat_rate',
       rate: 2.75,
       cap: null,
+      minAmount: 300,
     },
     {
       key: 'housing_levy',
@@ -54,8 +59,13 @@ const calcStatutory = (gross, cfg) => {
   if (!cfg || !cfg.enabled) return 0;
 
   if (cfg.type === 'flat_rate') {
-    const amount = gross * (cfg.rate / 100);
-    return Math.round((cfg.cap ? Math.min(amount, cfg.cap) : amount) * 100) / 100;
+    let amount = gross * (cfg.rate / 100);
+    if (cfg.cap) amount = Math.min(amount, cfg.cap);
+    // A statutory minimum (e.g. SHA's KES 300/month floor) applies even to employees
+    // whose percentage-calculated amount would fall below it — but never to someone
+    // with zero gross pay, since there's nothing to withhold from in that cycle.
+    if (cfg.minAmount && gross > 0) amount = Math.max(amount, cfg.minAmount);
+    return Math.round(amount * 100) / 100;
   }
 
   if (cfg.type === 'tiered_cap') {

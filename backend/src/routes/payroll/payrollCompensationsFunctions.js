@@ -161,9 +161,13 @@ const assignConcept = async (req, res) => {
   }
 
   // 'all' | 'department' | 'jobGroup' — a single shared assignment record, no running
-  // balance possible (a loan needs one specific person's balance, not a group's).
-  if (hasPrincipal) {
-    return returnFunction(res, 400, false, 'A loan-like assignment (with a principal) must target a specific employee, not a group.');
+  // balance possible (a loan needs one specific person's balance, not a group's). Gated
+  // on the concept's own subCategory, not just whether a principal was supplied here —
+  // a loan-type concept assigned group-wide with no balance would otherwise resolve as
+  // an ordinary flat deduction (resolveConceptPayItems.js's pass 1), silently bypassing
+  // every loan safeguard (balance tracking, loanStatus, auto-completion).
+  if (hasPrincipal || concept.subCategory === 'loans') {
+    return returnFunction(res, 400, false, 'A loan must target a specific employee, not a group — loans are always tied to one person\'s balance.');
   }
 
   let appliesTo;
