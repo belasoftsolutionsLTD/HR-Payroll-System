@@ -96,6 +96,7 @@ const createAccount = async (req, res) => {
         </p>
       </div>
     `,
+    bypassUnsubscribe: true,
   }).catch((e) => console.error('Credentials email failed:', e.message));
 
   // Training auto-enrollment — a new account is the point at which someone becomes
@@ -172,6 +173,7 @@ const adminResetPassword = async (req, res) => {
         <p style="color:#e53e3e;font-size:13px;">Please change this password after logging in.</p>
       </div>
     `,
+    bypassUnsubscribe: true,
   }).catch((e) => console.error('Password reset email failed:', e.message));
 
   return returnFunction(res, 200, true, 'Password reset. New credentials sent via email.');

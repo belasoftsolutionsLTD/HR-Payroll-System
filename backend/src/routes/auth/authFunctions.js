@@ -7,6 +7,7 @@ const { findOne, insertOne, updateOne } = require('../../functions/Database/comm
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { sendEmail } = require('../../services/emailService');
+const { verifyTurnstile } = require('../../lib/turnstile/verifyTurnstile');
 
 const COMPANY_NAME = process.env.COMPANY_NAME || 'Workfola';
 
@@ -36,6 +37,14 @@ const login = async (req, res) => {
   if (!validateRequiredFields(req, res, ['email', 'password'])) return;
 
   const { email, password } = req.body;
+
+  // No-op until TURNSTILE_SECRET_KEY is configured (see verifyTurnstile) — the existing
+  // loginLimiter (5 attempts/15min) already throttles brute force; this adds bot/scripted-
+  // attempt protection underneath it once real Cloudflare Turnstile keys are set.
+  const captchaOk = await verifyTurnstile(req.body.captchaToken, req.ip);
+  if (!captchaOk) {
+    return returnFunction(res, 400, false, 'Captcha verification failed. Please try again.');
+  }
 
   const user = await findOne('users', { email: email.toLowerCase().trim() });
   if (!user) return returnFunction(res, 401, false, locale.unauthorized);
@@ -175,6 +184,7 @@ const forgotPassword = async (req, res) => {
         <p style="color:#888;font-size:12px;">If you didn't request this, ignore this email.</p>
       </div>
     `,
+    bypassUnsubscribe: true,
   }).catch(() => {});
 
   return returnFunction(res, 200, true, 'If that email exists, a reset link has been sent.');

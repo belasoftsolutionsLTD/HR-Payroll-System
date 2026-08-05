@@ -8,6 +8,7 @@ const { validateRequiredFields } = require('../../functions/Route Fns/routeFns')
 const crypto = require('crypto');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
+const { verifyUnsubscribeToken } = require('../../lib/email/unsubscribeToken');
 const { respondToOfferCore } = require('../recruitment/recruitmentFunctions');
 const { findInviteByToken, acceptInviteCore, declineInviteCore } = require('../projects/projectsFunctions');
 
@@ -84,6 +85,17 @@ router.get('/company-info', async (req, res) => {
 // object literal would capture `new Date()` once at server startup and never advance.
 const notExpired = () => ({ $or: [{ applicationDeadline: null }, { applicationDeadline: { $gte: new Date() } }] });
 
+// A requisition with no branchId set (or a company with no branches configured at all)
+// is shown to candidates as based at "Headquarters" rather than a blank/missing field.
+const withBranchName = async (jobs) => {
+  const list = Array.isArray(jobs) ? jobs : [jobs];
+  const branchIds = [...new Set(list.filter((j) => j.branchId).map((j) => String(j.branchId)))].map((id) => new ObjectId(id));
+  const branches = branchIds.length ? await findMany('branches', { _id: { $in: branchIds } }, { projection: { name: 1 } }) : [];
+  const nameById = Object.fromEntries(branches.map((b) => [String(b._id), b.name]));
+  const enriched = list.map((j) => ({ ...j, branchName: (j.branchId && nameById[String(j.branchId)]) || 'Headquarters' }));
+  return Array.isArray(jobs) ? enriched : enriched[0];
+};
+
 // GET /api/public/jobs — open requisitions for the careers site (no auth)
 router.get('/jobs', async (req, res) => {
   try {
@@ -91,7 +103,7 @@ router.get('/jobs', async (req, res) => {
     if (req.query.department) filter.department = req.query.department;
     if (req.query.location) filter.location = req.query.location;
     const jobs = await findMany('jobRequisitions', filter, { sort: { createdAt: -1 } });
-    return returnFunction(res, 200, true, 'OK', jobs);
+    return returnFunction(res, 200, true, 'OK', await withBranchName(jobs));
   } catch (e) {
     return returnFunction(res, 500, false, 'Server error');
   }
@@ -102,6 +114,7 @@ router.get('/jobs/:id', async (req, res) => {
   try {
     const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open', ...notExpired() });
     if (!job) return returnFunction(res, 404, false, 'Job not found or closed');
+    Object.assign(job, await withBranchName(job));
     return returnFunction(res, 200, true, 'OK', job);
   } catch (e) {
     return returnFunction(res, 500, false, 'Server error');
@@ -117,10 +130,13 @@ const parseAnswers = (raw) => {
   return [];
 };
 
-// POST /api/public/jobs/:id/apply — submit application (no auth, resume upload optional)
+// POST /api/public/jobs/:id/apply — submit application (no auth). Phone and resume are
+// required — phone is the fallback contact channel if email doesn't reach the candidate,
+// and a resume is the baseline for reviewing any application at all.
 router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
   try {
-    if (!validateRequiredFields(req, res, ['firstName', 'lastName', 'email'])) return;
+    if (!validateRequiredFields(req, res, ['firstName', 'lastName', 'email', 'phone'])) return;
+    if (!req.file) return returnFunction(res, 400, false, 'A resume (PDF) is required.');
 
     const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open', ...notExpired() });
     if (!requisition) return returnFunction(res, 404, false, 'Job not found or closed');
@@ -393,6 +409,31 @@ router.post('/project-invites/:token/respond', AsyncHandler(async (req, res) => 
   }
 
   return returnFunction(res, 200, true, `Invite ${req.body.status}.`);
+}));
+
+// GET /api/public/unsubscribe/status — read-only check, used to show who/what before
+// the user commits to an action (a link-scanning email client prefetching this GET
+// must never itself change anything — see the POST route below for the real toggle).
+router.get('/unsubscribe/status', AsyncHandler(async (req, res) => {
+  const { uid, token } = req.query;
+  if (!uid || !token || !verifyUnsubscribeToken(uid, token)) {
+    return returnFunction(res, 400, false, 'This unsubscribe link is invalid.');
+  }
+  const user = await findOne('users', { _id: new ObjectId(uid) }, { projection: { email: 1, name: 1, unsubscribedFromEmails: 1 } });
+  if (!user) return returnFunction(res, 404, false, 'Account not found.');
+  return returnFunction(res, 200, true, 'OK', { email: user.email, name: user.name, unsubscribed: user.unsubscribedFromEmails === true });
+}));
+
+// POST /api/public/unsubscribe — the actual state change. No auth beyond the token
+// (recipient isn't necessarily logged in when they click this from their inbox).
+router.post('/unsubscribe', AsyncHandler(async (req, res) => {
+  const { uid, token, unsubscribed } = req.body;
+  if (!uid || !token || !verifyUnsubscribeToken(uid, token)) {
+    return returnFunction(res, 400, false, 'This unsubscribe link is invalid.');
+  }
+  const result = await updateOne('users', { _id: new ObjectId(uid) }, { $set: { unsubscribedFromEmails: unsubscribed !== false, updatedAt: new Date() } });
+  if (!result.matchedCount) return returnFunction(res, 404, false, 'Account not found.');
+  return returnFunction(res, 200, true, unsubscribed !== false ? 'Unsubscribed.' : 'Resubscribed.');
 }));
 
 module.exports = router;

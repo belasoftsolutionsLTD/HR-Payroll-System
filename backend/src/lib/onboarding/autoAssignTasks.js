@@ -1,8 +1,51 @@
+const bcrypt = require('bcryptjs');
 const { ObjectId } = require('mongodb');
 const { findOne, findMany, insertOne } = require('../../functions/Database/commonDBFunctions');
 const { notifyUser, notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyManager } = require('../../routes/inbox/inboxFunctions');
 const { sendEmail } = require('../../services/emailService');
+const { STAFF } = require('../../constants/roles');
+
+// Same generator as accountFunctions.js's createAccount — kept local (not imported)
+// to avoid a route-layer -> route-layer require; both produce an equally strong
+// random temporary password.
+const generatePassword = () => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789@#!';
+  return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+};
+
+// A new hire's "Welcome" email used to link straight to the login-gated onboarding
+// portal without ever provisioning them a login — they had no way in. This
+// provisions a staff account (if one doesn't already exist for this employee) right
+// before the welcome email goes out, so the credentials and the portal link travel
+// together in the same message. Returns the raw password when a new account was
+// created, or null if the employee already had one (or has no email on file).
+const ensureLoginAccount = async (employeeId, employee) => {
+  if (!employee.email) return null;
+
+  const existing = await findOne('users', { employeeId: new ObjectId(employeeId) }, { projection: { _id: 1 } });
+  if (existing) return null;
+
+  const byEmail = await findOne('users', { email: employee.email.toLowerCase().trim() }, { projection: { _id: 1 } });
+  if (byEmail) return null;
+
+  const rawPassword = generatePassword();
+  const hashed = await bcrypt.hash(rawPassword, 12);
+  await insertOne('users', {
+    name: employee.fullName,
+    email: employee.email.toLowerCase().trim(),
+    password: hashed,
+    role: STAFF,
+    employeeId: new ObjectId(employeeId),
+    department: employee.department || null,
+    mustResetPassword: true,
+    isActive: true,
+    createdBy: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  return rawPassword;
+};
 
 const STAKEHOLDER_DEPARTMENTS = {
   it: 'Information Technology',
@@ -41,7 +84,7 @@ const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) 
   const template = await findOne('onboarding_templates', { _id: new ObjectId(templateId) });
   if (!template) throw new Error('Onboarding template not found.');
 
-  const employee = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { fullName: 1, email: 1 } });
+  const employee = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { fullName: 1, email: 1, department: 1 } });
   if (!employee) throw new Error('Employee not found.');
 
   const start = new Date(startDate);
@@ -96,13 +139,25 @@ const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) 
   const result = await insertOne('onboarding_records', doc);
   const record = { ...doc, _id: result.insertedId };
 
-  // Welcome email (fire-and-forget — should never block onboarding creation)
+  // Welcome email (fire-and-forget — should never block onboarding creation). Provisioning
+  // happens first so the credentials and the portal link that needs them travel together —
+  // sending someone a link to a page they have no way to log into is the exact gap this closes.
   if (employee.email) {
+    const rawPassword = await ensureLoginAccount(employeeId, employee).catch(() => null);
     const portalLink = `${process.env.FRONTEND_URL || ''}/en/my/onboarding`;
+    const credentialsBlock = rawPassword
+      ? `<p>Your login has been created so you can access the onboarding portal:</p>
+         <table style="background:#f5f5f5;padding:16px;border-radius:8px;width:100%;">
+           <tr><td><strong>Email:</strong></td><td>${employee.email}</td></tr>
+           <tr><td><strong>Password:</strong></td><td style="font-family:monospace;font-size:16px;">${rawPassword}</td></tr>
+         </table>
+         <p style="color:#e53e3e;font-size:13px;margin-top:8px;">You'll be prompted to set a new password on your first login.</p>`
+      : '';
     sendEmail({
       to: employee.email,
       subject: `Welcome to ${process.env.COMPANY_NAME || 'the team'}!`,
-      html: `<p>Hi ${employee.fullName},</p><p>${(template.welcomeMessage || 'Welcome aboard! We\'re excited to have you join us.').replace(/\n/g, '<br/>')}</p><p>You can track your onboarding tasks here: <a href="${portalLink}">${portalLink}</a></p>`,
+      html: `<p>Hi ${employee.fullName},</p><p>${(template.welcomeMessage || 'Welcome aboard! We\'re excited to have you join us.').replace(/\n/g, '<br/>')}</p>${credentialsBlock}<p>You can track your onboarding tasks here: <a href="${portalLink}">${portalLink}</a></p>`,
+      bypassUnsubscribe: true,
     }).catch(() => {});
   }
 

@@ -5,6 +5,7 @@ const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../
 const { createStockMovement } = require('./inventoryMovementsFunctions');
 const { receiveLotStock } = require('./inventoryLotsFunctions');
 const { sendEmail } = require('../../services/emailService');
+const { generatePurchaseOrderPDF } = require('../../services/poService');
 const { postJournalEntry, resolveSystemAccount } = require('../../lib/accounting/glEngine');
 const { logPostingFailure } = require('../accounting/accountingPostingFailuresFunctions');
 
@@ -157,10 +158,23 @@ const sendPurchaseOrder = async (req, res) => {
     }).join('');
     const orderTotal = po.items.reduce((sum, l) => sum + l.quantityOrdered * l.unitCost, 0);
 
+    // The table in the email body is a quick preview — a real PDF is attached so the
+    // supplier has something they can actually file/print, not just read on screen.
+    const companySettings = await findOne('company_settings', {});
+    const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
+    let attachments = [];
+    try {
+      const pdfBuffer = await generatePurchaseOrderPDF(po, supplier, location, itemById, branding);
+      attachments = [{ filename: `${po.poNumber}.pdf`, content: pdfBuffer, contentType: 'application/pdf' }];
+    } catch (err) {
+      console.error(`PO PDF generation failed for ${po.poNumber}:`, err.message);
+    }
+
     sendEmail({
       to: supplier.email,
       subject: `Purchase Order ${po.poNumber}`,
-      html: `<p>Dear ${supplier.contactPerson || supplier.name},</p><p>Please find below purchase order <strong>${po.poNumber}</strong>${location?.name ? `, for delivery to <strong>${location.name}</strong>` : ''}${po.expectedDeliveryDate ? `, expected by <strong>${new Date(po.expectedDeliveryDate).toLocaleDateString()}</strong>` : ''}.</p><table cellpadding="6" style="border-collapse:collapse;width:100%"><thead><tr style="text-align:left;border-bottom:1px solid #ccc"><th>Item</th><th>Qty</th><th>Unit Cost</th><th>Line Total</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Order total: ${orderTotal.toLocaleString()}</strong></p><p>Please confirm receipt and let us know if you have any questions.</p>`,
+      html: `<p>Dear ${supplier.contactPerson || supplier.name},</p><p>Please find below purchase order <strong>${po.poNumber}</strong>${location?.name ? `, for delivery to <strong>${location.name}</strong>` : ''}${po.expectedDeliveryDate ? `, expected by <strong>${new Date(po.expectedDeliveryDate).toLocaleDateString()}</strong>` : ''} — a PDF copy is attached for your records.</p><table cellpadding="6" style="border-collapse:collapse;width:100%"><thead><tr style="text-align:left;border-bottom:1px solid #ccc"><th>Item</th><th>Qty</th><th>Unit Cost</th><th>Line Total</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Order total: ${orderTotal.toLocaleString()}</strong></p><p>Please confirm receipt and let us know if you have any questions.</p>`,
+      attachments,
     }).catch(() => {});
   }
 

@@ -32,6 +32,10 @@ const createRequisition = async (req, res) => {
     title: req.body.title.trim(),
     department: req.body.department,
     location: req.body.location,
+    // Optional — which of the company's configured branches this role is based at.
+    // null means "no specific branch" — the public careers page falls back to
+    // showing "Headquarters" for these, same as when the company has no branches at all.
+    branchId: req.body.branchId ? new ObjectId(req.body.branchId) : null,
     employmentType: req.body.employmentType,
     headcount: Number(req.body.headcount),
     salaryRange: {
@@ -99,13 +103,14 @@ const getRequisition = async (req, res) => {
 
 const updateRequisition = async (req, res) => {
   const allowed = [
-    'title', 'department', 'location', 'employmentType', 'headcount', 'salaryRange',
+    'title', 'department', 'location', 'branchId', 'employmentType', 'headcount', 'salaryRange',
     'description', 'applicationDeadline', 'competencies', 'pipelineStages', 'screeningQuestions', 'approvalChain', 'hiringManagerId',
   ];
   const update = { updatedAt: new Date() };
   allowed.forEach((f) => {
     if (req.body[f] === undefined) return;
     if (f === 'hiringManagerId') update[f] = new ObjectId(req.body[f]);
+    else if (f === 'branchId') update[f] = req.body[f] ? new ObjectId(req.body[f]) : null;
     else if (f === 'applicationDeadline') update[f] = req.body[f] ? new Date(req.body[f]) : null;
     else update[f] = req.body[f];
   });
@@ -493,6 +498,22 @@ const bulkApplicationAction = async (req, res) => {
 const extendOffer = async (req, res) => {
   if (!validateRequiredFields(req, res, ['salary', 'startDate', 'expiresAt'])) return;
 
+  // Neither date is meaningful in the past — a start date already gone by, or a response
+  // deadline that's already expired the moment the offer goes out, both silently made no
+  // sense before this check existed.
+  const startDate = new Date(req.body.startDate);
+  const expiresAt = new Date(req.body.expiresAt);
+  const todayStart = new Date(new Date().toDateString());
+  if (Number.isNaN(startDate.getTime()) || startDate < todayStart) {
+    return returnFunction(res, 400, false, 'Start date cannot be in the past.');
+  }
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+    return returnFunction(res, 400, false, 'Offer expiry must be in the future.');
+  }
+  if (expiresAt > startDate) {
+    return returnFunction(res, 400, false, 'Offer expiry cannot be after the start date.');
+  }
+
   const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
@@ -503,8 +524,8 @@ const extendOffer = async (req, res) => {
   const offerDetails = {
     salary: Number(req.body.salary),
     currency: req.body.currency || 'KES',
-    startDate: new Date(req.body.startDate),
-    expiresAt: new Date(req.body.expiresAt),
+    startDate,
+    expiresAt,
     status: 'pending',
     responseTokenHash: crypto.createHash('sha256').update(rawResponseToken).digest('hex'),
   };
@@ -601,6 +622,13 @@ const assignInterviewer = async (req, res) => {
   // is exactly the gap that left HR unable to remind candidates ahead of time.
   if (!validateRequiredFields(req, res, ['stageId', 'interviewerId', 'scheduledAt'])) return;
 
+  // A 5-minute buffer rather than a bare "> now" check — an interview scheduled for
+  // 30 seconds from now is functionally already a past-dated one nobody can prepare for.
+  const scheduledAt = new Date(req.body.scheduledAt);
+  if (Number.isNaN(scheduledAt.getTime()) || scheduledAt.getTime() < Date.now() + 5 * 60 * 1000) {
+    return returnFunction(res, 400, false, 'Interview time must be at least 5 minutes from now.');
+  }
+
   const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
@@ -629,7 +657,7 @@ const assignInterviewer = async (req, res) => {
     stageId: req.body.stageId,
     interviewerId: new ObjectId(req.body.interviewerId),
     interviewerName: interviewer.name,
-    scheduledAt: new Date(req.body.scheduledAt),
+    scheduledAt,
     // Candidate-facing logistics — deliberately separate from interviewerId/interviewerName
     // above, which must never be sent to the candidate (see the email below).
     meetingLink: req.body.meetingLink || null,
@@ -719,6 +747,63 @@ const unassignInterviewer = async (req, res) => {
     $set: { updatedAt: new Date() },
   });
   return returnFunction(res, 200, true, 'Interviewer unassigned.');
+};
+
+// Self-scoped view for an interviewer (any role, including plain staff) to see
+// their own upcoming/past interview assignments and jump straight to the scorecard
+// form — deliberately filtered server-side to req.user._id so this is safe to expose
+// broadly, unlike listScorecardsForApplication/getScorecard which return other
+// interviewers' assessments and candidate PII and must stay MGMT-only.
+const getMyInterviews = async (req, res) => {
+  const interviewerId = new ObjectId(req.user._id);
+
+  const applications = await findMany('applications', {
+    'interviewAssignments.interviewerId': interviewerId,
+  }, { sort: { updatedAt: -1 } });
+
+  if (!applications.length) return returnFunction(res, 200, true, 'OK', []);
+
+  const candidateIds = [...new Set(applications.map((a) => String(a.candidateId)))].map((id) => new ObjectId(id));
+  const requisitionIds = [...new Set(applications.map((a) => String(a.requisitionId)))].map((id) => new ObjectId(id));
+  const [candidates, requisitions, myScorecards] = await Promise.all([
+    findMany('candidates', { _id: { $in: candidateIds } }, { projection: { firstName: 1, lastName: 1 } }),
+    findMany('jobRequisitions', { _id: { $in: requisitionIds } }, { projection: { title: 1, pipelineStages: 1, competencies: 1 } }),
+    findMany('scorecards', { interviewerId, applicationId: { $in: applications.map((a) => a._id) } }, { projection: { applicationId: 1, stageId: 1 } }),
+  ]);
+  const candidateById = Object.fromEntries(candidates.map((c) => [String(c._id), c]));
+  const requisitionById = Object.fromEntries(requisitions.map((r) => [String(r._id), r]));
+  const submittedKeys = new Set(myScorecards.map((s) => `${s.applicationId}:${s.stageId}`));
+
+  const rows = [];
+  for (const application of applications) {
+    const requisition = requisitionById[String(application.requisitionId)];
+    const candidate = candidateById[String(application.candidateId)];
+    const myAssignments = (application.interviewAssignments || []).filter(
+      (a) => String(a.interviewerId) === String(interviewerId)
+    );
+    for (const assignment of myAssignments) {
+      const stage = requisition?.pipelineStages?.find((s) => s.id === assignment.stageId);
+      rows.push({
+        applicationId: application._id,
+        candidateName: candidate ? `${candidate.firstName} ${candidate.lastName}` : 'Unknown candidate',
+        jobTitle: requisition?.title || 'Unknown role',
+        stageId: assignment.stageId,
+        stageName: stage?.name || assignment.stageId,
+        scheduledAt: assignment.scheduledAt,
+        meetingLink: assignment.meetingLink,
+        location: assignment.location,
+        requiredDocuments: assignment.requiredDocuments,
+        // Denormalized here (rather than requiring the frontend to fetch the requisition
+        // separately) because GET /requisitions/:id is MGMT-gated and this endpoint is
+        // the one thing a plain-staff interviewer is allowed to call.
+        competencies: requisition?.competencies || [],
+        scorecardSubmitted: submittedKeys.has(`${application._id}:${assignment.stageId}`),
+      });
+    }
+  }
+
+  rows.sort((a, b) => new Date(b.scheduledAt) - new Date(a.scheduledAt));
+  return returnFunction(res, 200, true, 'OK', rows);
 };
 
 // ── Scorecards ────────────────────────────────────────────────────────────────
@@ -1199,7 +1284,7 @@ module.exports = {
   bulkApplicationAction,
   extendOffer, respondToOffer, respondToOfferCore,
   assignInterviewer, unassignInterviewer, sendInterviewReminder,
-  submitScorecard, listScorecardsForApplication, getScorecard,
+  submitScorecard, listScorecardsForApplication, getScorecard, getMyInterviews,
   createCandidate, listCandidates, getCandidate, updateCandidate, convertCandidate,
   createNurtureCampaign, listNurtureCampaigns, addNurtureTouchpoint, listNurtureCandidates,
   getRecruitmentOverview, getRequisitionFunnel, getTimeToFill, getTimeInStage,

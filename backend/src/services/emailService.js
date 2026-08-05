@@ -1,5 +1,7 @@
 const nodemailer = require('nodemailer');
 const logger = require('../lib/logger');
+const { findOne } = require('../functions/Database/commonDBFunctions');
+const { generateUnsubscribeToken } = require('../lib/email/unsubscribeToken');
 
 let transporter = null;
 
@@ -28,6 +30,14 @@ const htmlToText = (html) => html
   .replace(/\n{3,}/g, '\n\n')
   .trim();
 
+const unsubscribeFooter = (userId) => {
+  const token = generateUnsubscribeToken(userId);
+  const url = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/unsubscribe?uid=${userId}&token=${token}`;
+  return `<p style="margin-top:24px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;">
+    You're receiving this because it's tied to your account. <a href="${url}" style="color:#94a3b8;">Unsubscribe from these emails</a>.
+  </p>`;
+};
+
 /**
  * Send an email. Falls back to a warn log (never throws to the caller's core action)
  * if SMTP is not configured or the send itself fails.
@@ -37,20 +47,41 @@ const htmlToText = (html) => html
  * @param {string} opts.html
  * @param {string} [opts.text] - plain-text fallback; auto-derived from html if omitted
  * @param {Array}  [opts.attachments]
+ * @param {boolean} [opts.bypassUnsubscribe] - account-critical mail (password reset,
+ *   new-account credentials) that must always reach the recipient regardless of their
+ *   notification preference — opting out of "Leave Approved" emails shouldn't cost
+ *   someone the ability to recover a forgotten password.
  */
-const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
+const sendEmail = async ({ to, subject, html, text, attachments = [], bypassUnsubscribe = false }) => {
   const t = getTransporter();
   if (!t) {
     logger.warn('Email not sent — SMTP not configured', { to, subject });
     return;
   }
+
+  // Unsubscribe only applies to recipients who are actual system users (employees/HR) —
+  // a supplier receiving a PO or a candidate receiving an application confirmation isn't
+  // "subscribed" to anything, those are one-off transactional documents tied to an
+  // action they themselves triggered, not a marketing/notification stream.
+  let finalHtml = html;
+  if (!bypassUnsubscribe) {
+    const user = await findOne('users', { email: String(to).toLowerCase().trim() }, { projection: { _id: 1, unsubscribedFromEmails: 1 } }).catch(() => null);
+    if (user) {
+      if (user.unsubscribedFromEmails === true) {
+        logger.info('Email skipped — recipient unsubscribed', { to, subject });
+        return;
+      }
+      finalHtml = html + unsubscribeFooter(user._id);
+    }
+  }
+
   try {
     await t.sendMail({
       from: `"${process.env.COMPANY_NAME || 'Workfola'}" <${process.env.EMAIL_USER}>`,
       to,
       subject,
-      html,
-      text: text || htmlToText(html),
+      html: finalHtml,
+      text: text || htmlToText(finalHtml),
       attachments,
     });
   } catch (err) {

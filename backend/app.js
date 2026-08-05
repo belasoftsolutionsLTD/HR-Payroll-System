@@ -18,6 +18,7 @@ const { writeLimiter } = require('./src/middleware/RateLimitMiddleware');
 const { decodeToken, getUserData } = require('./src/middleware/AuthMiddleware');
 
 const authRoutes       = require('./src/routes/auth/auth');
+const demoRoutes       = require('./src/routes/demo/demo');
 const hrRoutes         = require('./src/routes/hr/hr');
 const employeesRoutes  = require('./src/routes/employees/employees');
 const recruitmentRoutes = require('./src/routes/recruitment/recruitment');
@@ -108,6 +109,9 @@ app.use(LocaleMiddleware);
 // ── Public routes (no auth) ───────────────────────────────────────────────────
 app.use('/api/auth',   authRoutes);
 app.use('/api/public', publicRoutes);
+// Mixed — login is public, everything else requires the guest token it issues;
+// each route declares its own auth, see demo.js.
+app.use('/api/demo',   demoRoutes);
 
 // ── HR Module routes (all require auth) ──────────────────────────────────────
 app.use('/api/hr',          decodeToken, getUserData, hrRoutes);

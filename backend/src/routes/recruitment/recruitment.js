@@ -9,7 +9,7 @@ const {
   bulkApplicationAction,
   extendOffer, respondToOffer,
   assignInterviewer, unassignInterviewer, sendInterviewReminder,
-  submitScorecard, listScorecardsForApplication, getScorecard,
+  submitScorecard, listScorecardsForApplication, getScorecard, getMyInterviews,
   createCandidate, listCandidates, getCandidate, updateCandidate, convertCandidate,
   createNurtureCampaign, listNurtureCampaigns, addNurtureTouchpoint, listNurtureCandidates,
   getRecruitmentOverview, getRequisitionFunnel, getTimeToFill, getTimeInStage,
@@ -18,7 +18,7 @@ const {
   createEmailTemplate, listEmailTemplates, updateEmailTemplate, deleteEmailTemplate,
 } = require('./recruitmentFunctions');
 
-const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
+const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD, ALL_ROLES } = require('../../constants/roles');
 const MGMT = [SUPER_ADMIN, HR_MANAGER, DEPT_HEAD];
 
 // ── Requisitions ───────────────────────────────────────────────────────────────
@@ -44,9 +44,17 @@ router.delete('/applications/:id/interviewers/:stageId/:interviewerId', allowRol
 router.post('/applications/:id/interviewers/:stageId/remind',          allowRoles(MGMT), AsyncHandler(sendInterviewReminder));
 
 // ── Scorecards ────────────────────────────────────────────────────────────────
-router.post('/applications/:id/scorecards',   allowRoles(MGMT), AsyncHandler(submitScorecard));
+// Submission is open to ALL_ROLES — an interviewer assigned from the plain staff
+// role must be able to submit their own scorecard. Handler-level ownership check
+// (see submitScorecard) still restricts it to the assigned interviewer or a super_admin.
+// Listing/reading scorecards stays MGMT-only — those return other interviewers'
+// assessments and candidate PII with no requester-scoping.
+router.post('/applications/:id/scorecards',   allowRoles(ALL_ROLES), AsyncHandler(submitScorecard));
 router.get('/applications/:id/scorecards',    allowRoles(MGMT), AsyncHandler(listScorecardsForApplication));
 router.get('/scorecards/:id',                 allowRoles(MGMT), AsyncHandler(getScorecard));
+
+// ── My Interviews (self-scoped, any role) ────────────────────────────────────
+router.get('/my-interviews', allowRoles(ALL_ROLES), AsyncHandler(getMyInterviews));
 
 // ── Candidates / CRM ──────────────────────────────────────────────────────────
 router.post('/candidates',              allowRoles(MGMT), AsyncHandler(createCandidate));
