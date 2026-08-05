@@ -40,6 +40,14 @@ const createAccount = async (req, res) => {
     return returnFunction(res, 400, false, `Role must be one of: ${ALLOWED_CREATE_ROLES.join(', ')}`);
   }
 
+  // Staff/dept-head accounts exist to BE a self-service portal for a real employee —
+  // one with no employee record can log in but has nothing to see (leave balance,
+  // payslips, profile all come from the employee doc). HR managers are a pure
+  // operator role and legitimately don't need one.
+  if ([STAFF, DEPT_HEAD].includes(role) && !employeeId) {
+    return returnFunction(res, 400, false, 'Link this account to an employee record — Staff and Department Head accounts need one to show any personal data.');
+  }
+
   const existing = await findOne('users', { email: email.toLowerCase().trim() });
   if (existing) return returnFunction(res, 409, false, 'A user with this email already exists.');
 

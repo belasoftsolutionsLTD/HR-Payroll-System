@@ -38,7 +38,7 @@ const createSingleCourseEnrollment = async ({ employeeId, courseId, learningPath
     title: 'New Training Assigned',
     body: 'You have been assigned a new course.',
     type: 'training',
-    link: `/my/training/courses/${courseId}`,
+    link: `/my/training/courses/${courseId}/learn`,
   }).catch(() => {});
   (async () => {
     const [user, course] = await Promise.all([
