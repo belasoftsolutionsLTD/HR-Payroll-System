@@ -3,8 +3,8 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 
-// Promo codes are optional and configured per business (not every industry using Bela
-// ERP needs them) — a plain admin-managed lookup, resolved at checkout time by code.
+// Promo codes are optional and configured per business (not every industry using
+// Workfola needs them) — a plain admin-managed lookup, resolved at checkout time by code.
 
 const listPromoCodes = async (req, res) => {
   // Plain listing (admin Settings panel) shows everything, including inactive/expired

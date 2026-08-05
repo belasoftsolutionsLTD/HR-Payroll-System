@@ -167,7 +167,7 @@ const generateP9Form = async (employee, year, monthlyData) => {
     doc.moveDown(0.4);
     doc.fontSize(7).font('Helvetica').fillColor('#94a3b8')
        .text(
-         `Computer-generated P9A form  •  Generated on ${new Date().toLocaleDateString('en-KE', { dateStyle: 'long' })}  •  Bela ERP`,
+         `Computer-generated P9A form  •  Generated on ${new Date().toLocaleDateString('en-KE', { dateStyle: 'long' })}  •  Workfola`,
          LEFT, doc.y, { width: pageW, align: 'center' },
        );
 

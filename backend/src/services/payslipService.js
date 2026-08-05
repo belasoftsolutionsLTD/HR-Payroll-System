@@ -53,7 +53,7 @@ const generatePayslipFromResult = (employee, result, cycle, branding = {}) => {
         textX = 122;
       } catch { /* corrupt/unsupported image — fall back to text-only header */ }
     }
-    doc.fontSize(20).font('Helvetica-Bold').fillColor('#f1f5f9').text(companyName || 'BELA ERP', textX, 25, { align: 'left' });
+    doc.fontSize(20).font('Helvetica-Bold').fillColor('#f1f5f9').text(companyName || 'WORKFOLA', textX, 25, { align: 'left' });
     doc.fontSize(11).font('Helvetica').fillColor('#94a3b8').text('PAYSLIP', textX, 50);
     doc.fontSize(9).fillColor('#64748b')
        .text(

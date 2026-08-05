@@ -20,7 +20,7 @@ const MAX_APPLICATIONS_PER_REQUISITION = 2;
 const candidateTokens = (candidate, requisition) => ({
   candidateName: candidate ? `${candidate.firstName} ${candidate.lastName}` : '',
   jobTitle: requisition?.title || '',
-  companyName: process.env.COMPANY_NAME || 'Bela ERP',
+  companyName: process.env.COMPANY_NAME || 'Workfola',
 });
 
 // ── Requisitions ───────────────────────────────────────────────────────────────

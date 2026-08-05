@@ -9,8 +9,8 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'], display: 'swap' });
 
 export const metadata: Metadata = {
-  title: 'Bela ERP',
-  description: 'Bela ERP – HR Management System',
+  title: 'Workfola',
+  description: 'Workfola – HR Management System',
 };
 
 export default async function LocaleLayout({

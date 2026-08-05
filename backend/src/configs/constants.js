@@ -1,5 +1,5 @@
 module.exports = {
-  companyName: 'Bela ERP',
+  companyName: 'Workfola',
   shortCompanyName: 'BERP',
   defaultLocale: 'en',
   defaultTimezone: 'Africa/Nairobi',

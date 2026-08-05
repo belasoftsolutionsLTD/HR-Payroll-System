@@ -8,7 +8,7 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { sendEmail } = require('../../services/emailService');
 
-const COMPANY_NAME = process.env.COMPANY_NAME || 'Bela ERP';
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Workfola';
 
 const REFRESH_TTL_DAYS = parseInt(process.env.REFRESH_TOKEN_DAYS || '30');
 

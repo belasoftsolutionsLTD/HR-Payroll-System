@@ -46,7 +46,7 @@ const sendEmail = async ({ to, subject, html, text, attachments = [] }) => {
   }
   try {
     await t.sendMail({
-      from: `"${process.env.COMPANY_NAME || 'Bela ERP'}" <${process.env.EMAIL_USER}>`,
+      from: `"${process.env.COMPANY_NAME || 'Workfola'}" <${process.env.EMAIL_USER}>`,
       to,
       subject,
       html,

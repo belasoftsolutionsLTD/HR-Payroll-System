@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bela-backend
+    name: workfola-backend
     runtime: node
     rootDir: backend
     plan: free

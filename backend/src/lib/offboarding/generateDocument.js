@@ -8,7 +8,7 @@ const DOC_DIR = path.join(
 );
 if (!fs.existsSync(DOC_DIR)) fs.mkdirSync(DOC_DIR, { recursive: true });
 
-const COMPANY_NAME = () => process.env.COMPANY_NAME || 'Bela ERP';
+const COMPANY_NAME = () => process.env.COMPANY_NAME || 'Workfola';
 const fmtDate = (d) => new Date(d).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' });
 
 const header = (doc) => {

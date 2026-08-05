@@ -35,7 +35,7 @@ function drawStar(doc, cx, cy, outerR, innerR, color) {
 // maybeGenerateCertificate, which loads those settings before calling this.
 const generateCertificatePDF = ({
   employeeName, courseTitle, completedAt, certificateNumber,
-  companyName = 'Bela ERP', brandColor, gradientEndColor, logoPath,
+  companyName = 'Workfola', brandColor, gradientEndColor, logoPath,
 }) => {
   return new Promise((resolve, reject) => {
     const brand = /^#[0-9a-fA-F]{6}$/.test(brandColor || '') ? brandColor : DEFAULT_BRAND;
