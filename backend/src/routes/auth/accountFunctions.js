@@ -183,7 +183,11 @@ const adminResetPassword = async (req, res) => {
 const changeOwnPassword = async (req, res) => {
   if (!validateRequiredFields(req, res, ['newPassword'])) return;
 
-  const { currentPassword, newPassword } = req.body;
+  // Trimmed — a temp/reset password pasted from an emailed credentials message
+  // routinely picks up a stray leading/trailing space from the mail client, which
+  // otherwise surfaces as a confusing "Current password is incorrect."
+  const currentPassword = String(req.body.currentPassword || '').trim();
+  const newPassword = String(req.body.newPassword || '').trim();
   const user = await findOne('users', { _id: new ObjectId(req.user._id) });
   if (!user) return returnFunction(res, 404, false, 'User not found.');
 

@@ -49,6 +49,7 @@ const createWorkOrder = async (req, res) => {
     status: 'open',
     scheduledDate: req.body.scheduledDate ? new Date(req.body.scheduledDate) : null,
     completedDate: null,
+    serviceBay: req.body.serviceBay || null,
     partsUsed: [],
     laborCost: 0,
     otherCost: 0,

@@ -36,7 +36,12 @@ const login = async (req, res) => {
 
   if (!validateRequiredFields(req, res, ['email', 'password'])) return;
 
-  const { email, password } = req.body;
+  const { email } = req.body;
+  // A password pasted from an emailed-credentials message very commonly picks up a
+  // stray leading/trailing space (mail-client copy behavior, not something a user did
+  // wrong) — trimming here means that never surfaces as a confusing "wrong password."
+  // No real password legitimately depends on leading/trailing whitespace.
+  const password = String(req.body.password || '').trim();
 
   // No-op until TURNSTILE_SECRET_KEY is configured (see verifyTurnstile) — the existing
   // loginLimiter (5 attempts/15min) already throttles brute force; this adds bot/scripted-
@@ -194,7 +199,8 @@ const forgotPassword = async (req, res) => {
 const resetPassword = async (req, res) => {
   if (!validateRequiredFields(req, res, ['token', 'newPassword'])) return;
 
-  const { token, newPassword } = req.body;
+  const { token } = req.body;
+  const newPassword = String(req.body.newPassword || '').trim();
   if (newPassword.length < 8) return returnFunction(res, 400, false, 'Password must be at least 8 characters.');
 
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');

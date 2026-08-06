@@ -22,6 +22,7 @@ const {
 } = require('./logisticsShipmentsFunctions');
 const {
   listVehicleTypes, createVehicleType, deleteVehicleType,
+  listServiceBays, createServiceBay, deleteServiceBay,
 } = require('./logisticsSettingsFunctions');
 const { getLogisticsAccessLevel } = require('../../lib/logistics/logisticsAccess');
 const returnFunction = require('../../functions/returnFunction');
@@ -64,6 +65,9 @@ router.get('/fleet/utilization',        allowRoles(ANY), AsyncHandler(getFleetUt
 router.get('/vehicle-types',            allowRoles(ANY), AsyncHandler(listVehicleTypes));
 router.post('/vehicle-types',           allowRoles(ANY), AsyncHandler(createVehicleType));
 router.delete('/vehicle-types/:id',     allowRoles(ANY), AsyncHandler(deleteVehicleType));
+router.get('/service-bays',             allowRoles(ANY), AsyncHandler(listServiceBays));
+router.post('/service-bays',            allowRoles(ANY), AsyncHandler(createServiceBay));
+router.delete('/service-bays/:id',      allowRoles(ANY), AsyncHandler(deleteServiceBay));
 
 // ── Fleet: maintenance work orders ───────────────────────────────────────────
 router.get('/work-orders',              allowRoles(ANY), AsyncHandler(listWorkOrders));

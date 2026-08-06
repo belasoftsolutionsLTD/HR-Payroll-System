@@ -166,7 +166,7 @@ const listEmployees = async (req, res) => {
   const projection = req.user.role === 'department_head' ? { password: 0, ...SENSITIVE_PROJECTION } : { password: 0 };
   const [total, data] = await Promise.all([
     countDocuments('employees', filter),
-    findMany('employees', filter, { skip, limit, sort: { createdAt: -1 }, projection }),
+    findMany('employees', filter, { skip, limit, sort: { fullName: 1 }, projection }),
   ]);
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, total, page, limit));
 };
@@ -233,6 +233,12 @@ const createEmployee = async (req, res) => {
   const existing = await findOne('employees', { nationalId: req.body.nationalId });
   if (existing) return returnFunction(res, 409, false, 'An employee with this National ID already exists.');
 
+  // employees.email has a unique index — without this pre-check a duplicate falls
+  // through to a raw MongoDB E11000 error, which the generic error handler turns into
+  // an opaque "Internal Server Error" (meaningless to a non-technical user).
+  const existingEmail = await findOne('employees', { email: String(req.body.email).trim().toLowerCase() });
+  if (existingEmail) return returnFunction(res, 409, false, 'An employee with this email already exists.');
+
   const hireYear = new Date(req.body.dateOfHire).getFullYear();
   const staffNumber = await generateStaffNumber(hireYear);
 
@@ -271,7 +277,7 @@ const createEmployee = async (req, res) => {
     paypalEmail: req.body.paypalEmail || null,
     cryptoWalletAddress: req.body.cryptoWalletAddress || null,
     cryptoNetwork: req.body.cryptoNetwork || null,
-    email: req.body.email,
+    email: String(req.body.email).trim().toLowerCase(),
     phone: req.body.phone || null,
     nextOfKin: req.body.nextOfKin || null,
     profilePhoto: null,
@@ -346,6 +352,16 @@ const updateEmployee = async (req, res) => {
   }
   const existing = await findOne('employees', { _id: new ObjectId(req.params.id) });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
+
+  // Same crash this collection's unique email index would otherwise cause on
+  // createEmployee — editing an employee's email to one already in use must fail with
+  // a real message, not an unhandled E11000 turned into "Internal Server Error."
+  if (req.body.email) {
+    const normalizedEmail = String(req.body.email).trim().toLowerCase();
+    const emailTaken = await findOne('employees', { email: normalizedEmail, _id: { $ne: existing._id } });
+    if (emailTaken) return returnFunction(res, 409, false, 'An employee with this email already exists.');
+    req.body.email = normalizedEmail;
+  }
 
   const update = { ...req.body, updatedAt: new Date() };
   delete update._id;

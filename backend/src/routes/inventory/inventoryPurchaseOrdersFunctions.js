@@ -145,7 +145,7 @@ const sendPurchaseOrder = async (req, res) => {
 
   const [supplier, location, itemDocs] = await Promise.all([
     findOne('inventory_suppliers', { _id: po.supplierId }),
-    findOne('inventory_locations', { _id: po.locationId }, { projection: { name: 1 } }),
+    findOne('inventory_locations', { _id: po.locationId }, { projection: { name: 1, address: 1 } }),
     findMany('inventory_items', { _id: { $in: po.items.map((l) => l.itemId) } }, { projection: { sku: 1, name: 1, unitOfMeasure: 1 } }),
   ]);
 
@@ -173,7 +173,7 @@ const sendPurchaseOrder = async (req, res) => {
     sendEmail({
       to: supplier.email,
       subject: `Purchase Order ${po.poNumber}`,
-      html: `<p>Dear ${supplier.contactPerson || supplier.name},</p><p>Please find below purchase order <strong>${po.poNumber}</strong>${location?.name ? `, for delivery to <strong>${location.name}</strong>` : ''}${po.expectedDeliveryDate ? `, expected by <strong>${new Date(po.expectedDeliveryDate).toLocaleDateString()}</strong>` : ''} — a PDF copy is attached for your records.</p><table cellpadding="6" style="border-collapse:collapse;width:100%"><thead><tr style="text-align:left;border-bottom:1px solid #ccc"><th>Item</th><th>Qty</th><th>Unit Cost</th><th>Line Total</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Order total: ${orderTotal.toLocaleString()}</strong></p><p>Please confirm receipt and let us know if you have any questions.</p>`,
+      html: `<p>Dear ${supplier.contactPerson || supplier.name},</p><p>Please find below purchase order <strong>${po.poNumber}</strong>${location?.name ? `, for delivery to <strong>${location.name}</strong>` : ''}${po.expectedDeliveryDate ? `, expected by <strong>${new Date(po.expectedDeliveryDate).toLocaleDateString()}</strong>` : ''} — a PDF copy is attached for your records.</p>${location?.address ? `<p><strong>Delivery address:</strong> ${location.address}</p>` : ''}<table cellpadding="6" style="border-collapse:collapse;width:100%"><thead><tr style="text-align:left;border-bottom:1px solid #ccc"><th>Item</th><th>Qty</th><th>Unit Cost</th><th>Line Total</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Order total: ${orderTotal.toLocaleString()}</strong></p><p>Please confirm receipt and let us know if you have any questions.</p>`,
       attachments,
     }).catch(() => {});
   }

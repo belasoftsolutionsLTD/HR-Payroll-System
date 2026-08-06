@@ -66,11 +66,38 @@ const createShipment = async (req, res) => {
     sourceId = sale._id;
   }
 
+  // Optional route/stop assignment — schema has always had these fields, but nothing
+  // ever let a caller set them, so every shipment was invisible to a driver's own
+  // scoped view (listShipments filters drivers to routeId $in their own routes) and
+  // had no way to say *which* delivery run it actually travels on.
+  let routeId = null;
+  let stopId = null;
+  if (req.body.routeId) {
+    const route = await findOne('logistics_routes', { _id: new ObjectId(req.body.routeId) });
+    if (!route) return returnFunction(res, 400, false, 'Route not found.');
+    routeId = route._id;
+    if (req.body.stopId) {
+      const stop = (route.stops || []).find((s) => s.id === req.body.stopId);
+      if (!stop) return returnFunction(res, 400, false, 'That stop does not belong to the selected route.');
+      stopId = stop.id;
+    }
+  }
+
+  const expectedDeliveryDate = req.body.expectedDeliveryDate ? new Date(req.body.expectedDeliveryDate) : null;
+  // A shipment "expected" in the past isn't meaningful — same reasoning as blocking
+  // past-dated interviews/offers earlier in this batch.
+  if (expectedDeliveryDate) {
+    const todayStart = new Date(new Date().toDateString());
+    if (Number.isNaN(expectedDeliveryDate.getTime()) || expectedDeliveryDate < todayStart) {
+      return returnFunction(res, 400, false, 'Expected delivery date cannot be in the past.');
+    }
+  }
+
   const doc = {
     sourceType, sourceId,
     status: 'pending',
-    routeId: null, stopId: null,
-    expectedDeliveryDate: req.body.expectedDeliveryDate ? new Date(req.body.expectedDeliveryDate) : null,
+    routeId, stopId,
+    expectedDeliveryDate,
     actualDeliveryDate: null,
     exceptionReason: null, exceptionResolution: null, exceptionResolvedAt: null,
     department: req.body.department || null,

@@ -43,7 +43,11 @@ const generatePurchaseOrderPDF = (po, supplier, location, itemById, branding = {
     if (location?.name) {
       doc.moveUp(supplier?.phone ? 4 : supplier?.email ? 3 : 2);
       doc.font('Helvetica-Bold').fillColor('#0f172a').text('Deliver to', 350, doc.y);
-      doc.font('Helvetica').fillColor('#334155').text(location.name, 350);
+      doc.font('Helvetica').fillColor('#334155').text(location.name, 350, doc.y, { width: 195 });
+      // A location name alone ("Nairobi") isn't enough for a driver to actually find
+      // it — the supplier needs the real address the same way they'd need one on any
+      // delivery note.
+      if (location.address) doc.text(location.address, 350, doc.y, { width: 195 });
     }
 
     doc.moveDown(2);
