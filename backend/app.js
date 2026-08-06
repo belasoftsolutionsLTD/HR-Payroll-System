@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express    = require('express');
 const cors       = require('cors');
+const helmet     = require('helmet');
 const mongoSanitize = require('express-mongo-sanitize');
 
 const validateEnv = require('./src/lib/validateEnv');
@@ -60,7 +61,38 @@ const path = require('path');
 const app = express();
 
 // ── Core middleware ──────────────────────────────────────────────────────────
-app.use(cors());
+// Standard hardening headers (clickjacking protection, MIME-sniffing protection,
+// HSTS, etc.) — this is a pure JSON+file API with no server-rendered HTML, so
+// helmet's default Content-Security-Policy is a no-op rather than something that
+// needs tuning. crossOriginResourcePolicy is relaxed from helmet's 'same-origin'
+// default to 'cross-origin': in production the frontend and this API happen to sit
+// behind the same nginx host, but dev (localhost:3000 → localhost:5000) genuinely is
+// cross-origin, and this API is meant to be called cross-origin regardless — that's
+// what the CORS allowlist just above already governs correctly.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// Behind nginx on Contabo — without this, Express (and express-rate-limit's IP-based
+// login throttling) sees nginx's own address as the "client" for every request instead
+// of the real visitor, since it doesn't trust X-Forwarded-For by default.
+app.set('trust proxy', 1);
+
+// A bare cors() reflects and allows *any* origin — any website's JavaScript could call
+// this API. Locked to the real frontend(s) only; requests with no Origin header (curl,
+// server-to-server, the deploy health check) are never blocked, since CORS is purely a
+// browser-enforced concept and doesn't apply to those.
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,
+  'https://workfola.com',
+  'https://www.workfola.com',
+].filter(Boolean);
+app.use(cors({
+  // CORS is enforced by the browser refusing to expose the response to page JS based
+  // on the Access-Control-Allow-Origin header — it was never a server-side access
+  // gate. Passing `false` here (not throwing) just omits that header for a
+  // disallowed origin; the request still completes normally underneath, same as any
+  // non-browser caller (curl, server-to-server) always ignores CORS entirely.
+  origin: (origin, callback) => callback(null, !origin || ALLOWED_ORIGINS.includes(origin)),
+}));
 app.use(express.json());
 
 // Strip MongoDB operators ($where, $gt, etc.) from req.body / req.query / req.params

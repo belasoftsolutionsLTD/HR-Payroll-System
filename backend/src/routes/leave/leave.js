@@ -18,6 +18,7 @@ const {
   listBlackouts, addBlackout, deleteBlackout,
   getMyLeaveTypeOptions, getMyBalances, getMyRequests, getMyRequestDetail, uploadMyAttachment, getMyCalendar,
 } = require('./leaveFunctions');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 
 const hrOnly = allowRoles(HR_ROLES);
 const mgmtOnly = allowRoles(MGMT_ROLES);
@@ -26,7 +27,7 @@ const allRoles = allowRoles(ALL_ROLES);
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-    filename: (req, file, cb) => cb(null, `leave-attachment-${Date.now()}-${file.originalname}`),
+    filename: (req, file, cb) => cb(null, `leave-attachment-${Date.now()}-${sanitizeFilename(file.originalname)}`),
   }),
   limits: { fileSize: 10 * 1024 * 1024 },
 });

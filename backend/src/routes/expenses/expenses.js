@@ -10,6 +10,7 @@ const {
   markReimbursed, exportClaims, getAnalytics, getPolicy, updatePolicy, calculateDistance,
   listPolicies, createPolicy, getPolicyById, updatePolicyById, deletePolicyById,
 } = require('./expenseClaimsFunctions');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 
 // diskStorage + timestamp-prefixed-original-filename, matching the convention used
 // everywhere else in the app (training.js, employees.js, messages.js, etc). The old
@@ -19,7 +20,7 @@ const {
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${sanitizeFilename(file.originalname)}`),
   }),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max for receipts
   fileFilter: (req, file, cb) => {

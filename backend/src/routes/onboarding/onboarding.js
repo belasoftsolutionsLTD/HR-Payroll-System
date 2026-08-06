@@ -4,6 +4,7 @@ const multer = require('multer');
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const { HR_ROLES, ALL_ROLES } = require('../../constants/roles');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 const {
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, uploadTemplateResource,
   createRecord, listRecords, getRecord, updateRecordTask, addRecordTask, updateWelcome,
@@ -18,7 +19,7 @@ const allRoles = allowRoles(ALL_ROLES);
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-    filename: (req, file, cb) => cb(null, `onboarding-doc-${Date.now()}-${file.originalname}`),
+    filename: (req, file, cb) => cb(null, `onboarding-doc-${Date.now()}-${sanitizeFilename(file.originalname)}`),
   }),
   limits: { fileSize: 10 * 1024 * 1024 },
 });
@@ -26,7 +27,7 @@ const upload = multer({
 const resourceUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-    filename: (req, file, cb) => cb(null, `template-resource-${Date.now()}-${file.originalname}`),
+    filename: (req, file, cb) => cb(null, `template-resource-${Date.now()}-${sanitizeFilename(file.originalname)}`),
   }),
   limits: { fileSize: 10 * 1024 * 1024 },
 });

@@ -32,6 +32,14 @@ const getUserData = AsyncHandler(async (req, res, next) => {
     return returnFunction(res, 403, false, 'Your account has been deactivated. Contact HR.');
   }
 
+  // Reject a still-time-valid token whose version doesn't match the user's current
+  // one — this is what actually revokes access tokens on password change/reset (see
+  // _issueTokens in authFunctions.js), since JWTs are otherwise stateless and would
+  // keep working until their own expiry regardless of a password change.
+  if ((req.tempUser.tokenVersion || 0) !== (user.tokenVersion || 0)) {
+    return returnFunction(res, 401, false, 'Session expired. Please log in again.');
+  }
+
   // Attach full user including employeeId and mustResetPassword for downstream middleware
   req.user = {
     ...user,

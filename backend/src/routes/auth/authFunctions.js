@@ -14,8 +14,15 @@ const COMPANY_NAME = process.env.COMPANY_NAME || 'Workfola';
 const REFRESH_TTL_DAYS = parseInt(process.env.REFRESH_TOKEN_DAYS || '30');
 
 const _issueTokens = async (user) => {
+  // tokenVersion is embedded so a still-time-valid access token can be revoked before
+  // its natural expiry — getUserData (AuthMiddleware.js) rejects any token whose
+  // version doesn't match the user's current one. Password changes/resets bump this,
+  // which is what actually closes the "changed my password after a leak, but my old
+  // token still works for hours/days" gap — clearing refreshTokenHash alone (the
+  // pre-existing behavior) only ever stopped *future* refreshes, not an already-issued
+  // access token already in someone else's hands.
   const accessToken = jwt.sign(
-    { userId: user._id.toString() },
+    { userId: user._id.toString(), tokenVersion: user.tokenVersion || 0 },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
   );
@@ -215,6 +222,10 @@ const resetPassword = async (req, res) => {
   await updateOne('users', { _id: user._id }, {
     $set:   { password: hashed, mustResetPassword: false, updatedAt: new Date() },
     $unset: { passwordResetToken: '', passwordResetExpires: '', refreshTokenHash: '', refreshTokenExpiresAt: '' },
+    // Revokes any access token issued before this reset — the exact scenario a forgot-
+    // password flow exists for (an account may have been compromised) needs the old
+    // session killed immediately, not just left to expire on its own.
+    $inc: { tokenVersion: 1 },
   });
 
   return returnFunction(res, 200, true, 'Password reset successfully. Please log in.');

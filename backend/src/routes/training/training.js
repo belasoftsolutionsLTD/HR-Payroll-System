@@ -25,6 +25,7 @@ const {
 } = require('./trainingFunctions');
 
 const { SUPER_ADMIN, HR_MANAGER, ALL_ROLES } = require('../../constants/roles');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 const HR = [SUPER_ADMIN, HR_MANAGER];
 
 // ── Multer for module content uploads (documents/videos) ─────────────────────
@@ -37,7 +38,7 @@ if (!fs.existsSync(trainingUploadDir)) fs.mkdirSync(trainingUploadDir, { recursi
 const upload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, trainingUploadDir),
-    filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+    filename: (_req, file, cb) => cb(null, `${Date.now()}-${sanitizeFilename(file.originalname)}`),
   }),
   limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {

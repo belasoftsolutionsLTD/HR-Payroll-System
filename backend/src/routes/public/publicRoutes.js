@@ -17,10 +17,14 @@ const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const AsyncHandler = require('../../middleware/AsyncHandler');
 const { serveCompanyLogo } = require('../config/companySettingsFunctions');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-  filename: (req, file, cb) => cb(null, `resume-${Date.now()}-${file.originalname}`),
+  // sanitizeFilename strips any path-traversal sequences from the client-supplied
+  // name — this endpoint needs no login at all, so it's the single most important
+  // place in the app for this fix (see sanitizeFilename.js for the full writeup).
+  filename: (req, file, cb) => cb(null, `resume-${Date.now()}-${sanitizeFilename(file.originalname)}`),
 });
 const upload = multer({
   storage,

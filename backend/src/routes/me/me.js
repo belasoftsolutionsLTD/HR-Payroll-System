@@ -21,12 +21,13 @@ const {
 } = require('./meFunctions');
 const { getMyAnnouncements, markAnnouncementRead } = require('../announcements/announcementFunctions');
 const { getMyWelfare } = require('../welfare/welfareFunctions');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 
 const auth = allowRoles(ALL_ROLES);
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${sanitizeFilename(file.originalname)}`),
 });
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10 MB
 

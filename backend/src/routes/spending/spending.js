@@ -18,6 +18,7 @@ const {
   listVendorInvoices, getVendorInvoice, createVendorInvoice, matchVendorInvoice, approveVendorInvoice, disputeVendorInvoice, payVendorInvoice,
   getProcurementOverview, getProcurementSpend, getVendorAnalytics, getCycleTimeAnalytics,
 } = require('./spendingFunctions');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 
 const hrOnly    = allowRoles(HR_ROLES);
 const deptHeadUp = allowRoles([...MGMT_ROLES]); // super_admin/hr_manager/department_head
@@ -28,7 +29,7 @@ const allRoles  = allowRoles(ALL_ROLES);
 const vendorDocUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${sanitizeFilename(file.originalname)}`),
   }),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {

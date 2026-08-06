@@ -12,6 +12,7 @@ const {
   updateEmergencyContacts,
   getHeadcountAnalytics, getTurnoverAnalytics, getTenureAnalytics, getDemographicsAnalytics, getUpcomingAnalytics,
 } = require('./employeesFunctions');
+const { sanitizeFilename } = require('../../lib/files/sanitizeFilename');
 
 const SUPER_ADMIN  = 'super_admin';
 const HR_MANAGER   = 'hr_manager';
@@ -19,7 +20,7 @@ const DEPT_HEAD    = 'department_head';
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, process.env.UPLOAD_DIR || 'uploads'),
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${sanitizeFilename(file.originalname)}`),
 });
 const upload = multer({
   storage,

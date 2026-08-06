@@ -159,6 +159,11 @@ const adminResetPassword = async (req, res) => {
   await updateOne('users', { _id: user._id }, {
     $set:   { password: hashed, mustResetPassword: true, updatedAt: new Date() },
     $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
+    // Revokes any access token already issued to this account — see the tokenVersion
+    // check in AuthMiddleware.js. Without this, an admin-forced password reset (e.g.
+    // because the account was thought to be compromised) wouldn't actually kick out
+    // whoever's currently using it until their token's own natural expiry.
+    $inc: { tokenVersion: 1 },
   });
 
   sendEmail({
@@ -203,8 +208,11 @@ const changeOwnPassword = async (req, res) => {
   const hashed = await bcrypt.hash(newPassword, 12);
   await updateOne('users', { _id: user._id }, {
     $set:   { password: hashed, mustResetPassword: false, updatedAt: new Date() },
-    // Invalidate all existing sessions — forces re-login on all devices
+    // Invalidate all existing sessions — forces re-login on all devices. tokenVersion
+    // is what makes this actually true for a still-time-valid access token too, not
+    // just future refreshes (see AuthMiddleware.js).
     $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
+    $inc: { tokenVersion: 1 },
   });
 
   return returnFunction(res, 200, true, 'Password updated successfully.');
