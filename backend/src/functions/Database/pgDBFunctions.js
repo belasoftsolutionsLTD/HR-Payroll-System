@@ -34,7 +34,13 @@ const newId = () => new ObjectId().toString();
 // (ids were deliberately kept as unchanged ObjectId-hex strings across the whole
 // migration). New, Postgres-aware code should prefer `.id` (the plain string); `._id`
 // is a compatibility bridge for the straddling period, not the long-term API.
-const withMongoId = (row) => (row && row.id !== undefined ? { ...row, _id: new ObjectId(row.id) } : row);
+// Most ids are Mongo-ObjectId-hex strings and this aliasing "just works" — but a
+// handful of deliberately hand-picked singleton keys (e.g. attendance_settings' own
+// id, always the literal 'singleton') aren't ObjectId-shaped at all. Skip the alias
+// rather than throw for those; nothing that reads a singleton row needs a Mongo `_id`
+// on it anyway (no not-yet-migrated collection cross-references a settings row by id).
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+const withMongoId = (row) => (row && row.id !== undefined && OBJECT_ID_RE.test(row.id) ? { ...row, _id: new ObjectId(row.id) } : row);
 const withMongoIdMany = (rows) => rows.map(withMongoId);
 
 const findOne = async (table, where = {}) => {

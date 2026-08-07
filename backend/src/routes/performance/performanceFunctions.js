@@ -2,6 +2,10 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, aggregate } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 3b) —
+// attendance_records now lives in Postgres; this file's other collections are unmigrated
+// and stay on the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -767,9 +771,7 @@ const getAttendanceSummaryForReview = async (employeeId) => {
   since.setDate(since.getDate() - 90);
   const sinceStr = since.toISOString().slice(0, 10);
 
-  const records = await global.dbo.collection('attendance_records')
-    .find({ employeeId, date: { $gte: sinceStr } })
-    .toArray();
+  const records = await pgDB.knex('attendance_records').where({ employeeId: String(employeeId) }).where('date', '>=', sinceStr);
 
   let present = 0, late = 0, absent = 0;
   for (const r of records) {

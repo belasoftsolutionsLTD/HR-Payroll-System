@@ -2,10 +2,10 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany, countDocuments } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
-// employees/users (Phase 1) and leave_balances/leave_requests/leave_types/
-// public_holidays (Phase 3a) now live in Postgres. Everything this file still touches
-// that HASN'T been migrated yet (expense_claims, goals, job_postings, payroll_runs,
-// communication_posts, scheduled_events, attendance_records, inbox_items, shifts) stays
+// employees/users (Phase 1), leave_balances/leave_requests/leave_types/public_holidays
+// (Phase 3a), and attendance_records/shifts (Phase 3b) now live in Postgres. Everything
+// this file still touches that HASN'T been migrated yet (expense_claims, goals,
+// job_postings, payroll_runs, communication_posts, scheduled_events, inbox_items) stays
 // on the Mongo helpers above.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 
@@ -55,8 +55,8 @@ const getDashboardSummary = async (req, res) => {
     // Missing clock-in (active team members with no attendance record today)
     let missingClockIn = 0;
     if (dept) {
-      const clockedIn = await global.dbo.collection('attendance_records')
-        .countDocuments({ date: todayStr, employeeId: { $in: teamIds.map((id) => new ObjectId(id)) }, checkInTime: { $ne: null } });
+      const clockedIn = await pgDB.knex('attendance_records').where({ date: todayStr }).whereIn('employeeId', teamIds).whereNotNull('checkInTime')
+        .count('* as count').first().then((r) => Number(r.count));
       missingClockIn = Math.max(0, teamIds.length - clockedIn);
     }
 
@@ -158,13 +158,21 @@ const getCelebrations = async (req, res) => {
 // ── Live attendance (HR/Admin only) ──────────────────────────────────────────
 const getLiveAttendance = async (req, res) => {
   const todayStr = today();
-  const [totalActive, records] = await Promise.all([
+  const [totalActive, rawRecords] = await Promise.all([
     pgDB.knex('employees').where({ status: 'active' }).count('* as count').first().then(r => Number(r.count)),
-    global.dbo.collection('attendance_records').find({ date: todayStr }).toArray(),
+    pgDB.knex('attendance_records').where({ date: todayStr }),
   ]);
+  // breaks is its own child table now (Phase 3b), not an embedded array — fetch open
+  // breaks in one query rather than one round-trip per record.
+  const openBreakEmployeeIds = rawRecords.length
+    ? new Set((await pgDB.knex('attendance_breaks')
+        .whereIn('attendanceRecordId', rawRecords.map((r) => r.id)).whereNull('endTime').select('attendanceRecordId'))
+        .map((b) => b.attendanceRecordId))
+    : new Set();
+  const records = rawRecords.map((r) => ({ ...r, hasOpenBreak: openBreakEmployeeIds.has(r.id) }));
 
-  const clockedIn = records.filter(r => r.checkInTime && !r.checkOutTime && !(r.breaks || []).find(b => !b.endTime)).length;
-  const onBreak   = records.filter(r => r.checkInTime && (r.breaks || []).find(b => !b.endTime)).length;
+  const clockedIn = records.filter(r => r.checkInTime && !r.checkOutTime && !r.hasOpenBreak).length;
+  const onBreak   = records.filter(r => r.checkInTime && r.hasOpenBreak).length;
   const clockedOut = records.filter(r => r.checkOutTime).length;
   const now = new Date();
   const onLeave   = await pgDB.knex('leave_requests').where({ status: 'approved' }).where('startDate', '<=', now).where('endDate', '>=', now).count('* as count').first().then(r => Number(r.count));
@@ -229,10 +237,12 @@ const getTodaySchedule = async (req, res) => {
   const holiday = await pgDB.findOne('public_holidays', { date: todayStr });
   if (holiday) return returnFunction(res, 200, true, 'ok', { type: 'holiday', name: holiday.name });
 
-  // Get assigned shift or default schedule. shifts is unmigrated — stays Mongo; employees'
-  // own shiftId lookup is Postgres.
+  // Get assigned shift or default schedule. shifts now lives in Postgres (Phase 3b).
+  // employees.shiftId isn't a real column (nothing in the employees schema ever set
+  // one — this always resolved to the fallback defaults below regardless), preserved
+  // as-is rather than invented.
   const emp = await pgDB.findOne('employees', { id: empId });
-  const shift = emp?.shiftId ? await findOne('shifts', { _id: new ObjectId(emp.shiftId) }) : null;
+  const shift = emp?.shiftId ? await pgDB.findOne('shifts', { id: String(emp.shiftId) }) : null;
 
   return returnFunction(res, 200, true, 'ok', {
     type: 'work',

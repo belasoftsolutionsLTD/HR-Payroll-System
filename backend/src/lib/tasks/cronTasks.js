@@ -172,27 +172,20 @@ async function dailyTaskJobs() {
   console.log(`[CRON] Daily task jobs done — overdue marked, ${newHires?.length ?? 0} onboarding triggers checked, ${dueTomorrow.length} reminders sent`);
 }
 
+// attendance_records now lives in Postgres (Phase 3b).
 async function detectMissedClockOuts() {
-  if (!global.dbo) return;
-
   // Find attendance records where employee clocked in today but has no clock-out
   // after 12 hours — flag them as 'incomplete' and notify the employee
   const now = new Date();
   const cutoff = new Date(now.getTime() - 12 * 60 * 60 * 1000);
   const todayStr = now.toISOString().split('T')[0];
 
-  const missed = await global.dbo.collection('attendance_records').find({
-    date: todayStr,
-    checkInAt: { $lte: cutoff },
-    checkOutTime: null,
-    missedClockOutNotified: { $ne: true },
-  }).toArray();
+  const missed = await pgDB.knex('attendance_records')
+    .where({ date: todayStr }).where('checkInAt', '<=', cutoff).whereNull('checkOutTime')
+    .whereNot('missedClockOutNotified', true);
 
   for (const rec of missed) {
-    await global.dbo.collection('attendance_records').updateOne(
-      { _id: rec._id },
-      { $set: { status: 'incomplete', missedClockOutNotified: true, updatedAt: now } }
-    );
+    await pgDB.knex('attendance_records').where({ id: rec.id }).update({ status: 'incomplete', missedClockOutNotified: true, updatedAt: now });
     notifyEmployee(rec.employeeId, {
       title: 'Missing clock-out',
       body:  'You clocked in earlier today but never clocked out. Please update your attendance.',
@@ -266,11 +259,11 @@ async function flipOffboardingEmployeeStatus() {
 // collection, regardless of what shift they were actually assigned. Grace-period
 // minutes still fall back to the default schedule since `shifts` doesn't carry its
 // own grace value yet.
+// attendance_records/shifts/work_schedules now live in Postgres (Phase 3b).
 async function markLateArrivals() {
-  if (!global.dbo) return;
   const todayStr = new Date().toISOString().split('T')[0];
 
-  const defaultSchedule = await global.dbo.collection('work_schedules').findOne({}) || {};
+  const defaultSchedule = (await pgDB.knex('work_schedules').first()) || {};
   const defaultStartTime = defaultSchedule.startTime || '09:00';
   const defaultGraceMins = Number(defaultSchedule.gracePeriod) || 15;
 
@@ -283,24 +276,19 @@ async function markLateArrivals() {
   };
   const defaultThreshold = thresholdStr(defaultStartTime, defaultGraceMins);
 
-  const candidates = await global.dbo.collection('attendance_records').find({
-    date: todayStr,
-    status: 'present',
-    lateMarked: { $ne: true },
-    checkInTime: { $exists: true, $ne: null },
-  }, { projection: { employeeId: 1, checkInTime: 1 } }).toArray();
+  const candidates = await pgDB.knex('attendance_records')
+    .where({ date: todayStr, status: 'present' }).whereNot('lateMarked', true).whereNotNull('checkInTime')
+    .select('id', 'employeeId', 'checkInTime');
 
   if (!candidates.length) return;
 
   const empIds = candidates.map((c) => c.employeeId);
-  const todayShifts = await global.dbo.collection('shifts').find({
-    employeeId: { $in: empIds }, date: todayStr,
-  }, { projection: { employeeId: 1, startTime: 1 } }).toArray();
-  const shiftByEmp = Object.fromEntries(todayShifts.map((s) => [String(s.employeeId), s]));
+  const todayShifts = await pgDB.knex('shifts').whereIn('employeeId', empIds).where({ date: todayStr }).select('employeeId', 'startTime');
+  const shiftByEmp = Object.fromEntries(todayShifts.map((s) => [s.employeeId, s]));
 
-  const ops = [];
+  let markedCount = 0;
   for (const rec of candidates) {
-    const shift = shiftByEmp[String(rec.employeeId)];
+    const shift = shiftByEmp[rec.employeeId];
     let threshold;
     if (shift?.startTime) {
       threshold = thresholdStr(shift.startTime, defaultGraceMins);
@@ -312,25 +300,19 @@ async function markLateArrivals() {
         : defaultThreshold;
     }
     if (rec.checkInTime > threshold) {
-      ops.push({
-        updateOne: {
-          filter: { _id: rec._id },
-          update: { $set: { status: 'late', lateMarked: true, updatedAt: new Date() } },
-        },
-      });
+      await pgDB.knex('attendance_records').where({ id: rec.id }).update({ status: 'late', lateMarked: true, updatedAt: new Date() });
+      markedCount++;
     }
   }
 
-  if (ops.length) {
-    const result = await global.dbo.collection('attendance_records').bulkWrite(ops);
-    console.log(`[CRON] Marked ${result.modifiedCount} employee(s) as late for ${todayStr} (per-shift thresholds)`);
+  if (markedCount > 0) {
+    console.log(`[CRON] Marked ${markedCount} employee(s) as late for ${todayStr} (per-shift thresholds)`);
   }
 }
 
 // Auto-mark absent for active employees with no attendance record by end of work day
 // Runs at 18:00 EAT (15:00 UTC)
 async function autoMarkAbsent() {
-  if (!global.dbo) return;
   const now = new Date();
   const todayStr = now.toISOString().split('T')[0];
 
@@ -338,49 +320,37 @@ async function autoMarkAbsent() {
   const dow = now.getDay();
   if (dow === 0 || dow === 6) return;
 
-  // Get all active employees. employees now lives in Postgres (Phase 1); empObjectIds
-  // is kept alongside the plain-string empIds for the still-Mongo attendance_records
-  // queries/writes below.
+  // employees/leave_requests/attendance_records all now live in Postgres (Phases 1/3a/3b).
   const activeEmps = await pgDB.knex('employees').where({ status: 'active' }).select('id');
   if (!activeEmps.length) return;
   const empIds = activeEmps.map(e => e.id);
-  const empObjectIds = empIds.map((id) => new ObjectId(id));
 
   // Find employees who already have a record today
-  const existing = await global.dbo.collection('attendance_records')
-    .find({ date: todayStr, employeeId: { $in: empObjectIds } }, { projection: { employeeId: 1 } })
-    .toArray();
-  const hasRecord = new Set(existing.map(r => String(r.employeeId)));
+  const existing = await pgDB.knex('attendance_records').where({ date: todayStr }).whereIn('employeeId', empIds).select('employeeId');
+  const hasRecord = new Set(existing.map(r => r.employeeId));
 
-  // Employees on approved leave today are not absent. leave_requests now lives in
-  // Postgres (Phase 3a).
+  // Employees on approved leave today are not absent.
   const onLeave = await pgDB.knex('leave_requests')
     .whereIn('employeeId', empIds).where({ status: 'approved' })
     .where('startDate', '<=', now).where('endDate', '>=', now)
     .select('employeeId');
   const onLeaveIds = new Set(onLeave.map(l => l.employeeId));
 
-  const noRecordIds = empObjectIds.filter(id => !hasRecord.has(String(id)));
-  const absentIds = noRecordIds.filter(id => !onLeaveIds.has(String(id)));
-  const onLeaveNoRecordIds = noRecordIds.filter(id => onLeaveIds.has(String(id)));
+  const noRecordIds = empIds.filter(id => !hasRecord.has(id));
+  const absentIds = noRecordIds.filter(id => !onLeaveIds.has(id));
+  const onLeaveNoRecordIds = noRecordIds.filter(id => onLeaveIds.has(id));
 
   if (!absentIds.length && !onLeaveNoRecordIds.length) return;
 
   const docs = [
-    ...absentIds.map(id => ({ employeeId: id, date: todayStr, status: 'absent', autoMarked: true, createdAt: now, updatedAt: now })),
-    ...onLeaveNoRecordIds.map(id => ({ employeeId: id, date: todayStr, status: 'onLeave', autoMarked: true, createdAt: now, updatedAt: now })),
+    ...absentIds.map(id => ({ id: pgDB.newId(), employeeId: id, date: todayStr, status: 'absent', autoMarked: true, createdAt: now, updatedAt: now })),
+    ...onLeaveNoRecordIds.map(id => ({ id: pgDB.newId(), employeeId: id, date: todayStr, status: 'onLeave', autoMarked: true, createdAt: now, updatedAt: now })),
   ];
 
-  // bulkWrite to avoid duplicates (in case of reruns)
-  await global.dbo.collection('attendance_records').bulkWrite(
-    docs.map(doc => ({
-      updateOne: {
-        filter: { employeeId: doc.employeeId, date: todayStr },
-        update: { $setOnInsert: doc },
-        upsert: true,
-      },
-    }))
-  );
+  // Insert-only-if-absent, matching the old $setOnInsert+upsert semantics exactly — a
+  // race with a real clock-in on the same (employeeId, date) between the read above and
+  // this write must never overwrite it.
+  await pgDB.knex('attendance_records').insert(docs).onConflict(['employeeId', 'date']).ignore();
 
   if (absentIds.length) console.log(`[CRON] Auto-marked ${absentIds.length} employee(s) as absent for ${todayStr}`);
   if (onLeaveNoRecordIds.length) console.log(`[CRON] Auto-marked ${onLeaveNoRecordIds.length} employee(s) as onLeave for ${todayStr}`);

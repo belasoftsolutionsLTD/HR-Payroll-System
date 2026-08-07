@@ -456,6 +456,123 @@ async function main() {
       departments: b.departments || [], createdBy: idStr(b.createdBy), createdAt: toDate(b.createdAt),
     })));
 
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase 3b — attendance: records (+ breaks child table), work schedules,
+    // shift task templates, shifts (+ tasks/notes/applications), employee
+    // schedule assignments, timesheets, attendance settings.
+    // ══════════════════════════════════════════════════════════════════════
+
+    // Real data has a handful of exact-duplicate (employeeId, date) pairs (a race in
+    // autoMarkAbsent's bulkWrite upsert, confirmed live — same status, created
+    // milliseconds apart) that would violate the new unique constraint the app's own
+    // upsert-by-(employeeId,date) pattern needs going forward. Dedupe by keeping the
+    // most recently updated row per pair — safe here since every found duplicate pair
+    // was functionally identical, not divergent data.
+    const rawAttendanceRecords = await dbo.collection('attendance_records').find({}).toArray();
+    const attendanceRecordsByKey = new Map();
+    for (const r of rawAttendanceRecords) {
+      const key = `${idStr(r.employeeId)}|${r.date}`;
+      const existing = attendanceRecordsByKey.get(key);
+      if (!existing || new Date(r.updatedAt || r.createdAt || 0) >= new Date(existing.updatedAt || existing.createdAt || 0)) {
+        attendanceRecordsByKey.set(key, r);
+      }
+    }
+    const attendanceRecords = [...attendanceRecordsByKey.values()];
+    counts.attendance_records = await upsertBatched('attendance_records', attendanceRecords.map((r) => ({
+      id: idStr(r._id), employeeId: idStr(r.employeeId), date: r.date, status: r.status ?? null,
+      checkInTime: r.checkInTime ?? null, checkOutTime: r.checkOutTime ?? null,
+      checkInAt: toDate(r.checkInAt), checkOutAt: toDate(r.checkOutAt),
+      checkInLat: r.checkInLat ?? null, checkInLng: r.checkInLng ?? null,
+      checkOutLat: r.checkOutLat ?? null, checkOutLng: r.checkOutLng ?? null,
+      checkInLocation: r.checkInLocation ?? null, checkOutLocation: r.checkOutLocation ?? null,
+      location: r.location ?? null, mode: r.mode ?? null,
+      selfMarked: r.selfMarked ?? false, isManualEntry: r.isManualEntry ?? false, markedBy: idStr(r.markedBy),
+      notes: r.notes ?? null, totalWorkMinutes: r.totalWorkMinutes ?? null, totalBreakMinutes: r.totalBreakMinutes ?? null,
+      regularMinutes: r.regularMinutes ?? null, overtimeMinutes: r.overtimeMinutes ?? null, overtimeHours: r.overtimeHours ?? null,
+      overtimeBreakdown: r.overtimeBreakdown ? JSON.stringify(r.overtimeBreakdown) : null, payCategory: r.payCategory ?? null,
+      lateMarked: r.lateMarked ?? false, missedClockOutNotified: r.missedClockOutNotified ?? false, autoMarked: r.autoMarked ?? false,
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // attendance_breaks uses an auto-increment id (plain array elements in Mongo) —
+    // delete-then-insert per record, same convention as Phase 1's employee_skills.
+    const breakRows = attendanceRecords.flatMap((r) => (r.breaks || []).map((b) => ({
+      attendanceRecordId: idStr(r._id), startTime: toDate(b.startTime), endTime: toDate(b.endTime), duration: b.duration ?? null,
+    })));
+    if (!DRY_RUN) {
+      for (const r of attendanceRecords) {
+        await knex('attendance_breaks').where({ attendanceRecordId: idStr(r._id) }).del();
+      }
+    }
+    counts.attendance_breaks = await upsertBatched('attendance_breaks', breakRows, null);
+
+    const workSchedules = await dbo.collection('work_schedules').find({}).toArray();
+    counts.work_schedules = await upsertBatched('work_schedules', workSchedules.map((s) => ({
+      id: idStr(s._id), name: s.name, workDays: s.workDays || [], startTime: s.startTime ?? null, endTime: s.endTime ?? null,
+      breakMinutes: s.breakMinutes ?? null, weeklyHours: s.weeklyHours ?? null, gracePeriod: s.gracePeriod ?? null,
+      createdBy: idStr(s.createdBy), createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const shiftTaskTemplates = await dbo.collection('shift_task_templates').find({}).toArray();
+    counts.shift_task_templates = await upsertBatched('shift_task_templates', shiftTaskTemplates.map((s) => ({
+      id: idStr(s._id), name: s.name, tasks: s.tasks || [], isActive: s.isActive ?? true,
+      createdBy: idStr(s.createdBy), createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const shifts = await dbo.collection('shifts').find({}).toArray();
+    counts.shifts = await upsertBatched('shifts', shifts.map((s) => ({
+      id: idStr(s._id), employeeId: idStr(s.employeeId), date: s.date, shiftType: s.shiftType ?? null,
+      startTime: s.startTime ?? null, endTime: s.endTime ?? null, breakMinutes: s.breakMinutes ?? null,
+      location: s.location ?? null, address: s.address ?? null, addressLat: s.addressLat ?? null, addressLng: s.addressLng ?? null,
+      notes: s.notes ?? null, taskTemplateId: idStr(s.taskTemplateId),
+      assignedBy: idStr(s.assignedBy), createdBy: idStr(s.createdBy), isOpen: s.isOpen ?? false,
+      createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const shiftTasks = await dbo.collection('shift_tasks').find({}).toArray();
+    counts.shift_tasks = await upsertBatched('shift_tasks', shiftTasks.map((t) => ({
+      id: idStr(t._id), shiftId: idStr(t.shiftId), title: t.title ?? null, order: t.order ?? null,
+      completed: t.completed ?? false, completedAt: toDate(t.completedAt), completedBy: idStr(t.completedBy),
+      createdAt: toDate(t.createdAt),
+    })));
+
+    const shiftNotes = await dbo.collection('shift_notes').find({}).toArray();
+    counts.shift_notes = await upsertBatched('shift_notes', shiftNotes.map((n) => ({
+      id: idStr(n._id), shiftId: idStr(n.shiftId), employeeId: idStr(n.employeeId), authorName: n.authorName ?? null,
+      type: n.type ?? null, text: n.text ?? null, createdAt: toDate(n.createdAt),
+    })));
+
+    const shiftApplications = await dbo.collection('shift_applications').find({}).toArray();
+    counts.shift_applications = await upsertBatched('shift_applications', shiftApplications.map((a) => ({
+      id: idStr(a._id), shiftId: idStr(a.shiftId), employeeId: idStr(a.employeeId), employeeName: a.employeeName ?? null,
+      status: a.status ?? 'pending', note: a.note ?? null, createdAt: toDate(a.createdAt),
+      resolvedAt: toDate(a.resolvedAt), resolvedBy: idStr(a.resolvedBy),
+    })));
+
+    const shiftAssignments = await dbo.collection('employeeShiftAssignments').find({}).toArray();
+    counts.employeeShiftAssignments = await upsertBatched('employeeShiftAssignments', shiftAssignments.map((a) => ({
+      id: idStr(a._id), employeeId: idStr(a.employeeId), scheduleId: idStr(a.scheduleId),
+      effectiveFrom: toDate(a.effectiveFrom), effectiveTo: toDate(a.effectiveTo),
+      assignedBy: idStr(a.assignedBy), createdAt: toDate(a.createdAt), updatedAt: toDate(a.updatedAt),
+    })));
+
+    const timesheets = await dbo.collection('timesheets').find({}).toArray();
+    counts.timesheets = await upsertBatched('timesheets', timesheets.map((s) => ({
+      id: idStr(s._id), employeeId: idStr(s.employeeId), weekStart: toDate(s.weekStart), weekEnd: toDate(s.weekEnd),
+      entries: s.entries ? JSON.stringify(s.entries) : null, totalMinutes: s.totalMinutes ?? null,
+      totalRegularMinutes: s.totalRegularMinutes ?? null, overtimeMinutes: s.overtimeMinutes ?? null,
+      overtimeBreakdown: s.overtimeBreakdown ? JSON.stringify(s.overtimeBreakdown) : null,
+      totalBreakMinutes: s.totalBreakMinutes ?? null, status: s.status ?? 'draft', submittedAt: toDate(s.submittedAt),
+      approvedBy: idStr(s.approvedBy), approvedAt: toDate(s.approvedAt), rejectionReason: s.rejectionReason ?? null,
+      payrollRunId: idStr(s.payrollRunId), createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const attendanceSettingsDoc = await dbo.collection('attendance_settings').findOne({});
+    counts.attendance_settings = await upsertBatched('attendance_settings', attendanceSettingsDoc ? [{
+      id: 'singleton', data: JSON.stringify(attendanceSettingsDoc),
+      createdAt: toDate(attendanceSettingsDoc.createdAt), updatedAt: toDate(attendanceSettingsDoc.updatedAt),
+    }] : []);
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

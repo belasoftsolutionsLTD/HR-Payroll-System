@@ -1,7 +1,18 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 3b) —
+// attendance_records (+ attendance_breaks), timesheets, shifts (+ shift_task_templates/
+// shift_tasks/shift_notes/shift_applications), work_schedules, employeeShiftAssignments,
+// attendance_settings, employees, users, leave_requests, public_holidays all now live in
+// Postgres. company_settings/overtime_config are unmigrated and stay on the Mongo helpers
+// above.
+// NOTE: insertOne here MUST come from pgDBFunctions, not commonDBFunctions (Mongo) — an
+// earlier version of this file imported it from the Mongo helper by mistake, which meant
+// every insert in this module (clock-in, timesheets, shifts, ...) silently wrote to Mongo
+// while every read hit Postgres, so nothing ever appeared to persist. Caught via live
+// verification (clock-in reported success but the row never showed up in Postgres).
+const { knex, newId, insertOne } = require('../../functions/Database/pgDBFunctions');
 const { parseAttendanceCSV } = require('../../services/csvService');
 const { notifyManager, notifyHR } = require('../inbox/inboxFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
@@ -30,13 +41,14 @@ const getScopedEmployeeIds = async (user) => {
   if (HR_ROLE_LIST.includes(user.role)) return null;
   if (user.role === DEPT_HEAD) {
     if (!user.department) return [];
-    const emps = await findMany('employees', { department: user.department }, { projection: { _id: 1 } });
-    return emps.map((e) => e._id);
+    const emps = await knex('employees').where({ department: user.department }).select('id');
+    return emps.map((e) => e.id);
   }
   if (!user.employeeId) return [];
-  const directReports = await findMany('employees', { managerId: new ObjectId(user.employeeId) }, { projection: { _id: 1 } });
-  const ids = directReports.map((e) => e._id);
-  ids.push(new ObjectId(user.employeeId));
+  const empId = String(user.employeeId);
+  const directReports = await knex('employees').where({ managerId: empId }).select('id');
+  const ids = directReports.map((e) => e.id);
+  ids.push(empId);
   return ids;
 };
 
@@ -44,20 +56,32 @@ const getScopedEmployeeIds = async (user) => {
 // otherwise the acting user must be that employee's manager or department_head-of-record.
 const isAuthorizedForEmployee = async (req, employeeId) => {
   if (isHR(req)) return true;
-  const emp = await findOne('employees', { _id: employeeId }, { projection: { managerId: 1, department: 1 } });
+  const emp = await knex('employees').where({ id: String(employeeId) }).select('managerId', 'department').first();
   if (!emp) return false;
   if (req.user.role === DEPT_HEAD) return !!req.user.department && emp.department === req.user.department;
-  return !!req.user.employeeId && String(emp.managerId || '') === String(req.user.employeeId);
+  return !!req.user.employeeId && emp.managerId === String(req.user.employeeId);
 };
+
+// Reassembles an attendance_records row's breaks child table back into the Mongo-
+// document-shaped `breaks` array the rest of this file (and the frontend) already
+// expects — breakStart/breakEnd insert/update one row at a time (a real per-row
+// operation, not a whole-array replace), so the child table is the real storage; this
+// view is reconstructed on read. See the migration's file header.
+const attachBreaks = async (record) => {
+  if (!record) return record;
+  const breaks = await knex('attendance_breaks').where({ attendanceRecordId: record.id }).orderBy('startTime');
+  return { ...record, breaks: breaks.map((b) => ({ id: b.id, startTime: b.startTime, endTime: b.endTime, duration: b.duration })) };
+};
+const attachBreaksMany = async (records) => Promise.all(records.map(attachBreaks));
 
 // ── Existing helpers ──────────────────────────────────────────────────────────
 
 const listAttendance = async (req, res) => {
-  const filter = {};
+  let query = knex('attendance_records');
   const { month, year, employeeId, department } = req.query;
   if (month && year) {
     const m = String(month).padStart(2, '0');
-    filter.date = { $gte: `${year}-${m}-01`, $lte: `${year}-${m}-31` };
+    query = query.where('date', '>=', `${year}-${m}-01`).where('date', '<=', `${year}-${m}-31`);
   }
 
   // A caller-supplied ?employeeId= must be validated against the requester's own
@@ -66,36 +90,35 @@ const listAttendance = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
   if (employeeId) {
-    const requested = new ObjectId(employeeId);
-    if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(requested))) {
+    if (scopedIds !== null && !scopedIds.includes(employeeId)) {
       return returnFunction(res, 403, false, 'You are not authorized to view this employee\'s attendance.');
     }
-    filter.employeeId = requested;
+    query = query.where({ employeeId });
   } else if (scopedIds !== null) {
-    filter.employeeId = { $in: scopedIds };
+    query = query.whereIn('employeeId', scopedIds);
   }
 
-  let records = await global.dbo.collection('attendance_records').find(filter).sort({ date: 1 }).toArray();
+  let records = await query.orderBy('date', 'asc');
 
   if (department) {
-    const deptEmps = await findMany('employees', { department }, { projection: { _id: 1 } });
-    const ids = deptEmps.map((e) => String(e._id));
-    records = records.filter((r) => ids.includes(String(r.employeeId)));
+    const deptEmps = await knex('employees').where({ department }).select('id');
+    const ids = deptEmps.map((e) => e.id);
+    records = records.filter((r) => ids.includes(r.employeeId));
   }
 
   const grouped = {};
   for (const rec of records) {
-    const key = String(rec.employeeId);
+    const key = rec.employeeId;
     if (!grouped[key]) grouped[key] = { employeeId: rec.employeeId, records: [] };
     grouped[key].records.push(rec);
   }
 
   const groupedValues = Object.values(grouped);
-  const attEmpIds = groupedValues.map(g => g.employeeId);
-  const attEmps = await findMany('employees', { _id: { $in: attEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-  const attEmpMap = Object.fromEntries(attEmps.map(e => [String(e._id), e]));
-  const enriched = groupedValues.map(g => {
-    const emp = attEmpMap[String(g.employeeId)];
+  const attEmpIds = groupedValues.map((g) => g.employeeId);
+  const attEmps = attEmpIds.length ? await knex('employees').whereIn('id', attEmpIds).select('id', 'fullName', 'staffNumber', 'department') : [];
+  const attEmpMap = Object.fromEntries(attEmps.map((e) => [e.id, e]));
+  const enriched = groupedValues.map((g) => {
+    const emp = attEmpMap[g.employeeId];
     return { ...g, employeeName: emp?.fullName || null, staffNumber: emp?.staffNumber || null, department: emp?.department || null };
   });
 
@@ -104,8 +127,8 @@ const listAttendance = async (req, res) => {
 
 const markAttendance = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'date', 'status'])) return;
-  const employeeId = new ObjectId(req.body.employeeId);
-  const entryDate = new Date(`${req.body.date}T00:00:00.000Z`);
+  const employeeId = String(req.body.employeeId);
+  const entryDate = req.body.date;
 
   // A manual entry claiming the employee worked (present/late/half_day) while they
   // have approved leave covering that date is almost always a mistake — block it
@@ -113,37 +136,34 @@ const markAttendance = async (req, res) => {
   // the record wasn't updated).
   const WORKED_STATUSES = ['present', 'late', 'half_day', 'remote'];
   if (WORKED_STATUSES.includes(req.body.status) && !req.body.overrideLeaveConflict) {
-    const conflictingLeave = await findOne('leave_requests', {
-      employeeId,
-      status: 'approved',
-      startDate: { $lte: entryDate },
-      endDate: { $gte: entryDate },
-    });
+    const conflictingLeave = await knex('leave_requests')
+      .where({ employeeId, status: 'approved' })
+      .where('startDate', '<=', new Date(`${entryDate}T00:00:00.000Z`))
+      .where('endDate', '>=', new Date(`${entryDate}T00:00:00.000Z`))
+      .first();
     if (conflictingLeave) {
       return returnFunction(res, 409, false,
         `This employee has approved leave covering ${req.body.date}. Set overrideLeaveConflict to confirm this entry anyway.`,
-        { leaveConflict: true, leaveRequestId: conflictingLeave._id }
+        { leaveConflict: true, leaveRequestId: conflictingLeave.id }
       );
     }
   }
 
-  const doc = {
-    employeeId,
-    date: req.body.date,
+  const patch = {
     status: req.body.status,
     checkInTime: req.body.checkInTime || null,
     checkOutTime: req.body.checkOutTime || null,
     notes: req.body.notes || null,
     isManualEntry: true,
-    markedBy: new ObjectId(req.user._id),
-    createdAt: new Date(),
+    markedBy: req.user.id,
   };
 
-  await global.dbo.collection('attendance_records').updateOne(
-    { employeeId: doc.employeeId, date: doc.date },
-    { $set: doc },
-    { upsert: true }
-  );
+  const existing = await knex('attendance_records').where({ employeeId, date: entryDate }).first();
+  if (existing) {
+    await knex('attendance_records').where({ id: existing.id }).update({ ...patch, updatedAt: new Date() });
+  } else {
+    await insertOne('attendance_records', { id: newId(), employeeId, date: entryDate, ...patch, createdAt: new Date(), updatedAt: new Date() });
+  }
   return returnFunction(res, 200, true, req.locale.success);
 };
 
@@ -155,26 +175,21 @@ const bulkImportAttendance = async (req, res) => {
   const errors = [];
 
   for (const row of validRows) {
-    const employee = await findOne('employees', { staffNumber: row.staffNumber });
+    const employee = await knex('employees').where({ staffNumber: row.staffNumber }).first();
     if (!employee) {
       errors.push({ row, reason: `No employee found with staffNumber ${row.staffNumber}` });
       continue;
     }
-    const doc = {
-      employeeId: employee._id,
-      date: row.date,
-      status: row.status,
-      checkInTime: row.checkInTime || null,
-      checkOutTime: row.checkOutTime || null,
-      notes: row.notes || null,
-      markedBy: new ObjectId(req.user._id),
-      createdAt: new Date(),
+    const patch = {
+      status: row.status, checkInTime: row.checkInTime || null, checkOutTime: row.checkOutTime || null,
+      notes: row.notes || null, markedBy: req.user.id, updatedAt: new Date(),
     };
-    await global.dbo.collection('attendance_records').updateOne(
-      { employeeId: doc.employeeId, date: doc.date },
-      { $set: doc, $setOnInsert: { createdAt: new Date() } },
-      { upsert: true }
-    );
+    const existing = await knex('attendance_records').where({ employeeId: employee.id, date: row.date }).first();
+    if (existing) {
+      await knex('attendance_records').where({ id: existing.id }).update(patch);
+    } else {
+      await insertOne('attendance_records', { id: newId(), employeeId: employee.id, date: row.date, ...patch, createdAt: new Date() });
+    }
     successCount++;
   }
 
@@ -189,19 +204,15 @@ const bulkImportAttendance = async (req, res) => {
 const getAbsenceAlerts = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
-  const alertFilter = { status: 'absent' };
-  if (scopedIds !== null) alertFilter.employeeId = { $in: scopedIds };
+  let query = knex('attendance_records').where({ status: 'absent' });
+  if (scopedIds !== null) query = query.whereIn('employeeId', scopedIds);
 
-  const recentRecords = await global.dbo.collection('attendance_records')
-    .find(alertFilter)
-    .sort({ employeeId: 1, date: 1 })
-    .toArray();
+  const recentRecords = await query.orderBy('employeeId', 'asc').orderBy('date', 'asc');
 
   const byEmployee = {};
   for (const r of recentRecords) {
-    const key = String(r.employeeId);
-    if (!byEmployee[key]) byEmployee[key] = [];
-    byEmployee[key].push(r.date);
+    if (!byEmployee[r.employeeId]) byEmployee[r.employeeId] = [];
+    byEmployee[r.employeeId].push(r.date);
   }
 
   // First pass: find which employees have consecutive absence streaks >= 3
@@ -228,15 +239,15 @@ const getAbsenceAlerts = async (req, res) => {
   }
 
   // Batch-fetch employees for all alert candidates
-  const alertEmpIds = alertCandidates.map(a => new ObjectId(a.empId));
+  const alertEmpIds = alertCandidates.map((a) => a.empId);
   const alertEmpDocs = alertEmpIds.length
-    ? await findMany('employees', { _id: { $in: alertEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    ? await knex('employees').whereIn('id', alertEmpIds).select('id', 'fullName', 'staffNumber', 'department')
     : [];
-  const alertEmpMap = Object.fromEntries(alertEmpDocs.map(e => [String(e._id), e]));
+  const alertEmpMap = Object.fromEntries(alertEmpDocs.map((e) => [e.id, e]));
 
   const alerts = alertCandidates
-    .filter(a => alertEmpMap[a.empId])
-    .map(a => ({ employee: alertEmpMap[a.empId], consecutiveAbsentDays: a.streak, from: a.from, to: a.to }));
+    .filter((a) => alertEmpMap[a.empId])
+    .map((a) => ({ employee: alertEmpMap[a.empId], consecutiveAbsentDays: a.streak, from: a.from, to: a.to }));
 
   return returnFunction(res, 200, true, req.locale.success, alerts);
 };
@@ -245,10 +256,8 @@ const getAbsenceAlerts = async (req, res) => {
 // regularMinutes/overtimeMinutes (computed once, in clockOut) rather than
 // recomputing against a flat weekly threshold that could disagree with it.
 async function computeWeeklyHoursFromAttendance(employeeId, weekStartStr, weekEndStr) {
-  const recs = await global.dbo.collection('attendance_records').find({
-    employeeId,
-    date: { $gte: weekStartStr, $lte: weekEndStr },
-  }).toArray();
+  const recs = await knex('attendance_records').where({ employeeId: String(employeeId) })
+    .where('date', '>=', weekStartStr).where('date', '<=', weekEndStr);
 
   let totalRegularMinutes = 0;
   let totalOvertimeMinutes = 0;
@@ -292,18 +301,19 @@ const CLIENT_SITE_GEOFENCE_METERS = 30;
 // venue}) fills exactly that gap, and only that gap: it's ignored the moment a shift
 // exists for the day, same as `descOverrides` for the free-text notes field.
 async function buildTimesheetEntries(empId, weekStartStr, weekEndStr, descOverrides = {}, manualOverrides = {}) {
+  const employeeId = String(empId);
   const [clockRecs, shifts] = await Promise.all([
-    global.dbo.collection('attendance_records').find({ employeeId: empId, date: { $gte: weekStartStr, $lte: weekEndStr } }).toArray(),
-    findMany('shifts', { employeeId: empId, date: { $gte: weekStartStr, $lte: weekEndStr } }),
+    knex('attendance_records').where({ employeeId }).where('date', '>=', weekStartStr).where('date', '<=', weekEndStr),
+    knex('shifts').where({ employeeId }).where('date', '>=', weekStartStr).where('date', '<=', weekEndStr),
   ]);
   const recByDate = Object.fromEntries(clockRecs.map((r) => [r.date, r]));
   const shiftByDate = Object.fromEntries(shifts.map((s) => [s.date, s]));
 
-  const templateIds = [...new Set(shifts.filter((s) => s.taskTemplateId).map((s) => String(s.taskTemplateId)))];
+  const templateIds = [...new Set(shifts.filter((s) => s.taskTemplateId).map((s) => s.taskTemplateId))];
   const templates = templateIds.length
-    ? await findMany('shift_task_templates', { _id: { $in: templateIds.map((id) => new ObjectId(id)) } }, { projection: { name: 1 } })
+    ? await knex('shift_task_templates').whereIn('id', templateIds).select('id', 'name')
     : [];
-  const templateNameById = Object.fromEntries(templates.map((t) => [String(t._id), t.name]));
+  const templateNameById = Object.fromEntries(templates.map((t) => [t.id, t.name]));
 
   const dates = [];
   for (let d = new Date(`${weekStartStr}T00:00:00`); d.toISOString().split('T')[0] <= weekEndStr; d.setDate(d.getDate() + 1)) {
@@ -317,8 +327,8 @@ async function buildTimesheetEntries(empId, weekStartStr, weekEndStr, descOverri
 
     let projectName = '';
     let projectIsAuto = false;
-    if (shift?.taskTemplateId && templateNameById[String(shift.taskTemplateId)]) {
-      projectName = templateNameById[String(shift.taskTemplateId)];
+    if (shift?.taskTemplateId && templateNameById[shift.taskTemplateId]) {
+      projectName = templateNameById[shift.taskTemplateId];
       projectIsAuto = true;
     } else if (shift?.shiftType) {
       projectName = SHIFT_TYPE_LABELS[shift.shiftType] || 'Shift';
@@ -369,18 +379,16 @@ async function buildTimesheetEntries(empId, weekStartStr, weekEndStr, descOverri
 
 const clockIn = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee profile linked to your account.');
-  const empId = req.user.employeeId;
+  const empId = String(req.user.employeeId);
   const today = new Date().toISOString().split('T')[0];
 
-  const existing = await findOne('attendance_records', { employeeId: empId, date: today });
+  const existing = await knex('attendance_records').where({ employeeId: empId, date: today }).first();
   if (existing?.checkInTime) return returnFunction(res, 409, false, 'You have already clocked in today.');
 
-  const onApprovedLeave = await findOne('leave_requests', {
-    employeeId: empId,
-    status: 'approved',
-    startDate: { $lte: new Date() },
-    endDate:   { $gte: new Date() },
-  });
+  const onApprovedLeave = await knex('leave_requests')
+    .where({ employeeId: empId, status: 'approved' })
+    .where('startDate', '<=', new Date()).where('endDate', '>=', new Date())
+    .first();
   if (onApprovedLeave) return returnFunction(res, 403, false, 'You are on approved leave today and cannot clock in.');
 
   const latitude  = parseFloat(req.body.latitude);
@@ -389,7 +397,8 @@ const clockIn = async (req, res) => {
     return returnFunction(res, 400, false, 'Location access is required to clock in. Please enable GPS and try again.');
   }
 
-  const settings = await findOne('company_settings', {});
+  // company_settings is unmigrated — stays Mongo.
+  const settings = await global.dbo.collection('company_settings').findOne({});
   const officeLat    = parseFloat(settings?.officeLatitude);
   const officeLng    = parseFloat(settings?.officeLongitude);
   const radiusMeters = parseFloat(settings?.officeRadiusMeters) || 200;
@@ -406,9 +415,10 @@ const clockIn = async (req, res) => {
   }
 
   // Block unscheduled clock-ins if the setting is enabled
-  const attSettings = await findOne('attendance_settings', {});
+  const attSettingsRow = await knex('attendance_settings').where({ id: 'singleton' }).first();
+  const attSettings = attSettingsRow?.data || {};
   if (attSettings?.blockUnscheduledClockIn) {
-    const todayShift = await findOne('shifts', { employeeId: empId, date: today });
+    const todayShift = await knex('shifts').where({ employeeId: empId, date: today }).first();
     if (!todayShift) {
       return returnFunction(res, 403, false, 'You do not have a scheduled shift today. Please contact HR.');
     }
@@ -418,8 +428,6 @@ const clockIn = async (req, res) => {
   const checkInTime = now.toTimeString().slice(0, 5);
 
   const patch = {
-    employeeId:      empId,
-    date:            today,
     status:          'present',
     mode,
     checkInTime,
@@ -428,27 +436,30 @@ const clockIn = async (req, res) => {
     checkInLng:      longitude,
     checkInLocation: req.body.locationName || null,
     location:        req.body.workLocation || 'office',
-    breaks:          [],
     selfMarked:      true,
-    markedBy:        new ObjectId(req.user._id),
+    markedBy:        req.user.id,
     updatedAt:       now,
   };
 
-  await global.dbo.collection('attendance_records').updateOne(
-    { employeeId: empId, date: today },
-    { $set: patch, $setOnInsert: { createdAt: now } },
-    { upsert: true }
-  );
+  if (existing) {
+    await knex('attendance_records').where({ id: existing.id }).update(patch);
+    // Clear any prior breaks — this is a fresh clock-in on a record that already
+    // existed for today (e.g. a manual entry created earlier), matching the old
+    // $set-the-whole-doc behavior which implicitly reset `breaks` too.
+    await knex('attendance_breaks').where({ attendanceRecordId: existing.id }).del();
+  } else {
+    await insertOne('attendance_records', { id: newId(), employeeId: empId, date: today, ...patch, createdAt: now });
+  }
 
   return returnFunction(res, 200, true, 'Clocked in successfully.', { checkInTime, mode });
 };
 
 const clockOut = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee profile linked to your account.');
-  const empId = req.user.employeeId;
+  const empId = String(req.user.employeeId);
   const today = new Date().toISOString().split('T')[0];
 
-  const existing = await findOne('attendance_records', { employeeId: empId, date: today });
+  const existing = await knex('attendance_records').where({ employeeId: empId, date: today }).first();
   if (!existing?.checkInTime) return returnFunction(res, 400, false, 'You have not clocked in yet today.');
   if (existing?.checkOutTime) return returnFunction(res, 409, false, 'You have already clocked out today.');
 
@@ -457,8 +468,9 @@ const clockOut = async (req, res) => {
   const latitude  = parseFloat(req.body.latitude);
   const longitude = parseFloat(req.body.longitude);
 
-  // Compute total break minutes from breaks array
-  const totalBreakMins = (existing.breaks || []).reduce((sum, b) => {
+  // Compute total break minutes from the breaks child table (was an embedded array).
+  const breaks = await knex('attendance_breaks').where({ attendanceRecordId: existing.id });
+  const totalBreakMins = breaks.reduce((sum, b) => {
     if (b.endTime) return sum + Math.round((new Date(b.endTime) - new Date(b.startTime)) / 60000);
     return sum;
   }, 0);
@@ -469,11 +481,15 @@ const clockOut = async (req, res) => {
 
   // Overtime + payment category calculation
   const toMins = t => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
-  const [todayShift, attSettings, holiday] = await Promise.all([
-    findOne('shifts', { employeeId: empId, date: today }),
-    findOne('attendance_settings', {}),
-    findOne('holidays', { date: today }),
+  const [todayShift, attSettingsRow, holiday] = await Promise.all([
+    knex('shifts').where({ employeeId: empId, date: today }).first(),
+    knex('attendance_settings').where({ id: 'singleton' }).first(),
+    // public_holidays now lives in Postgres (Phase 3a) — this used to (incorrectly)
+    // query a 'holidays' collection nothing ever wrote to, so this branch could never
+    // fire; fixed here since there's no real prior behavior to preserve.
+    knex('public_holidays').where({ date: today }).first(),
   ]);
+  const attSettings = attSettingsRow?.data || {};
 
   let regularMinutes  = workMins;
   let overtimeMinutes = 0;
@@ -503,7 +519,7 @@ const clockOut = async (req, res) => {
   // Split overtime minutes into weekday/weekend × day/night buckets so payroll can apply
   // HR's own custom multiplier per bucket instead of one flat rate for all overtime.
   // Overtime is the tail end of the shift, i.e. the last `overtimeMinutes` minutes
-  // before checkout.
+  // before checkout. overtime_config is unmigrated — stays Mongo.
   const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
   const isWeekend = [0, 6].includes(new Date(today + 'T00:00:00').getDay());
   let weekdayDayMins = 0, weekdayNightMins = 0, weekendDayMins = 0, weekendNightMins = 0;
@@ -517,24 +533,21 @@ const clockOut = async (req, res) => {
     else { weekdayDayMins = dayMins; weekdayNightMins = nightMins; }
   }
 
-  await global.dbo.collection('attendance_records').updateOne(
-    { employeeId: empId, date: today },
-    { $set: {
-      checkOutTime,
-      checkOutAt:        now,
-      checkOutLat:       isNaN(latitude)  ? null : latitude,
-      checkOutLng:       isNaN(longitude) ? null : longitude,
-      checkOutLocation:  req.body.locationName || null,
-      totalWorkMinutes:  workMins,
-      totalBreakMinutes: totalBreakMins,
-      regularMinutes,
-      overtimeMinutes,
-      overtimeHours,
-      overtimeBreakdown: { weekdayDayMins, weekdayNightMins, weekendDayMins, weekendNightMins },
-      payCategory,
-      updatedAt:         now,
-    }}
-  );
+  await knex('attendance_records').where({ id: existing.id }).update({
+    checkOutTime,
+    checkOutAt:        now,
+    checkOutLat:       isNaN(latitude)  ? null : latitude,
+    checkOutLng:       isNaN(longitude) ? null : longitude,
+    checkOutLocation:  req.body.locationName || null,
+    totalWorkMinutes:  workMins,
+    totalBreakMinutes: totalBreakMins,
+    regularMinutes,
+    overtimeMinutes,
+    overtimeHours,
+    overtimeBreakdown: JSON.stringify({ weekdayDayMins, weekdayNightMins, weekendDayMins, weekendNightMins }),
+    payCategory,
+    updatedAt:         now,
+  });
 
   return returnFunction(res, 200, true, 'Clocked out successfully.', { checkOutTime, totalWorkMinutes: workMins, overtimeMinutes, payCategory });
 };
@@ -543,48 +556,42 @@ const clockOut = async (req, res) => {
 
 const breakStart = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee profile linked.');
-  const empId = req.user.employeeId;
+  const empId = String(req.user.employeeId);
   const today = new Date().toISOString().split('T')[0];
 
-  const existing = await findOne('attendance_records', { employeeId: empId, date: today });
+  const existing = await knex('attendance_records').where({ employeeId: empId, date: today }).first();
   if (!existing?.checkInTime) return returnFunction(res, 400, false, 'You have not clocked in yet.');
   if (existing?.checkOutTime) return returnFunction(res, 400, false, 'You have already clocked out.');
 
-  const openBreak = (existing.breaks || []).find(b => !b.endTime);
+  const openBreak = await knex('attendance_breaks').where({ attendanceRecordId: existing.id }).whereNull('endTime').first();
   if (openBreak) return returnFunction(res, 409, false, 'You are already on a break.');
 
   const now = new Date();
-  const breakEntry = { startTime: now, endTime: null };
-
-  await global.dbo.collection('attendance_records').updateOne(
-    { employeeId: empId, date: today },
-    { $push: { breaks: breakEntry }, $set: { updatedAt: now } }
-  );
+  // NOT addChildRow here — that helper always assigns a Mongo-ObjectId-shaped TEXT id
+  // (right for employee_documents/certifications/education, which preserve Mongo
+  // sub-document ids), but attendance_breaks.id is a real Postgres auto-increment
+  // integer (see the migration file header), so a plain insert with no id is correct.
+  await knex('attendance_breaks').insert({ attendanceRecordId: existing.id, startTime: now, endTime: null });
+  await knex('attendance_records').where({ id: existing.id }).update({ updatedAt: now });
 
   return returnFunction(res, 200, true, 'Break started.', { breakStartedAt: now });
 };
 
 const breakEnd = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 400, false, 'No employee profile linked.');
-  const empId = req.user.employeeId;
+  const empId = String(req.user.employeeId);
   const today = new Date().toISOString().split('T')[0];
 
-  const existing = await findOne('attendance_records', { employeeId: empId, date: today });
+  const existing = await knex('attendance_records').where({ employeeId: empId, date: today }).first();
   if (!existing) return returnFunction(res, 400, false, 'No attendance record found for today.');
 
-  const breaks = existing.breaks || [];
-  const openIdx = breaks.findIndex(b => !b.endTime);
-  if (openIdx === -1) return returnFunction(res, 400, false, 'You are not currently on a break.');
+  const openBreak = await knex('attendance_breaks').where({ attendanceRecordId: existing.id }).whereNull('endTime').first();
+  if (!openBreak) return returnFunction(res, 400, false, 'You are not currently on a break.');
 
   const now = new Date();
-  const durationMins = Math.round((now - new Date(breaks[openIdx].startTime)) / 60000);
-  breaks[openIdx].endTime = now;
-  breaks[openIdx].duration = durationMins;
-
-  await global.dbo.collection('attendance_records').updateOne(
-    { employeeId: empId, date: today },
-    { $set: { breaks, updatedAt: now } }
-  );
+  const durationMins = Math.round((now - new Date(openBreak.startTime)) / 60000);
+  await knex('attendance_breaks').where({ id: openBreak.id }).update({ endTime: now, duration: durationMins });
+  await knex('attendance_records').where({ id: existing.id }).update({ updatedAt: now });
 
   return returnFunction(res, 200, true, 'Break ended.', { durationMinutes: durationMins });
 };
@@ -594,8 +601,8 @@ const breakEnd = async (req, res) => {
 const getTodayStatus = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 200, true, req.locale.success, null);
   const today = new Date().toISOString().split('T')[0];
-  const record = await findOne('attendance_records', { employeeId: req.user.employeeId, date: today });
-  return returnFunction(res, 200, true, req.locale.success, record || null);
+  const record = await knex('attendance_records').where({ employeeId: String(req.user.employeeId), date: today }).first();
+  return returnFunction(res, 200, true, req.locale.success, record ? await attachBreaks(record) : null);
 };
 
 const getMyRecords = async (req, res) => {
@@ -604,10 +611,9 @@ const getMyRecords = async (req, res) => {
   const since = new Date();
   since.setDate(since.getDate() - days + 1);
   const sinceStr = since.toISOString().split('T')[0];
-  const records = await global.dbo.collection('attendance_records')
-    .find({ employeeId: req.user.employeeId, date: { $gte: sinceStr } })
-    .sort({ date: 1 })
-    .toArray();
+  const records = await knex('attendance_records')
+    .where({ employeeId: String(req.user.employeeId) }).where('date', '>=', sinceStr)
+    .orderBy('date', 'asc');
   return returnFunction(res, 200, true, req.locale.success, records);
 };
 
@@ -619,40 +625,39 @@ const getTeamStatus = async (req, res) => {
   if (scopedIds !== null && !scopedIds.length) {
     return returnFunction(res, 200, true, req.locale.success, { records: [], stats: { clockedIn: 0, onBreak: 0, completed: 0, notClockedIn: 0 } });
   }
-  const recordFilter = { date: today };
-  if (scopedIds !== null) recordFilter.employeeId = { $in: scopedIds };
+  let recordQuery = knex('attendance_records').where({ date: today });
+  if (scopedIds !== null) recordQuery = recordQuery.whereIn('employeeId', scopedIds);
 
-  const records = await global.dbo.collection('attendance_records')
-    .find(recordFilter)
-    .toArray();
+  const rawRecords = await recordQuery;
+  const records = await attachBreaksMany(rawRecords);
 
-  const teamEmpIds = records.map(r => r.employeeId);
-  const teamEmps = await findMany('employees', { _id: { $in: teamEmpIds } }, { projection: { fullName: 1, designation: 1, department: 1 } });
-  const teamEmpMap = Object.fromEntries(teamEmps.map(e => [String(e._id), e]));
-  const enriched = records.map(r => {
-    const openBreak = (r.breaks || []).find(b => !b.endTime);
+  const teamEmpIds = records.map((r) => r.employeeId);
+  const teamEmps = teamEmpIds.length ? await knex('employees').whereIn('id', teamEmpIds).select('id', 'fullName', 'designation', 'department') : [];
+  const teamEmpMap = Object.fromEntries(teamEmps.map((e) => [e.id, e]));
+  const enriched = records.map((r) => {
+    const openBreak = (r.breaks || []).find((b) => !b.endTime);
     const clockStatus = r.checkOutTime ? 'completed'
       : openBreak ? 'on_break'
       : r.checkInTime ? 'clocked_in'
       : 'not_clocked_in';
-    return { ...r, employee: teamEmpMap[String(r.employeeId)] ?? null, clockStatus };
+    return { ...r, employee: teamEmpMap[r.employeeId] ?? null, clockStatus };
   });
 
-  const allEmpFilter = { status: 'active' };
-  if (scopedIds !== null) allEmpFilter._id = { $in: scopedIds };
-  const allEmployees = await findMany('employees', allEmpFilter, { projection: { _id: 1, fullName: 1, designation: 1, department: 1 } });
-  const recordedIds = new Set(records.map(r => String(r.employeeId)));
+  let allEmpQuery = knex('employees').where({ status: 'active' });
+  if (scopedIds !== null) allEmpQuery = allEmpQuery.whereIn('id', scopedIds);
+  const allEmployees = await allEmpQuery.select('id', 'fullName', 'designation', 'department');
+  const recordedIds = new Set(records.map((r) => r.employeeId));
   const notClockedIn = allEmployees
-    .filter(e => !recordedIds.has(String(e._id)))
-    .map(e => ({ employeeId: e._id, employee: e, clockStatus: 'not_clocked_in', date: today }));
+    .filter((e) => !recordedIds.has(e.id))
+    .map((e) => ({ employeeId: e.id, employee: e, clockStatus: 'not_clocked_in', date: today }));
 
   const all = [...enriched, ...notClockedIn];
 
   const stats = {
-    clockedIn:     all.filter(r => r.clockStatus === 'clocked_in').length,
-    onBreak:       all.filter(r => r.clockStatus === 'on_break').length,
-    completed:     all.filter(r => r.clockStatus === 'completed').length,
-    notClockedIn:  all.filter(r => r.clockStatus === 'not_clocked_in').length,
+    clockedIn:     all.filter((r) => r.clockStatus === 'clocked_in').length,
+    onBreak:       all.filter((r) => r.clockStatus === 'on_break').length,
+    completed:     all.filter((r) => r.clockStatus === 'completed').length,
+    notClockedIn:  all.filter((r) => r.clockStatus === 'not_clocked_in').length,
   };
 
   return returnFunction(res, 200, true, req.locale.success, { records: all, stats });
@@ -661,9 +666,9 @@ const getTeamStatus = async (req, res) => {
 // ── Timesheets ────────────────────────────────────────────────────────────────
 
 const getTimesheets = async (req, res) => {
-  const filter = {};
-  if (req.query.weekStart) filter.weekStart = new Date(req.query.weekStart);
-  if (req.query.status) filter.status = req.query.status;
+  let query = knex('timesheets');
+  if (req.query.weekStart) query = query.where({ weekStart: new Date(req.query.weekStart) });
+  if (req.query.status) query = query.where({ status: req.query.status });
 
   // Route everyone (including plain "staff") through getScopedEmployeeIds — a staff
   // role can still be someone's manager via employees.managerId, and that helper
@@ -675,28 +680,27 @@ const getTimesheets = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
   if (req.query.employeeId) {
-    const requested = new ObjectId(req.query.employeeId);
-    if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(requested))) {
+    if (scopedIds !== null && !scopedIds.includes(req.query.employeeId)) {
       return returnFunction(res, 403, false, 'You are not authorized to view this employee\'s timesheets.');
     }
-    filter.employeeId = requested;
+    query = query.where({ employeeId: req.query.employeeId });
   } else if (scopedIds !== null) {
-    filter.employeeId = { $in: scopedIds };
+    query = query.whereIn('employeeId', scopedIds);
     isTeamView = scopedIds.length > 1;
   } else {
     isTeamView = true; // HR/super_admin browsing everyone's timesheets
   }
 
-  const sheets = await findMany('timesheets', filter, { sort: { weekStart: -1 }, limit: isTeamView ? 200 : 20 });
+  const sheets = await query.orderBy('weekStart', 'desc').limit(isTeamView ? 200 : 20);
 
   if (!isTeamView) return returnFunction(res, 200, true, req.locale.success, sheets);
 
-  const empIds = [...new Set(sheets.map((s) => String(s.employeeId)))].map((id) => new ObjectId(id));
+  const empIds = [...new Set(sheets.map((s) => s.employeeId))];
   const employees = empIds.length
-    ? await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'staffNumber', 'department')
     : [];
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
-  const enriched = sheets.map((s) => ({ ...s, employee: empMap[String(s.employeeId)] ?? null }));
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
+  const enriched = sheets.map((s) => ({ ...s, employee: empMap[s.employeeId] ?? null }));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -713,10 +717,10 @@ const getCurrentTimesheet = async (req, res) => {
   sunday.setDate(monday.getDate() + 6);
   sunday.setHours(23, 59, 59, 999);
 
-  let sheet = await findOne('timesheets', {
-    employeeId: empId,
-    weekStart:  { $gte: monday, $lte: new Date(monday.getTime() + 1000) },
-  });
+  let sheet = await knex('timesheets')
+    .where({ employeeId: String(empId) })
+    .where('weekStart', '>=', monday).where('weekStart', '<=', new Date(monday.getTime() + 1000))
+    .first();
 
   const weekStr = monday.toISOString().split('T')[0];
   const sundayStr = sunday.toISOString().split('T')[0];
@@ -727,21 +731,22 @@ const getCurrentTimesheet = async (req, res) => {
 
   if (!sheet) {
     const doc = {
-      employeeId: empId,
+      id: newId(),
+      employeeId:  String(empId),
       weekStart:  monday,
       weekEnd:    sunday,
-      entries,
+      entries: JSON.stringify(entries),
       totalMinutes: weekHours.totalMinutes,
       totalRegularMinutes: weekHours.totalRegularMinutes,
       overtimeMinutes: weekHours.totalOvertimeMinutes,
-      overtimeBreakdown: weekHours.overtimeBreakdown,
+      overtimeBreakdown: JSON.stringify(weekHours.overtimeBreakdown),
       totalBreakMinutes: weekHours.totalBreakMinutes,
       status: 'draft',
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    const result = await insertOne('timesheets', doc);
-    sheet = { ...doc, _id: result.insertedId };
+    await insertOne('timesheets', doc);
+    sheet = { ...doc, entries };
   } else {
     // Re-derive from attendance/shift data on every view (not just on first creation)
     // so a late clock-out or a shift edited after the fact stays reflected — only the
@@ -764,7 +769,7 @@ const getCurrentTimesheet = async (req, res) => {
 const saveTimesheet = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'weekStart'])) return;
 
-  const empId = new ObjectId(req.body.employeeId);
+  const empId = String(req.body.employeeId);
   const weekStart = new Date(req.body.weekStart);
   const weekStartStr = weekStart.toISOString().split('T')[0];
   const weekEndStr = new Date(weekStart.getTime() + 6 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -778,44 +783,47 @@ const saveTimesheet = async (req, res) => {
   const entries = await buildTimesheetEntries(empId, weekStartStr, weekEndStr, descOverrides, manualOverrides);
   const weekHours = await computeWeeklyHoursFromAttendance(empId, weekStartStr, weekEndStr);
 
-  await global.dbo.collection('timesheets').updateOne(
-    { employeeId: empId, weekStart },
-    { $set: {
-      entries,
-      totalMinutes: weekHours.totalMinutes,
-      totalRegularMinutes: weekHours.totalRegularMinutes,
-      overtimeMinutes: weekHours.totalOvertimeMinutes,
-      overtimeBreakdown: weekHours.overtimeBreakdown,
-      totalBreakMinutes: weekHours.totalBreakMinutes,
-      status: req.body.status || 'draft',
-      updatedAt: new Date(),
-    }, $setOnInsert: { createdAt: new Date(), employeeId: empId, weekStart } },
-    { upsert: true }
-  );
+  const patch = {
+    entries: JSON.stringify(entries),
+    totalMinutes: weekHours.totalMinutes,
+    totalRegularMinutes: weekHours.totalRegularMinutes,
+    overtimeMinutes: weekHours.totalOvertimeMinutes,
+    overtimeBreakdown: JSON.stringify(weekHours.overtimeBreakdown),
+    totalBreakMinutes: weekHours.totalBreakMinutes,
+    status: req.body.status || 'draft',
+    updatedAt: new Date(),
+  };
+
+  const existing = await knex('timesheets').where({ employeeId: empId, weekStart }).first();
+  if (existing) {
+    await knex('timesheets').where({ id: existing.id }).update(patch);
+  } else {
+    await insertOne('timesheets', { id: newId(), employeeId: empId, weekStart, ...patch, createdAt: new Date() });
+  }
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const submitTimesheet = async (req, res) => {
-  const sheet = await findOne('timesheets', { _id: new ObjectId(req.params.id) });
+  const sheet = await knex('timesheets').where({ id: req.params.id }).first();
   if (!sheet) return returnFunction(res, 404, false, 'Timesheet not found.');
-  if (req.user.role === 'staff' && req.user.employeeId && String(sheet.employeeId) !== String(req.user.employeeId)) {
+  if (req.user.role === 'staff' && req.user.employeeId && sheet.employeeId !== String(req.user.employeeId)) {
     return returnFunction(res, 403, false, 'You can only submit your own timesheets.');
   }
   if (sheet.status === 'submitted') return returnFunction(res, 400, false, 'Already submitted.');
 
-  await updateOne('timesheets', { _id: sheet._id }, { $set: { status: 'submitted', submittedAt: new Date(), updatedAt: new Date() } });
+  await knex('timesheets').where({ id: sheet.id }).update({ status: 'submitted', submittedAt: new Date(), updatedAt: new Date() });
 
   // Inbox: notify manager that timesheet was submitted. notifyManager silently no-ops
   // if the employee has no managerId on file (same gap as the leave-request bug) — HR
   // must always get a copy too, otherwise a timesheet can go unnoticed by anyone.
   if (req.user.employeeId) {
-    const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } });
+    const emp = await knex('employees').where({ id: String(req.user.employeeId) }).select('fullName').first();
     const inboxItem = {
       type: 'timesheet', subType: 'timesheet_submission',
       title: `Timesheet submitted by ${emp?.fullName || 'An employee'}`,
       subtitle: `Week ${sheet.weekStart || ''} – ${sheet.weekEnd || ''} · ${sheet.totalHours || ''}h`,
-      referenceId: sheet._id, referenceModel: 'timesheets',
+      referenceId: new ObjectId(sheet.id), referenceModel: 'timesheets',
       requiresAction: true, triggeredBy: req.user._id,
     };
     await notifyManager(req.user.employeeId, inboxItem);
@@ -826,50 +834,43 @@ const submitTimesheet = async (req, res) => {
 };
 
 const approveTimesheet = async (req, res) => {
-  const sheet = await findOne('timesheets', { _id: new ObjectId(req.params.id) });
+  const sheet = await knex('timesheets').where({ id: req.params.id }).first();
   if (!sheet) return returnFunction(res, 404, false, 'Timesheet not found.');
   if (!(await isAuthorizedForEmployee(req, sheet.employeeId))) {
     return returnFunction(res, 403, false, 'You can only approve timesheets for your direct reports.');
   }
-  await updateOne('timesheets', { _id: sheet._id }, {
-    $set: { status: 'approved', approvedBy: new ObjectId(req.user._id), approvedAt: new Date(), updatedAt: new Date() },
-  });
+  await knex('timesheets').where({ id: sheet.id }).update({ status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Timesheet approved.');
 };
 
 const rejectTimesheet = async (req, res) => {
   if (!validateRequiredFields(req, res, ['reason'])) return;
-  const sheet = await findOne('timesheets', { _id: new ObjectId(req.params.id) });
+  const sheet = await knex('timesheets').where({ id: req.params.id }).first();
   if (!sheet) return returnFunction(res, 404, false, 'Timesheet not found.');
   if (!(await isAuthorizedForEmployee(req, sheet.employeeId))) {
     return returnFunction(res, 403, false, 'You can only reject timesheets for your direct reports.');
   }
-  await updateOne('timesheets', { _id: sheet._id }, {
-    $set: { status: 'rejected', rejectionReason: req.body.reason, updatedAt: new Date() },
-  });
+  await knex('timesheets').where({ id: sheet.id }).update({ status: 'rejected', rejectionReason: req.body.reason, updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Timesheet rejected.');
 };
 
 const bulkApproveTimesheets = async (req, res) => {
   if (!validateRequiredFields(req, res, ['timesheetIds'])) return;
-  const ids = req.body.timesheetIds.map((id) => new ObjectId(id));
-  const sheets = await findMany('timesheets', { _id: { $in: ids }, status: 'submitted' }, {});
+  const ids = req.body.timesheetIds.map(String);
+  const sheets = await knex('timesheets').whereIn('id', ids).where({ status: 'submitted' });
 
   const approvedIds = [];
   const skipped = [];
   for (const sheet of sheets) {
     if (await isAuthorizedForEmployee(req, sheet.employeeId)) {
-      approvedIds.push(sheet._id);
+      approvedIds.push(sheet.id);
     } else {
-      skipped.push(sheet._id);
+      skipped.push(sheet.id);
     }
   }
 
   if (approvedIds.length) {
-    await global.dbo.collection('timesheets').updateMany(
-      { _id: { $in: approvedIds } },
-      { $set: { status: 'approved', approvedBy: new ObjectId(req.user._id), approvedAt: new Date(), updatedAt: new Date() } }
-    );
+    await knex('timesheets').whereIn('id', approvedIds).update({ status: 'approved', approvedBy: req.user.id, approvedAt: new Date(), updatedAt: new Date() });
   }
 
   return returnFunction(res, 200, true, `${approvedIds.length} timesheet(s) approved.`, {
@@ -884,20 +885,20 @@ const bulkApproveTimesheets = async (req, res) => {
 // before that happens, and to manually reconcile/mark items outside the normal cycle flow.
 
 const getPayrollFeed = async (req, res) => {
-  const filter = { status: 'approved', payrollRunId: null };
+  let query = knex('timesheets').where({ status: 'approved' }).whereNull('payrollRunId');
   if (req.query.startDate && req.query.endDate) {
-    filter.weekStart = { $gte: new Date(req.query.startDate), $lte: new Date(req.query.endDate) };
+    query = query.where('weekStart', '>=', new Date(req.query.startDate)).where('weekStart', '<=', new Date(req.query.endDate));
   }
-  const sheets = await findMany('timesheets', filter, { sort: { weekStart: 1 } });
-  const empIds = [...new Set(sheets.map((s) => String(s.employeeId)))].map((id) => new ObjectId(id));
+  const sheets = await query.orderBy('weekStart', 'asc');
+  const empIds = [...new Set(sheets.map((s) => s.employeeId))];
   const employees = empIds.length
-    ? await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'staffNumber', 'department')
     : [];
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
 
   const feed = sheets.map((s) => ({
     ...s,
-    employee: empMap[String(s.employeeId)] ?? null,
+    employee: empMap[s.employeeId] ?? null,
     overtimeHours: Math.round(((s.overtimeMinutes || 0) / 60) * 100) / 100,
   }));
 
@@ -906,21 +907,19 @@ const getPayrollFeed = async (req, res) => {
 
 const markPayrollFeedProcessed = async (req, res) => {
   if (!validateRequiredFields(req, res, ['timesheetIds', 'payrollRunId'])) return;
-  const ids = req.body.timesheetIds.map((id) => new ObjectId(id));
-  const payrollRunId = new ObjectId(req.body.payrollRunId);
-  const result = await global.dbo.collection('timesheets').updateMany(
-    { _id: { $in: ids }, status: 'approved', payrollRunId: null },
-    { $set: { payrollRunId, updatedAt: new Date() } }
-  );
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully, { matchedCount: result.matchedCount, modifiedCount: result.modifiedCount });
+  const ids = req.body.timesheetIds.map(String);
+  const payrollRunId = String(req.body.payrollRunId);
+  const modifiedCount = await knex('timesheets').whereIn('id', ids).where({ status: 'approved' }).whereNull('payrollRunId')
+    .update({ payrollRunId, updatedAt: new Date() });
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully, { matchedCount: ids.length, modifiedCount });
 };
 
 // ── Shifts ────────────────────────────────────────────────────────────────────
 
 const getShifts = async (req, res) => {
-  const filter = {};
+  let query = knex('shifts');
   if (req.query.startDate && req.query.endDate) {
-    filter.date = { $gte: req.query.startDate, $lte: req.query.endDate };
+    query = query.where('date', '>=', req.query.startDate).where('date', '<=', req.query.endDate);
   }
 
   // Unscoped before this: any authenticated user (route allows ALL roles) could pass
@@ -930,20 +929,19 @@ const getShifts = async (req, res) => {
   // attendance endpoint.
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (req.query.employeeId) {
-    const requested = new ObjectId(req.query.employeeId);
-    if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(requested))) {
+    if (scopedIds !== null && !scopedIds.includes(req.query.employeeId)) {
       return returnFunction(res, 403, false, 'You are not authorized to view this employee\'s shifts.');
     }
-    filter.employeeId = requested;
+    query = query.where({ employeeId: req.query.employeeId });
   } else if (scopedIds !== null) {
-    filter.$or = [{ employeeId: { $in: scopedIds } }, { employeeId: null }];
+    query = query.where((qb) => qb.whereIn('employeeId', scopedIds).orWhereNull('employeeId'));
   }
 
-  const shifts = await findMany('shifts', filter, { sort: { date: 1 } });
-  const shiftEmpIds = [...new Set(shifts.map(s => s.employeeId))];
-  const shiftEmps = await findMany('employees', { _id: { $in: shiftEmpIds } }, { projection: { fullName: 1, designation: 1, department: 1 } });
-  const shiftEmpMap = Object.fromEntries(shiftEmps.map(e => [String(e._id), e]));
-  const enriched = shifts.map(s => ({ ...s, employee: shiftEmpMap[String(s.employeeId)] ?? null }));
+  const shifts = await query.orderBy('date', 'asc');
+  const shiftEmpIds = [...new Set(shifts.map((s) => s.employeeId).filter(Boolean))];
+  const shiftEmps = shiftEmpIds.length ? await knex('employees').whereIn('id', shiftEmpIds).select('id', 'fullName', 'designation', 'department') : [];
+  const shiftEmpMap = Object.fromEntries(shiftEmps.map((e) => [e.id, e]));
+  const enriched = shifts.map((s) => ({ ...s, employee: s.employeeId ? (shiftEmpMap[s.employeeId] ?? null) : null }));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -972,9 +970,8 @@ const createShift = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'date', 'startTime', 'endTime'])) return;
 
   const coords = await geocodeAddress(req.body.address);
-  const doc = {
-    employeeId: new ObjectId(req.body.employeeId),
-    date:       req.body.date,
+  const employeeId = String(req.body.employeeId);
+  const fields = {
     shiftType:  req.body.shiftType || 'custom',
     startTime:  req.body.startTime,
     endTime:    req.body.endTime,
@@ -984,29 +981,37 @@ const createShift = async (req, res) => {
     addressLat: coords?.lat ?? null,
     addressLng: coords?.lng ?? null,
     notes:      req.body.notes || '',
-    taskTemplateId: req.body.taskTemplateId ? new ObjectId(req.body.taskTemplateId) : null,
-    assignedBy: new ObjectId(req.user._id),
-    createdAt:  new Date(),
+    taskTemplateId: req.body.taskTemplateId ? String(req.body.taskTemplateId) : null,
+    assignedBy: req.user.id,
+    updatedAt:  new Date(),
   };
 
-  const { createdAt: _ca, ...shiftFields } = doc;
-  await global.dbo.collection('shifts').updateOne(
-    { employeeId: doc.employeeId, date: doc.date },
-    { $set: shiftFields, $setOnInsert: { createdAt: new Date() } },
-    { upsert: true }
-  );
-  const saved = await findOne('shifts', { employeeId: doc.employeeId, date: doc.date });
-  if (saved) await materializeShiftTasks(saved._id, saved.taskTemplateId);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, doc);
+  const existing = await knex('shifts').where({ employeeId, date: req.body.date }).first();
+  let saved;
+  if (existing) {
+    await knex('shifts').where({ id: existing.id }).update(fields);
+    saved = { ...existing, ...fields };
+  } else {
+    saved = await insertOne('shifts', { id: newId(), employeeId, date: req.body.date, ...fields, createdAt: new Date() });
+  }
+  if (saved) await materializeShiftTasks(saved.id, saved.taskTemplateId);
+  // Bug found in live verification: this used to omit the shift's own id from the
+  // response entirely, so a caller could never learn the id of the shift it just
+  // created/updated (needed immediately after for the task-checklist/notes routes,
+  // which are keyed by :id). Restored from `saved`, matching every other create
+  // endpoint in this file (e.g. createShiftTaskTemplate's `{ _id: result.id }`).
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id, _id: saved.id, employeeId, date: req.body.date, ...fields });
 };
 
 const updateShift = async (req, res) => {
   const update = { ...req.body };
   delete update._id;
+  delete update.id;
   update.updatedAt = new Date();
-  if (update.employeeId) update.employeeId = new ObjectId(update.employeeId);
+  if (update.employeeId) update.employeeId = String(update.employeeId);
+  if (update.taskTemplateId !== undefined) update.taskTemplateId = update.taskTemplateId ? String(update.taskTemplateId) : null;
   if (update.address !== undefined) {
-    const existing = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+    const existing = await knex('shifts').where({ id: req.params.id }).first();
     if (update.address?.trim() && update.address !== existing?.address) {
       const coords = await geocodeAddress(update.address);
       update.addressLat = coords?.lat ?? null;
@@ -1016,12 +1021,12 @@ const updateShift = async (req, res) => {
       update.addressLng = null;
     }
   }
-  await updateOne('shifts', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('shifts').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteShift = async (req, res) => {
-  await global.dbo.collection('shifts').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('shifts').where({ id: req.params.id }).del();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -1032,7 +1037,7 @@ const deleteShift = async (req, res) => {
 // edits to the template never retroactively change a shift that's already in progress.
 
 const listShiftTaskTemplates = async (req, res) => {
-  const templates = await findMany('shift_task_templates', { isActive: true }, { sort: { name: 1 } });
+  const templates = await knex('shift_task_templates').where({ isActive: true }).orderBy('name', 'asc');
   return returnFunction(res, 200, true, req.locale.success, templates);
 };
 
@@ -1045,11 +1050,11 @@ const createShiftTaskTemplate = async (req, res) => {
     name: req.body.name.trim(),
     tasks: req.body.tasks.map((t) => String(t).trim()).filter(Boolean),
     isActive: true,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('shift_task_templates', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const updateShiftTaskTemplate = async (req, res) => {
@@ -1057,12 +1062,12 @@ const updateShiftTaskTemplate = async (req, res) => {
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (Array.isArray(req.body.tasks)) update.tasks = req.body.tasks.map((t) => String(t).trim()).filter(Boolean);
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('shift_task_templates', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('shift_task_templates').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteShiftTaskTemplate = async (req, res) => {
-  await updateOne('shift_task_templates', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('shift_task_templates').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -1070,41 +1075,41 @@ const deleteShiftTaskTemplate = async (req, res) => {
 // already has tasks (e.g. changing its time) never duplicates or resets progress.
 const materializeShiftTasks = async (shiftId, taskTemplateId) => {
   if (!taskTemplateId) return;
-  const existing = await findOne('shift_tasks', { shiftId: new ObjectId(shiftId) });
+  const existing = await knex('shift_tasks').where({ shiftId: String(shiftId) }).first();
   if (existing) return;
-  const template = await findOne('shift_task_templates', { _id: new ObjectId(taskTemplateId) });
+  const template = await knex('shift_task_templates').where({ id: String(taskTemplateId) }).first();
   if (!template?.tasks?.length) return;
   const now = new Date();
   const docs = template.tasks.map((title, i) => ({
-    shiftId: new ObjectId(shiftId), title, order: i,
+    id: newId(), shiftId: String(shiftId), title, order: i,
     completed: false, completedAt: null, completedBy: null,
     createdAt: now,
   }));
-  await global.dbo.collection('shift_tasks').insertMany(docs);
+  await knex('shift_tasks').insert(docs);
 };
 
 // Any real assigned party (the shift's own employee) or MGMT — never a stranger who
 // just knows the shift id.
 const canAccessShift = (shift, reqUser) => {
   if (['super_admin', 'hr_manager', 'department_head'].includes(reqUser.role)) return true;
-  return !!reqUser.employeeId && String(shift.employeeId) === String(reqUser.employeeId);
+  return !!reqUser.employeeId && shift.employeeId === String(reqUser.employeeId);
 };
 
 const getShiftTasks = async (req, res) => {
-  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  const shift = await knex('shifts').where({ id: req.params.id }).first();
   if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
   if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
-  const tasks = await findMany('shift_tasks', { shiftId: shift._id }, { sort: { order: 1 } });
+  const tasks = await knex('shift_tasks').where({ shiftId: shift.id }).orderBy('order', 'asc');
   return returnFunction(res, 200, true, req.locale.success, tasks);
 };
 
 const updateShiftTask = async (req, res) => {
-  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  const shift = await knex('shifts').where({ id: req.params.id }).first();
   if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
   if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
   const completed = !!req.body.completed;
-  await updateOne('shift_tasks', { _id: new ObjectId(req.params.taskId), shiftId: shift._id }, {
-    $set: { completed, completedAt: completed ? new Date() : null, completedBy: completed ? req.user._id : null },
+  await knex('shift_tasks').where({ id: req.params.taskId, shiftId: shift.id }).update({
+    completed, completedAt: completed ? new Date() : null, completedBy: completed ? req.user.id : null,
   });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
@@ -1114,23 +1119,23 @@ const updateShiftTask = async (req, res) => {
 // application — progress notes are just a log, no one needs paging for those.
 
 const getShiftNotes = async (req, res) => {
-  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  const shift = await knex('shifts').where({ id: req.params.id }).first();
   if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
   if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
-  const notes = await findMany('shift_notes', { shiftId: shift._id }, { sort: { createdAt: -1 } });
+  const notes = await knex('shift_notes').where({ shiftId: shift.id }).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, notes);
 };
 
 const createShiftNote = async (req, res) => {
   if (!validateRequiredFields(req, res, ['type', 'text'])) return;
   if (!['progress', 'incident'].includes(req.body.type)) return returnFunction(res, 400, false, "type must be 'progress' or 'incident'.");
-  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  const shift = await knex('shifts').where({ id: req.params.id }).first();
   if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
   if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const emp = req.user.employeeId ? await findOne('employees', { _id: new ObjectId(req.user.employeeId) }, { projection: { fullName: 1 } }) : null;
+  const emp = req.user.employeeId ? await knex('employees').where({ id: String(req.user.employeeId) }).select('fullName').first() : null;
   const doc = {
-    shiftId: shift._id,
+    shiftId: shift.id,
     employeeId: shift.employeeId,
     authorName: emp?.fullName || req.user.name || 'Staff',
     type: req.body.type,
@@ -1144,14 +1149,14 @@ const createShiftNote = async (req, res) => {
       type: 'shift', subType: 'shift_incident',
       title: `Incident logged by ${doc.authorName}`,
       subtitle: `Shift ${shift.date} ${shift.startTime}–${shift.endTime}: ${doc.text.slice(0, 80)}`,
-      referenceId: result.insertedId, referenceModel: 'shift_notes',
+      referenceId: new ObjectId(result.id), referenceModel: 'shift_notes',
       requiresAction: true, triggeredBy: req.user._id,
     };
     await notifyManager(shift.employeeId, inboxItem).catch(() => {});
     await notifyHR(inboxItem).catch(() => {});
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...doc });
 };
 
 // Handover: the incoming employee on a shift needs to see what the PREVIOUS shift at the
@@ -1160,29 +1165,29 @@ const createShiftNote = async (req, res) => {
 // shift's own notes. Match by address first (exact place), falling back to taskTemplateId
 // (same recurring checklist/site) when no address was set on either shift.
 const getShiftHandoverNotes = async (req, res) => {
-  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  const shift = await knex('shifts').where({ id: req.params.id }).first();
   if (!shift) return returnFunction(res, 404, false, req.locale.notFound);
   if (!canAccessShift(shift, req.user)) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const matchFilter = { _id: { $ne: shift._id }, date: { $lt: shift.date } };
+  let matchQuery = knex('shifts').whereNot('id', shift.id).where('date', '<', shift.date);
   if (shift.address?.trim()) {
-    matchFilter.address = shift.address;
+    matchQuery = matchQuery.where({ address: shift.address });
   } else if (shift.taskTemplateId) {
-    matchFilter.taskTemplateId = shift.taskTemplateId;
+    matchQuery = matchQuery.where({ taskTemplateId: shift.taskTemplateId });
   } else {
     return returnFunction(res, 200, true, req.locale.success, { previousShift: null, notes: [] });
   }
 
-  const previousShift = await findOne('shifts', matchFilter, { sort: { date: -1 } });
+  const previousShift = await matchQuery.orderBy('date', 'desc').first();
   if (!previousShift) return returnFunction(res, 200, true, req.locale.success, { previousShift: null, notes: [] });
 
   const [notes, prevEmp] = await Promise.all([
-    findMany('shift_notes', { shiftId: previousShift._id }, { sort: { createdAt: -1 } }),
-    findOne('employees', { _id: previousShift.employeeId }, { projection: { fullName: 1 } }),
+    knex('shift_notes').where({ shiftId: previousShift.id }).orderBy('createdAt', 'desc'),
+    previousShift.employeeId ? knex('employees').where({ id: previousShift.employeeId }).select('fullName').first() : null,
   ]);
 
   return returnFunction(res, 200, true, req.locale.success, {
-    previousShift: { _id: previousShift._id, date: previousShift.date, employeeName: prevEmp?.fullName || 'A previous staff member' },
+    previousShift: { _id: new ObjectId(previousShift.id), date: previousShift.date, employeeName: prevEmp?.fullName || 'A previous staff member' },
     notes,
   });
 };
@@ -1195,10 +1200,10 @@ const getAttendanceReport = async (req, res) => {
   const from  = `${year}-${month}-01`;
   const to    = `${year}-${month}-31`;
 
-  const filter = { date: { $gte: from, $lte: to } };
+  let recordQuery = knex('attendance_records').where('date', '>=', from).where('date', '<=', to);
   if (req.query.department) {
-    const empIds = (await findMany('employees', { department: req.query.department }, { projection: { _id: 1 } })).map(e => e._id);
-    filter.employeeId = { $in: empIds };
+    const empIds = (await knex('employees').where({ department: req.query.department }).select('id')).map((e) => e.id);
+    recordQuery = recordQuery.whereIn('employeeId', empIds);
   }
 
   const scopedIds = await getScopedEmployeeIds(req.user);
@@ -1208,35 +1213,33 @@ const getAttendanceReport = async (req, res) => {
   // A caller-supplied ?employeeId= is validated against scope below via employeeFilter
   // (the returned `report` is built by mapping over that scoped employee list, so a
   // record fetched for an out-of-scope id would never actually surface) — but keep
-  // `filter.employeeId` itself scoped too, for defense in depth and clarity.
+  // the record query itself scoped too, for defense in depth and clarity.
   if (req.query.employeeId) {
-    const requested = new ObjectId(req.query.employeeId);
-    if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(requested))) {
+    if (scopedIds !== null && !scopedIds.includes(req.query.employeeId)) {
       return returnFunction(res, 403, false, 'You are not authorized to view this employee\'s attendance.');
     }
-    filter.employeeId = requested;
+    recordQuery = recordQuery.where({ employeeId: req.query.employeeId });
+  } else if (scopedIds !== null) {
+    recordQuery = recordQuery.whereIn('employeeId', scopedIds);
   }
-  const employeeFilter = { status: 'active' };
-  if (scopedIds !== null) {
-    employeeFilter._id = { $in: scopedIds };
-    filter.employeeId = filter.employeeId ? filter.employeeId : { $in: scopedIds };
-  }
-  if (req.query.employeeId) employeeFilter._id = new ObjectId(req.query.employeeId);
 
-  const records = await global.dbo.collection('attendance_records').find(filter).sort({ date: 1 }).toArray();
+  let employeeQuery = knex('employees').where({ status: 'active' });
+  if (scopedIds !== null) employeeQuery = employeeQuery.whereIn('id', scopedIds);
+  if (req.query.employeeId) employeeQuery = knex('employees').where({ id: req.query.employeeId });
+
+  const records = await recordQuery.orderBy('date', 'asc');
 
   const byEmp = {};
   for (const r of records) {
-    const k = String(r.employeeId);
-    if (!byEmp[k]) byEmp[k] = { employeeId: r.employeeId, days: {} };
-    byEmp[k].days[r.date] = r;
+    if (!byEmp[r.employeeId]) byEmp[r.employeeId] = { employeeId: r.employeeId, days: {} };
+    byEmp[r.employeeId].days[r.date] = r;
   }
 
-  const employees = await findMany('employees', employeeFilter, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const employees = await employeeQuery.select('id', 'fullName', 'staffNumber', 'department');
 
-  const report = employees.map(emp => ({
+  const report = employees.map((emp) => ({
     employee: emp,
-    days: byEmp[String(emp._id)]?.days || {},
+    days: byEmp[emp.id]?.days || {},
   }));
 
   return returnFunction(res, 200, true, req.locale.success, { report, month: Number(month), year: Number(year) });
@@ -1259,27 +1262,25 @@ const exportAttendanceReportCSV = async (req, res) => {
     return res.send('StaffNo,Name,Department,Present,Absent,Late,TotalHours');
   }
 
-  const empFilter = {};
-  if (scopedIds !== null) empFilter._id = { $in: scopedIds };
-  if (req.query.department) empFilter.department = req.query.department;
-  const employees = await findMany('employees', empFilter, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  let empQuery = knex('employees');
+  if (scopedIds !== null) empQuery = empQuery.whereIn('id', scopedIds);
+  if (req.query.department) empQuery = empQuery.where({ department: req.query.department });
+  const employees = await empQuery.select('id', 'fullName', 'staffNumber', 'department');
+  const empIds = employees.map((e) => e.id);
 
-  const records = await global.dbo.collection('attendance_records').find({
-    date: { $gte: `${year}-${m}-01`, $lte: `${year}-${m}-31` },
-    employeeId: { $in: employees.map((e) => e._id) },
-  }).toArray();
+  const records = empIds.length
+    ? await knex('attendance_records').where('date', '>=', `${year}-${m}-01`).where('date', '<=', `${year}-${m}-31`).whereIn('employeeId', empIds)
+    : [];
 
   const grouped = {};
   for (const r of records) {
-    const k = String(r.employeeId);
-    if (!grouped[k]) grouped[k] = [];
-    grouped[k].push(r);
+    if (!grouped[r.employeeId]) grouped[r.employeeId] = [];
+    grouped[r.employeeId].push(r);
   }
 
   const toMins = (t) => { const [h, mi] = String(t).split(':').map(Number); return h * 60 + mi; };
   const rows = employees.map((emp) => {
-    const recs = grouped[String(emp._id)] || [];
+    const recs = grouped[emp.id] || [];
     let present = 0, absent = 0, late = 0, totalMins = 0;
     for (const r of recs) {
       if (['present', 'remote', 'late'].includes(r.status)) present++;
@@ -1313,14 +1314,14 @@ const getAttendanceStats = async (req, res) => {
   if (scopedIds !== null && !scopedIds.length) {
     return returnFunction(res, 200, true, req.locale.success, { attendanceRate: 0, totalPresent: 0, totalLate: 0, totalAbsent: 0, totalRecords: 0 });
   }
-  const baseFilter = { date: { $gte: from, $lte: to } };
-  if (scopedIds !== null) baseFilter.employeeId = { $in: scopedIds };
+  let baseQuery = knex('attendance_records').where('date', '>=', from).where('date', '<=', to);
+  if (scopedIds !== null) baseQuery = baseQuery.whereIn('employeeId', scopedIds);
 
   const [present, late, absent, total] = await Promise.all([
-    global.dbo.collection('attendance_records').countDocuments({ ...baseFilter, status: 'present' }),
-    global.dbo.collection('attendance_records').countDocuments({ ...baseFilter, status: 'late' }),
-    global.dbo.collection('attendance_records').countDocuments({ ...baseFilter, status: 'absent' }),
-    global.dbo.collection('attendance_records').countDocuments(baseFilter),
+    baseQuery.clone().where({ status: 'present' }).count('* as count').first().then((r) => Number(r.count)),
+    baseQuery.clone().where({ status: 'late' }).count('* as count').first().then((r) => Number(r.count)),
+    baseQuery.clone().where({ status: 'absent' }).count('* as count').first().then((r) => Number(r.count)),
+    baseQuery.clone().count('* as count').first().then((r) => Number(r.count)),
   ]);
 
   const rate = total > 0 ? Math.round(((present + late) / total) * 100) : 0;
@@ -1337,23 +1338,25 @@ const getAttendanceStats = async (req, res) => {
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 const getSettings = async (req, res) => {
-  const settings = await findOne('attendance_settings', {}) || {};
-  return returnFunction(res, 200, true, req.locale.success, settings);
+  const row = await knex('attendance_settings').where({ id: 'singleton' }).first();
+  return returnFunction(res, 200, true, req.locale.success, row?.data || {});
 };
 
 const saveSettings = async (req, res) => {
   const update = { ...req.body, updatedAt: new Date() };
   delete update._id;
-  await global.dbo.collection('attendance_settings').updateOne(
-    {},
-    { $set: update, $setOnInsert: { createdAt: new Date() } },
-    { upsert: true }
-  );
+  const existing = await knex('attendance_settings').where({ id: 'singleton' }).first();
+  const merged = { ...(existing?.data || {}), ...update };
+  if (existing) {
+    await knex('attendance_settings').where({ id: 'singleton' }).update({ data: JSON.stringify(merged), updatedAt: new Date() });
+  } else {
+    await insertOne('attendance_settings', { id: 'singleton', data: JSON.stringify(merged), createdAt: new Date(), updatedAt: new Date() });
+  }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const getSchedules = async (req, res) => {
-  const schedules = await findMany('work_schedules', {}, { sort: { createdAt: -1 } });
+  const schedules = await knex('work_schedules').orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, schedules);
 };
 
@@ -1367,22 +1370,23 @@ const createSchedule = async (req, res) => {
     breakMinutes: Number(req.body.breakMinutes) || 60,
     weeklyHours:  Number(req.body.weeklyHours) || 40,
     gracePeriod:  Number(req.body.gracePeriod) || 15,
-    createdBy:    new ObjectId(req.user._id),
+    createdBy:    req.user.id,
     createdAt:    new Date(),
   };
   const result = await insertOne('work_schedules', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const updateSchedule = async (req, res) => {
   const update = { ...req.body, updatedAt: new Date() };
   delete update._id;
-  await updateOne('work_schedules', { _id: new ObjectId(req.params.id) }, { $set: update });
+  delete update.id;
+  await knex('work_schedules').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteSchedule = async (req, res) => {
-  await global.dbo.collection('work_schedules').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('work_schedules').where({ id: req.params.id }).del();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -1394,45 +1398,43 @@ const deleteSchedule = async (req, res) => {
 
 const assignSchedule = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'scheduleId', 'effectiveFrom'])) return;
-  const employeeId = new ObjectId(req.body.employeeId);
-  const scheduleId = new ObjectId(req.body.scheduleId);
+  const employeeId = String(req.body.employeeId);
+  const scheduleId = String(req.body.scheduleId);
   const effectiveFrom = new Date(req.body.effectiveFrom);
 
-  const schedule = await findOne('work_schedules', { _id: scheduleId });
+  const schedule = await knex('work_schedules').where({ id: scheduleId }).first();
   if (!schedule) return returnFunction(res, 404, false, 'Work schedule not found.');
 
   // Close out any currently-open assignment for this employee as of the day before the new one starts
   const dayBefore = new Date(effectiveFrom.getTime() - 24 * 60 * 60 * 1000);
-  await global.dbo.collection('employeeShiftAssignments').updateMany(
-    { employeeId, effectiveTo: null },
-    { $set: { effectiveTo: dayBefore, updatedAt: new Date() } }
-  );
+  await knex('employeeShiftAssignments').where({ employeeId }).whereNull('effectiveTo')
+    .update({ effectiveTo: dayBefore, updatedAt: new Date() });
 
   const doc = {
     employeeId,
     scheduleId,
     effectiveFrom,
     effectiveTo: req.body.effectiveTo ? new Date(req.body.effectiveTo) : null,
-    assignedBy: new ObjectId(req.user._id),
+    assignedBy: req.user.id,
     createdAt: new Date(),
   };
   const result = await insertOne('employeeShiftAssignments', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...doc });
 };
 
 const getEmployeeScheduleAssignment = async (req, res) => {
-  const employeeId = new ObjectId(req.params.employeeId);
+  const employeeId = req.params.employeeId;
   const scopedIds = await getScopedEmployeeIds(req.user);
-  if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(employeeId))) {
+  if (scopedIds !== null && !scopedIds.includes(employeeId)) {
     return returnFunction(res, 403, false, 'You are not authorized to view this employee\'s schedule.');
   }
   const now = new Date();
-  const assignment = await global.dbo.collection('employeeShiftAssignments').findOne(
-    { employeeId, effectiveFrom: { $lte: now }, $or: [{ effectiveTo: null }, { effectiveTo: { $gte: now } }] },
-    { sort: { effectiveFrom: -1 } }
-  );
+  const assignment = await knex('employeeShiftAssignments')
+    .where({ employeeId }).where('effectiveFrom', '<=', now)
+    .where((qb) => qb.whereNull('effectiveTo').orWhere('effectiveTo', '>=', now))
+    .orderBy('effectiveFrom', 'desc').first();
   if (!assignment) return returnFunction(res, 200, true, req.locale.success, null);
-  const schedule = await findOne('work_schedules', { _id: assignment.scheduleId });
+  const schedule = await knex('work_schedules').where({ id: assignment.scheduleId }).first();
   return returnFunction(res, 200, true, req.locale.success, { ...assignment, schedule: schedule || null });
 };
 
@@ -1440,12 +1442,12 @@ const getEmployeeScheduleAssignment = async (req, res) => {
 // "normal" schedule is on a given date via their current employeeShiftAssignments link.
 async function getEffectiveScheduleForEmployee(employeeId, dateStr) {
   const date = new Date(`${dateStr}T00:00:00.000Z`);
-  const assignment = await global.dbo.collection('employeeShiftAssignments').findOne(
-    { employeeId, effectiveFrom: { $lte: date }, $or: [{ effectiveTo: null }, { effectiveTo: { $gte: date } }] },
-    { sort: { effectiveFrom: -1 } }
-  );
+  const assignment = await knex('employeeShiftAssignments')
+    .where({ employeeId: String(employeeId) }).where('effectiveFrom', '<=', date)
+    .where((qb) => qb.whereNull('effectiveTo').orWhere('effectiveTo', '>=', date))
+    .orderBy('effectiveFrom', 'desc').first();
   if (!assignment) return null;
-  return findOne('work_schedules', { _id: assignment.scheduleId });
+  return knex('work_schedules').where({ id: assignment.scheduleId }).first();
 }
 
 const bulkCreateShifts = async (req, res) => {
@@ -1465,26 +1467,26 @@ const bulkCreateShifts = async (req, res) => {
     addressLat:   coords?.lat ?? null,
     addressLng:   coords?.lng ?? null,
     notes:        notes || '',
-    taskTemplateId: taskTemplateId ? new ObjectId(taskTemplateId) : null,
-    createdBy:    new ObjectId(req.user._id),
+    taskTemplateId: taskTemplateId ? String(taskTemplateId) : null,
+    createdBy:    req.user.id,
     createdAt:    new Date(),
   };
 
   const docs = [];
   if (open) {
     for (const date of dates) {
-      docs.push({ ...shiftBase, employeeId: null, isOpen: true, date });
+      docs.push({ id: newId(), ...shiftBase, employeeId: null, isOpen: true, date });
     }
   } else {
     for (const empId of employeeIds) {
       for (const date of dates) {
-        docs.push({ ...shiftBase, employeeId: new ObjectId(empId), isOpen: false, date });
+        docs.push({ id: newId(), ...shiftBase, employeeId: String(empId), isOpen: false, date });
       }
     }
   }
-  const result = await global.dbo.collection('shifts').insertMany(docs);
+  await knex('shifts').insert(docs);
   if (taskTemplateId) {
-    await Promise.all(Object.values(result.insertedIds).map((id) => materializeShiftTasks(id, taskTemplateId)));
+    await Promise.all(docs.map((d) => materializeShiftTasks(d.id, taskTemplateId)));
   }
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { count: docs.length });
 };
@@ -1495,28 +1497,28 @@ const getMyShifts = async (req, res) => {
   const empId = req.user.employeeId;
   if (!empId) return returnFunction(res, 400, false, 'No employee profile linked.');
   const today = new Date().toISOString().split('T')[0];
-  const shifts = await findMany('shifts', { employeeId: empId, date: { $gte: today } }, { sort: { date: 1 }, limit: 30 });
+  const shifts = await knex('shifts').where({ employeeId: String(empId) }).where('date', '>=', today).orderBy('date', 'asc').limit(30);
   return returnFunction(res, 200, true, req.locale.success, shifts);
 };
 
 const getOpenShifts = async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
-  const shifts = await findMany('shifts', { isOpen: true, employeeId: null, date: { $gte: today } }, { sort: { date: 1 } });
+  const shifts = await knex('shifts').where({ isOpen: true }).whereNull('employeeId').where('date', '>=', today).orderBy('date', 'asc');
   return returnFunction(res, 200, true, req.locale.success, shifts);
 };
 
 const applyForShift = async (req, res) => {
   const empId = req.user.employeeId;
   if (!empId) return returnFunction(res, 400, false, 'No employee profile linked.');
-  const shift = await findOne('shifts', { _id: new ObjectId(req.params.id) });
+  const shift = await knex('shifts').where({ id: req.params.id }).first();
   if (!shift) return returnFunction(res, 404, false, 'Shift not found.');
   if (!shift.isOpen) return returnFunction(res, 400, false, 'This shift is not open for applications.');
-  const existing = await findOne('shift_applications', { shiftId: new ObjectId(req.params.id), employeeId: empId });
+  const existing = await knex('shift_applications').where({ shiftId: req.params.id, employeeId: String(empId) }).first();
   if (existing) return returnFunction(res, 409, false, 'You have already applied for this shift.');
-  const emp = await findOne('employees', { _id: empId });
-  const result = await global.dbo.collection('shift_applications').insertOne({
-    shiftId:      new ObjectId(req.params.id),
-    employeeId:   empId,
+  const emp = await knex('employees').where({ id: String(empId) }).first();
+  const result = await insertOne('shift_applications', {
+    shiftId:      req.params.id,
+    employeeId:   String(empId),
     employeeName: emp?.fullName || '',
     status:       'pending',
     note:         req.body.note || '',
@@ -1527,7 +1529,7 @@ const applyForShift = async (req, res) => {
     type: 'shift', subType: 'shift_application',
     title: `Shift application from ${emp?.fullName || 'An employee'}`,
     subtitle: `Shift ${shift.date || ''} ${shift.startTime || ''}–${shift.endTime || ''}`.trim(),
-    referenceId: result.insertedId, referenceModel: 'shift_applications',
+    referenceId: new ObjectId(result.id), referenceModel: 'shift_applications',
     requiresAction: true, triggeredBy: req.user._id,
   };
   await notifyManager(empId, inboxItem);
@@ -1537,34 +1539,26 @@ const applyForShift = async (req, res) => {
 };
 
 const getShiftApplications = async (req, res) => {
-  const filter = {};
-  if (req.query.shiftId) filter.shiftId = new ObjectId(req.query.shiftId);
-  if (req.query.status)  filter.status  = req.query.status;
-  const apps   = await findMany('shift_applications', filter, { sort: { createdAt: -1 } });
-  const shiftIds = [...new Set(apps.map(a => a.shiftId))];
-  const shifts   = shiftIds.length ? await findMany('shifts', { _id: { $in: shiftIds } }) : [];
-  const shiftMap = Object.fromEntries(shifts.map(s => [String(s._id), s]));
-  return returnFunction(res, 200, true, req.locale.success, apps.map(a => ({ ...a, shift: shiftMap[String(a.shiftId)] ?? null })));
+  let query = knex('shift_applications');
+  if (req.query.shiftId) query = query.where({ shiftId: req.query.shiftId });
+  if (req.query.status)  query = query.where({ status: req.query.status });
+  const apps = await query.orderBy('createdAt', 'desc');
+  const shiftIds = [...new Set(apps.map((a) => a.shiftId))];
+  const shifts   = shiftIds.length ? await knex('shifts').whereIn('id', shiftIds) : [];
+  const shiftMap = Object.fromEntries(shifts.map((s) => [s.id, s]));
+  return returnFunction(res, 200, true, req.locale.success, apps.map((a) => ({ ...a, shift: shiftMap[a.shiftId] ?? null })));
 };
 
 const resolveShiftApplication = async (req, res) => {
   const { status } = req.body;
   if (!['approved', 'rejected'].includes(status)) return returnFunction(res, 400, false, 'Invalid status.');
-  const app = await findOne('shift_applications', { _id: new ObjectId(req.params.id) });
+  const app = await knex('shift_applications').where({ id: req.params.id }).first();
   if (!app) return returnFunction(res, 404, false, 'Application not found.');
-  await global.dbo.collection('shift_applications').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { status, resolvedAt: new Date(), resolvedBy: new ObjectId(req.user._id) } }
-  );
+  await knex('shift_applications').where({ id: req.params.id }).update({ status, resolvedAt: new Date(), resolvedBy: req.user.id });
   if (status === 'approved') {
-    await global.dbo.collection('shifts').updateOne(
-      { _id: app.shiftId },
-      { $set: { employeeId: app.employeeId, isOpen: false } }
-    );
-    await global.dbo.collection('shift_applications').updateMany(
-      { shiftId: app.shiftId, _id: { $ne: new ObjectId(req.params.id) } },
-      { $set: { status: 'rejected', resolvedAt: new Date() } }
-    );
+    await knex('shifts').where({ id: app.shiftId }).update({ employeeId: app.employeeId, isOpen: false });
+    await knex('shift_applications').where({ shiftId: app.shiftId }).whereNot('id', req.params.id)
+      .update({ status: 'rejected', resolvedAt: new Date() });
   }
 
   notifyEmployee(app.employeeId, {
@@ -1575,8 +1569,8 @@ const resolveShiftApplication = async (req, res) => {
 
   {
     const [empUser, emp] = await Promise.all([
-      findOne('users', { employeeId: app.employeeId }, { projection: { email: 1 } }),
-      findOne('employees', { _id: app.employeeId }, { projection: { fullName: 1 } }),
+      knex('users').where({ employeeId: app.employeeId }).select('email').first(),
+      knex('employees').where({ id: app.employeeId }).select('fullName').first(),
     ]);
     if (empUser?.email) {
       const tokens = { employeeName: emp?.fullName || 'there', status };
@@ -1594,11 +1588,11 @@ const resolveShiftApplication = async (req, res) => {
 const getMyShiftApplications = async (req, res) => {
   const empId = req.user.employeeId;
   if (!empId) return returnFunction(res, 400, false, 'No employee profile linked.');
-  const apps    = await findMany('shift_applications', { employeeId: empId }, { sort: { createdAt: -1 } });
-  const shiftIds = [...new Set(apps.map(a => a.shiftId))];
-  const shifts   = shiftIds.length ? await findMany('shifts', { _id: { $in: shiftIds } }) : [];
-  const shiftMap = Object.fromEntries(shifts.map(s => [String(s._id), s]));
-  return returnFunction(res, 200, true, req.locale.success, apps.map(a => ({ ...a, shift: shiftMap[String(a.shiftId)] ?? null })));
+  const apps = await knex('shift_applications').where({ employeeId: String(empId) }).orderBy('createdAt', 'desc');
+  const shiftIds = [...new Set(apps.map((a) => a.shiftId))];
+  const shifts   = shiftIds.length ? await knex('shifts').whereIn('id', shiftIds) : [];
+  const shiftMap = Object.fromEntries(shifts.map((s) => [s.id, s]));
+  return returnFunction(res, 200, true, req.locale.success, apps.map((a) => ({ ...a, shift: shiftMap[a.shiftId] ?? null })));
 };
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
@@ -1612,19 +1606,19 @@ const getAttendanceOverview = async (req, res) => {
     return returnFunction(res, 200, true, req.locale.success, { present: 0, absent: 0, late: 0, onLeave: 0, notClockedIn: 0, total: 0 });
   }
 
-  const empFilter = { status: 'active' };
-  if (scopedIds !== null) empFilter._id = { $in: scopedIds };
-  const employees = await findMany('employees', empFilter, { projection: { _id: 1 } });
-  const empIds = employees.map((e) => e._id);
+  let empQuery = knex('employees').where({ status: 'active' });
+  if (scopedIds !== null) empQuery = empQuery.whereIn('id', scopedIds);
+  const employees = await empQuery.select('id');
+  const empIds = employees.map((e) => e.id);
 
-  const recordFilter = { date: today, employeeId: { $in: empIds } };
-  const byStatus = await global.dbo.collection('attendance_records').aggregate([
-    { $match: recordFilter },
-    { $group: { _id: '$status', count: { $sum: 1 } } },
-  ]).toArray();
-  const statusMap = Object.fromEntries(byStatus.map((s) => [s._id, s.count]));
+  const byStatus = empIds.length
+    ? await knex('attendance_records').where({ date: today }).whereIn('employeeId', empIds).select('status').count('* as count').groupBy('status')
+    : [];
+  const statusMap = Object.fromEntries(byStatus.map((s) => [s.status, Number(s.count)]));
 
-  const recordedCount = await global.dbo.collection('attendance_records').countDocuments(recordFilter);
+  const recordedCount = empIds.length
+    ? await knex('attendance_records').where({ date: today }).whereIn('employeeId', empIds).count('* as count').first().then((r) => Number(r.count))
+    : 0;
 
   return returnFunction(res, 200, true, req.locale.success, {
     present:      statusMap.present || 0,
@@ -1644,21 +1638,20 @@ const getAttendanceSummary = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const empFilter = { status: 'active' };
-  if (scopedIds !== null) empFilter._id = { $in: scopedIds };
-  const employees = await findMany('employees', empFilter, { projection: { fullName: 1, department: 1 } });
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  let empQuery = knex('employees').where({ status: 'active' });
+  if (scopedIds !== null) empQuery = empQuery.whereIn('id', scopedIds);
+  const employees = await empQuery.select('id', 'fullName', 'department');
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
 
-  const records = await global.dbo.collection('attendance_records').find({
-    date: { $gte: from, $lte: to },
-    employeeId: { $in: employees.map((e) => e._id) },
-  }).toArray();
+  const records = employees.length
+    ? await knex('attendance_records').where('date', '>=', from).where('date', '<=', to).whereIn('employeeId', employees.map((e) => e.id))
+    : [];
 
   const groups = {};
   for (const r of records) {
-    const emp = empMap[String(r.employeeId)];
+    const emp = empMap[r.employeeId];
     if (!emp) continue;
-    const key = groupBy === 'department' ? (emp.department || 'Unassigned') : String(r.employeeId);
+    const key = groupBy === 'department' ? (emp.department || 'Unassigned') : r.employeeId;
     if (!groups[key]) {
       groups[key] = {
         key,
@@ -1691,22 +1684,20 @@ const getOvertimeAnalytics = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const empFilter = {};
-  if (scopedIds !== null) empFilter._id = { $in: scopedIds };
-  const employees = await findMany('employees', empFilter, { projection: { fullName: 1, department: 1 } });
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  let empQuery = knex('employees');
+  if (scopedIds !== null) empQuery = empQuery.whereIn('id', scopedIds);
+  const employees = await empQuery.select('id', 'fullName', 'department');
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
 
-  const records = await global.dbo.collection('attendance_records').find({
-    date: { $gte: from, $lte: to },
-    employeeId: { $in: employees.map((e) => e._id) },
-    overtimeMinutes: { $gt: 0 },
-  }).toArray();
+  const records = employees.length
+    ? await knex('attendance_records').where('date', '>=', from).where('date', '<=', to).whereIn('employeeId', employees.map((e) => e.id)).where('overtimeMinutes', '>', 0)
+    : [];
 
   const groups = {};
   for (const r of records) {
-    const emp = empMap[String(r.employeeId)];
+    const emp = empMap[r.employeeId];
     if (!emp) continue;
-    const key = groupBy === 'department' ? (emp.department || 'Unassigned') : String(r.employeeId);
+    const key = groupBy === 'department' ? (emp.department || 'Unassigned') : r.employeeId;
     if (!groups[key]) groups[key] = { key, label: groupBy === 'department' ? key : emp.fullName, overtimeMinutes: 0 };
     groups[key].overtimeMinutes += r.overtimeMinutes || 0;
   }
@@ -1725,23 +1716,20 @@ const getLateArrivalsAnalytics = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, { trend: [], leaderboard: [] });
 
-  const empFilter = { status: 'active' };
-  if (scopedIds !== null) empFilter._id = { $in: scopedIds };
-  const employees = await findMany('employees', empFilter, { projection: { fullName: 1, department: 1 } });
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  let empQuery = knex('employees').where({ status: 'active' });
+  if (scopedIds !== null) empQuery = empQuery.whereIn('id', scopedIds);
+  const employees = await empQuery.select('id', 'fullName', 'department');
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
 
-  const lateRecords = await global.dbo.collection('attendance_records').find({
-    date: { $gte: from, $lte: to },
-    status: 'late',
-    employeeId: { $in: employees.map((e) => e._id) },
-  }).toArray();
+  const lateRecords = employees.length
+    ? await knex('attendance_records').where('date', '>=', from).where('date', '<=', to).where({ status: 'late' }).whereIn('employeeId', employees.map((e) => e.id))
+    : [];
 
   const byDay = {};
   const byEmployee = {};
   for (const r of lateRecords) {
     byDay[r.date] = (byDay[r.date] || 0) + 1;
-    const key = String(r.employeeId);
-    byEmployee[key] = (byEmployee[key] || 0) + 1;
+    byEmployee[r.employeeId] = (byEmployee[r.employeeId] || 0) + 1;
   }
 
   const trend = Object.entries(byDay).map(([date, count]) => ({ date, count })).sort((a, b) => a.date.localeCompare(b.date));
@@ -1761,20 +1749,19 @@ const getAbsenteeismAnalytics = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const empFilter = { status: 'active' };
-  if (scopedIds !== null) empFilter._id = { $in: scopedIds };
-  const employees = await findMany('employees', empFilter, { projection: { department: 1 } });
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  let empQuery = knex('employees').where({ status: 'active' });
+  if (scopedIds !== null) empQuery = empQuery.whereIn('id', scopedIds);
+  const employees = await empQuery.select('id', 'department');
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
 
-  const records = await global.dbo.collection('attendance_records').find({
-    date: { $gte: from, $lte: to },
-    employeeId: { $in: employees.map((e) => e._id) },
-    status: { $in: ['present', 'late', 'absent', 'half_day'] },
-  }).toArray();
+  const records = employees.length
+    ? await knex('attendance_records').where('date', '>=', from).where('date', '<=', to)
+        .whereIn('employeeId', employees.map((e) => e.id)).whereIn('status', ['present', 'late', 'absent', 'half_day'])
+    : [];
 
   const groups = {};
   for (const r of records) {
-    const emp = empMap[String(r.employeeId)];
+    const emp = empMap[r.employeeId];
     if (!emp) continue;
     const dept = emp.department || 'Unassigned';
     if (!groups[dept]) groups[dept] = { department: dept, absentDays: 0, totalDays: 0 };

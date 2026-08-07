@@ -4,11 +4,12 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
-// employees/users/job_history/staff_notes now live in Postgres (Phase 1); everything
-// else this file touches (attendance_records, appraisal_records/goals/reviews,
-// employee_awards, scheduled_events, project_members/projects/project_time_entries,
-// tasks, jobRequisitions/candidates/applications) is unmigrated and stays on the Mongo
-// helpers via commonDBFunctions/global.dbo, imported separately below.
+// employees/users/job_history/staff_notes (Phase 1) and attendance_records (Phase 3b)
+// now live in Postgres; everything else this file touches (appraisal_records/goals/
+// reviews, employee_awards, scheduled_events, project_members/projects/
+// project_time_entries, tasks, jobRequisitions/candidates/applications) is unmigrated
+// and stays on the Mongo helpers via commonDBFunctions/global.dbo, imported separately
+// below.
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -202,19 +203,18 @@ const getMyPayslips = async (req, res) => {
 };
 
 // ── Attendance ─────────────────────────────────────────────────────────────────
-// attendance_records is unmigrated (Phase 3) — stays Mongo.
+// attendance_records now lives in Postgres (Phase 3b).
 const getMyAttendance = async (req, res) => {
   const empId = myEmployeeId(req);
   if (!empId) return returnFunction(res, 404, false, 'No employee record linked.');
 
-  const filter = { employeeId: new ObjectId(empId) };
+  let query = pgDB.knex('attendance_records').where({ employeeId: empId });
   if (req.query.month && req.query.year) {
     const m = String(req.query.month).padStart(2, '0');
-    filter.date = { $gte: `${req.query.year}-${m}-01`, $lte: `${req.query.year}-${m}-31` };
+    query = query.where('date', '>=', `${req.query.year}-${m}-01`).where('date', '<=', `${req.query.year}-${m}-31`);
   }
 
-  const records = await global.dbo.collection('attendance_records')
-    .find(filter).sort({ date: -1 }).limit(90).toArray();
+  const records = await query.orderBy('date', 'desc').limit(90);
 
   return returnFunction(res, 200, true, 'OK', [{ employeeId: empId, records }]);
 };
@@ -259,8 +259,7 @@ const deleteMyDocument = async (req, res) => {
 };
 
 // ── Department Portal (department_head only) ────────────────────────────────────
-// attendance_records is unmigrated (Phase 3) — stays Mongo for the today's-attendance
-// snapshot; the employee roster itself is Postgres.
+// attendance_records now lives in Postgres (Phase 3b).
 const getDepartmentData = async (req, res) => {
   const empId = myEmployeeId(req);
   if (!empId) return returnFunction(res, 400, false, 'No employee profile linked to your account.');
@@ -275,11 +274,11 @@ const getDepartmentData = async (req, res) => {
     .select('id', 'fullName', 'staffNumber', 'designation', 'status', 'email', 'phone')
     .orderBy('fullName', 'asc');
 
-  const empIds = employees.map(e => new ObjectId(e.id));
+  const empIds = employees.map(e => e.id);
 
   // Today's attendance
   const today = new Date().toISOString().split('T')[0];
-  const todayAttendance = await global.dbo.collection('attendance_records').find({ employeeId: { $in: empIds }, date: today }).toArray();
+  const todayAttendance = empIds.length ? await pgDB.knex('attendance_records').whereIn('employeeId', empIds).where({ date: today }) : [];
   const present   = todayAttendance.filter(r => ['present', 'late'].includes(r.status)).length;
   const absent    = todayAttendance.filter(r => r.status === 'absent').length;
   const onLeave   = employees.filter(e => e.status === 'on_leave').length;

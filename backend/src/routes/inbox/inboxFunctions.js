@@ -125,9 +125,10 @@ const getInboxItem = async (req, res) => {
   }
 
   // Enrich with reference data. referenceModel is a collection name picked at write
-  // time by whatever module created this item — 'employees'/'users' (Phase 1) and
-  // 'leave_requests' (Phase 3a) now live in Postgres, everything else is still Mongo.
-  const PG_REFERENCE_MODELS = ['employees', 'users', 'leave_requests'];
+  // time by whatever module created this item — 'employees'/'users' (Phase 1),
+  // 'leave_requests' (Phase 3a), and 'timesheets'/'shift_notes'/'shift_applications'
+  // (Phase 3b) now live in Postgres, everything else is still Mongo.
+  const PG_REFERENCE_MODELS = ['employees', 'users', 'leave_requests', 'timesheets', 'shift_notes', 'shift_applications'];
   let referenceData = null;
   if (item.referenceId && item.referenceModel) {
     referenceData = PG_REFERENCE_MODELS.includes(item.referenceModel)
@@ -216,10 +217,17 @@ const takeAction = async (req, res) => {
       }
 
       if (item.type === 'timesheet' && item.referenceModel === 'timesheets') {
-        const update = action === 'approved'
-          ? { status: 'approved', approvedBy: req.user._id, approvedAt: now }
-          : { status: 'rejected', rejectedBy: req.user._id, rejectedAt: now, rejectionReason: reason || '' };
-        await global.dbo.collection('timesheets').updateOne({ _id: item.referenceId }, { $set: { ...update, updatedAt: now } });
+        // Same fix as the leave-requests branch above, for the same reason: this used
+        // to write straight to timesheets (with fields — rejectedBy/rejectedAt — the
+        // real timesheets schema never even defines) bypassing approveTimesheet/
+        // rejectTimesheet's own authorization check entirely.
+        const { approveTimesheet, rejectTimesheet } = require('../attendance/attendanceFunctions');
+        const shimReq = { params: { id: String(item.referenceId) }, body: { reason }, user: req.user, locale: req.locale };
+        let shimResult = null;
+        const shimRes = { status: () => shimRes, json: (payload) => { shimResult = payload; } };
+        if (action === 'approved') await approveTimesheet(shimReq, shimRes);
+        else await rejectTimesheet(shimReq, shimRes);
+        if (shimResult && !shimResult.success) return returnFunction(res, 400, false, shimResult.message);
       }
     } catch {
       // Business action failed but still mark inbox item

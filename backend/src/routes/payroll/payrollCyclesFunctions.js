@@ -7,9 +7,9 @@ const { validateRequiredFields, getPagination, paginatedResponse } = require('..
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // payroll_concepts, employee_compensations, payroll_cycles, payroll_results (+ its child
 // tables), payslips, employees, departments, users, compensation_audit_logs (Phase 2),
-// plus leave_requests/leave_types/public_holidays (Phase 3a), now live in Postgres.
-// Everything this file still touches that HASN'T been migrated yet (timesheets,
-// expense_claims, tax_config, overtime_config, company_settings, GL accounting) stays on
+// leave_requests/leave_types/public_holidays (Phase 3a), and timesheets (Phase 3b) now
+// live in Postgres. Everything this file still touches that HASN'T been migrated yet
+// (expense_claims, tax_config, overtime_config, company_settings, GL accounting) stays on
 // the Mongo helpers via commonDBFunctions/global.dbo, imported separately below.
 const { findOne, findMany, insertOne, updateOne, countDocuments, knex, newId, addChildRow } = require('../../functions/Database/pgDBFunctions');
 const { generatePayslipFromResult } = require('../../services/payslipService');
@@ -470,15 +470,13 @@ async function doLockCycleInternal(req, res, cycle) {
     // period — not raw attendance_records. A timesheet must go through the manager
     // approval gate before its overtime hours affect pay, and each one is stamped
     // with this cycle's id below so it's never counted into a payroll run twice.
-    // timesheets is unmigrated — stays Mongo.
+    // timesheets now lives in Postgres (Phase 3b). empObjectId (below) is still needed
+    // for expense_claims, which stays Mongo.
     const empObjectId = new ObjectId(emp.id);
-    const cycleTimesheets = await global.dbo.collection('timesheets').find({
-      employeeId: empObjectId,
-      status: 'approved',
-      payrollRunId: null,
-      weekStart: { $gte: cycle.periodStartDate, $lte: cycle.periodEndDate },
-    }).toArray();
-    matchedTimesheetIds.push(...cycleTimesheets.map((t) => t._id));
+    const cycleTimesheets = await knex('timesheets')
+      .where({ employeeId: emp.id, status: 'approved' }).whereNull('payrollRunId')
+      .where('weekStart', '>=', cycle.periodStartDate).where('weekStart', '<=', cycle.periodEndDate);
+    matchedTimesheetIds.push(...cycleTimesheets.map((t) => t.id));
     const overtimeMinutesTotal = cycleTimesheets.reduce((sum, t) => sum + (t.overtimeMinutes || 0), 0);
     const overtimeHours  = Math.round((overtimeMinutesTotal / 60) * 100) / 100;
 
@@ -668,10 +666,7 @@ async function doLockCycleInternal(req, res, cycle) {
   });
 
   if (matchedTimesheetIds.length) {
-    await global.dbo.collection('timesheets').updateMany(
-      { _id: { $in: matchedTimesheetIds } },
-      { $set: { payrollRunId: new ObjectId(cycle.id), updatedAt: new Date() } }
-    );
+    await knex('timesheets').whereIn('id', matchedTimesheetIds).update({ payrollRunId: cycle.id, updatedAt: new Date() });
   }
 
   // A fully-repaid loan is auto-unassigned via isActive:false, the same soft-delete
