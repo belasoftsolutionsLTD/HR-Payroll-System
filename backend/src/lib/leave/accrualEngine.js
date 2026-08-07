@@ -1,4 +1,9 @@
+const { ObjectId } = require('mongodb');
 const { findMany, findOne, updateOne, insertOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// `employees`/`users` now live in Postgres; leave_accrual_policies/leave_balances/
+// leave_audit_log/leave_types are unmigrated, so they stay on the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 
 const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 
@@ -15,10 +20,15 @@ const runAccrual = async (triggeredBy = null, onlyEmployeeIds = null) => {
   const policies = await findMany('leave_accrual_policies', { isActive: true });
   if (!policies.length) return { processed: 0, message: 'No active accrual policies.' };
 
-  const employeeFilter = { status: { $ne: 'inactive' } };
-  if (onlyEmployeeIds) employeeFilter._id = { $in: onlyEmployeeIds };
-  const employees = await findMany('employees', employeeFilter);
-  const users = await findMany('users', { employeeId: { $in: employees.map(e => e._id) } }, { projection: { employeeId: 1, role: 1 } });
+  let employeeQuery = pgDB.knex('employees').whereNot('status', 'inactive');
+  if (onlyEmployeeIds) employeeQuery = employeeQuery.whereIn('id', onlyEmployeeIds.map(String));
+  // Raw knex rows only carry `.id` — `_id` (a real ObjectId) is added back here since
+  // the rest of this file, and the Mongo leave_balances/leave_audit_log documents it
+  // writes below, still expect employee._id in the Mongo-document-shaped sense.
+  const employees = (await employeeQuery).map((e) => ({ ...e, _id: new ObjectId(e.id) }));
+  const users = employees.length
+    ? await pgDB.knex('users').whereIn('employeeId', employees.map(e => e.id)).select('employeeId', 'role')
+    : [];
   const roleByEmployeeId = Object.fromEntries(users.map(u => [String(u.employeeId), u.role]));
 
   const policyApplies = (policy, employee) => {

@@ -1,6 +1,10 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// `employees`/`users` now live in Postgres; `inbox_items` itself is unmigrated, so it's
+// aliased rather than imported under the same names as the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 
 // ── Internal helper — called by other modules when events occur ────────────────
@@ -46,18 +50,18 @@ const createInboxItem = async ({
 
 // ── Notify all HR users ────────────────────────────────────────────────────────
 const notifyHR = async (itemData) => {
-  const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] } }, { projection: { _id: 1 } });
+  const hrUsers = await pgDB.knex('users').whereIn('role', ['super_admin', 'hr_manager']).select('id');
   for (const u of hrUsers) {
-    await createInboxItem({ ...itemData, recipientId: u._id });
+    await createInboxItem({ ...itemData, recipientId: new ObjectId(u.id) });
   }
 };
 
 // ── Notify employee's manager ──────────────────────────────────────────────────
 const notifyManager = async (employeeId, itemData) => {
   if (!employeeId) return;
-  const emp = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { managerId: 1 } });
+  const emp = await pgDB.findOne('employees', { id: String(employeeId) });
   if (!emp?.managerId) return;
-  const mgr = await findOne('users', { employeeId: emp.managerId }, { projection: { _id: 1 } });
+  const mgr = await pgDB.findOne('users', { employeeId: emp.managerId });
   if (mgr) await createInboxItem({ ...itemData, recipientId: mgr._id });
 };
 
@@ -91,8 +95,8 @@ const listInbox = async (req, res) => {
   const enriched = await Promise.all(items.map(async (item) => {
     let triggeredByUser = null;
     if (item.triggeredBy) {
-      const u = await findOne('users', { _id: item.triggeredBy }, { projection: { name: 1 } });
-      const emp = u ? await findOne('employees', { _id: item.triggeredBy }, { projection: { fullName: 1, designation: 1, department: 1 } }) : null;
+      const u = await pgDB.findOne('users', { id: String(item.triggeredBy) });
+      const emp = u ? await pgDB.findOne('employees', { id: String(item.triggeredBy) }) : null;
       triggeredByUser = { name: u?.name || '', designation: emp?.designation || '', department: emp?.department || '' };
     }
     return { ...item, triggeredByUser };
@@ -120,14 +124,18 @@ const getInboxItem = async (req, res) => {
     await updateOne('inbox_items', { _id: item._id }, { $set: { status: 'read', updatedAt: new Date() } });
   }
 
-  // Enrich with reference data
+  // Enrich with reference data. referenceModel is a collection name picked at write
+  // time by whatever module created this item — 'employees'/'users' now live in
+  // Postgres (Phase 1), everything else is still Mongo.
   let referenceData = null;
   if (item.referenceId && item.referenceModel) {
-    referenceData = await findOne(item.referenceModel, { _id: item.referenceId });
+    referenceData = ['employees', 'users'].includes(item.referenceModel)
+      ? await pgDB.findOne(item.referenceModel, { id: String(item.referenceId) })
+      : await findOne(item.referenceModel, { _id: item.referenceId });
 
     // Enrich with employee data if available
     if (referenceData?.employeeId) {
-      const emp = await findOne('employees', { _id: referenceData.employeeId });
+      const emp = await pgDB.findOne('employees', { id: String(referenceData.employeeId) });
       referenceData = { ...referenceData, employee: emp || null };
     }
 
@@ -189,7 +197,7 @@ const takeAction = async (req, res) => {
 
         const claim = await findOne('expense_claims', { _id: item.referenceId });
         if (claim) {
-          const empUser = await findOne('users', { employeeId: claim.employeeId });
+          const empUser = await pgDB.findOne('users', { employeeId: String(claim.employeeId) });
           if (empUser) {
             await createInboxItem({
               recipientId: empUser._id,

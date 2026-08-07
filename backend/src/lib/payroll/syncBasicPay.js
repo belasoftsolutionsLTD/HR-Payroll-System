@@ -1,5 +1,9 @@
 const { ObjectId } = require('mongodb');
 const { findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// compensation_audit_logs now lives in Postgres; payroll_concepts/employee_compensations
+// are unmigrated (Phase 2), so they stay on the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 
 const BASIC_PAY_CODE = 'BASIC';
 
@@ -32,10 +36,10 @@ async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effec
   if (!grossPay || grossPay <= 0) {
     if (existing) {
       await updateOne('employee_compensations', { _id: existing._id }, { $set: { isActive: false, updatedAt: new Date() } });
-      await insertOne('compensation_audit_logs', {
-        employeeId: empObjectId, compensationId: existing._id, conceptName: existing.conceptName, action: 'removed',
-        changes: [{ field: 'isActive', oldValue: true, newValue: false }],
-        performedBy: actorUserId ?? null, performedAt: new Date(),
+      await pgDB.insertOne('compensation_audit_logs', {
+        employeeId: String(empObjectId), compensationId: String(existing._id), conceptName: existing.conceptName, action: 'removed',
+        changes: JSON.stringify([{ field: 'isActive', oldValue: true, newValue: false }]),
+        performedBy: actorUserId ? String(actorUserId) : null, performedAt: new Date(),
       }).catch(() => {});
     }
     return;
@@ -44,10 +48,10 @@ async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effec
   if (existing) {
     if (existing.amount === grossPay) return;
     await updateOne('employee_compensations', { _id: existing._id }, { $set: { amount: grossPay, updatedAt: new Date() } });
-    await insertOne('compensation_audit_logs', {
-      employeeId: empObjectId, compensationId: existing._id, conceptName: existing.conceptName, action: 'updated',
-      changes: [{ field: 'amount', oldValue: existing.amount, newValue: grossPay }],
-      performedBy: actorUserId ?? null, performedAt: new Date(),
+    await pgDB.insertOne('compensation_audit_logs', {
+      employeeId: String(empObjectId), compensationId: String(existing._id), conceptName: existing.conceptName, action: 'updated',
+      changes: JSON.stringify([{ field: 'amount', oldValue: existing.amount, newValue: grossPay }]),
+      performedBy: actorUserId ? String(actorUserId) : null, performedAt: new Date(),
     }).catch(() => {});
     return;
   }
@@ -64,10 +68,10 @@ async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effec
     createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('employee_compensations', doc);
-  await insertOne('compensation_audit_logs', {
-    employeeId: empObjectId, compensationId: result.insertedId, conceptName: doc.conceptName, action: 'added',
-    changes: [{ field: 'amount', oldValue: null, newValue: grossPay }],
-    performedBy: actorUserId ?? null, performedAt: new Date(),
+  await pgDB.insertOne('compensation_audit_logs', {
+    employeeId: String(empObjectId), compensationId: String(result.insertedId), conceptName: doc.conceptName, action: 'added',
+    changes: JSON.stringify([{ field: 'amount', oldValue: null, newValue: grossPay }]),
+    performedBy: actorUserId ? String(actorUserId) : null, performedAt: new Date(),
   }).catch(() => {});
 }
 

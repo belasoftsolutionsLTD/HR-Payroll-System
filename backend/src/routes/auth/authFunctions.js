@@ -3,7 +3,11 @@ const jwt      = require('jsonwebtoken');
 const crypto   = require('crypto');
 const speakeasy = require('speakeasy');
 const QRCode   = require('qrcode');
-const { findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// `users` now lives in Postgres. `knex` is used directly for the handful of queries
+// pgDBFunctions' plain-equality shim can't express (a $gt on an expiry date, an atomic
+// $inc on tokenVersion).
+const { findOne, insertOne, updateOne, knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { sendEmail } = require('../../services/emailService');
@@ -22,7 +26,7 @@ const _issueTokens = async (user) => {
   // pre-existing behavior) only ever stopped *future* refreshes, not an already-issued
   // access token already in someone else's hands.
   const accessToken = jwt.sign(
-    { userId: user._id.toString(), tokenVersion: user.tokenVersion || 0 },
+    { userId: user.id, tokenVersion: user.tokenVersion || 0 },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
   );
@@ -31,8 +35,8 @@ const _issueTokens = async (user) => {
 
   // Store hashed refresh token against user (one active token per user)
   const hashed = crypto.createHash('sha256').update(refreshToken).digest('hex');
-  await updateOne('users', { _id: user._id }, {
-    $set: { refreshTokenHash: hashed, refreshTokenExpiresAt: expiresAt, updatedAt: new Date() },
+  await updateOne('users', { id: user.id }, {
+    refreshTokenHash: hashed, refreshTokenExpiresAt: expiresAt, updatedAt: new Date(),
   });
 
   return { accessToken, refreshToken };
@@ -71,11 +75,10 @@ const login = async (req, res) => {
   // If MFA is enabled, return a short-lived challenge token instead of full access
   if (user.mfaEnabled) {
     const mfaChallenge = jwt.sign(
-      { userId: user._id.toString(), mfaPending: true },
+      { userId: user.id, mfaPending: true },
       process.env.JWT_SECRET,
       { expiresIn: '5m' }
     );
-    const { password: _pw2 } = user;
     return returnFunction(res, 200, true, 'MFA required.', { mfaRequired: true, mfaChallenge });
   }
 
@@ -103,9 +106,9 @@ const refreshAccessToken = async (req, res) => {
 
 const logout = async (req, res) => {
   // Invalidate refresh token by clearing it
-  if (req.user?._id) {
-    await updateOne('users', { _id: req.user._id }, {
-      $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
+  if (req.user?.id) {
+    await updateOne('users', { id: req.user.id }, {
+      refreshTokenHash: null, refreshTokenExpiresAt: null,
     });
   }
   return returnFunction(res, 200, true, 'Logged out successfully.');
@@ -136,7 +139,7 @@ const register = async (req, res) => {
   });
 
   return returnFunction(res, 201, true, locale.createdSuccessfully, {
-    userId: result.insertedId,
+    userId: result.id,
   });
 };
 
@@ -153,8 +156,7 @@ const completeMfaLogin = async (req, res) => {
   }
   if (!payload.mfaPending) return returnFunction(res, 400, false, 'Invalid challenge token.');
 
-  const { ObjectId } = require('mongodb');
-  const user = await findOne('users', { _id: new ObjectId(payload.userId) });
+  const user = await findOne('users', { id: payload.userId });
   if (!user || !user.mfaEnabled) return returnFunction(res, 401, false, 'Invalid request.');
 
   const valid = speakeasy.totp.verify({ secret: user.mfaSecret, encoding: 'base32', token: code, window: 1 });
@@ -177,8 +179,8 @@ const forgotPassword = async (req, res) => {
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
-  await updateOne('users', { _id: user._id }, {
-    $set: { passwordResetToken: tokenHash, passwordResetExpires: expiresAt, updatedAt: new Date() },
+  await updateOne('users', { id: user.id }, {
+    passwordResetToken: tokenHash, passwordResetExpires: expiresAt, updatedAt: new Date(),
   });
 
   const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/reset-password?token=${rawToken}`;
@@ -211,21 +213,24 @@ const resetPassword = async (req, res) => {
   if (newPassword.length < 8) return returnFunction(res, 400, false, 'Password must be at least 8 characters.');
 
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-  const user = await findOne('users', {
-    passwordResetToken:   tokenHash,
-    passwordResetExpires: { $gt: new Date() },
-  });
+  // $gt on passwordResetExpires — beyond pgDBFunctions' plain-equality shim, so this
+  // one query goes straight against knex.
+  const user = await knex('users')
+    .where({ passwordResetToken: tokenHash })
+    .where('passwordResetExpires', '>', new Date())
+    .first();
 
   if (!user) return returnFunction(res, 400, false, 'Reset link is invalid or has expired.');
 
   const hashed = await bcrypt.hash(newPassword, 12);
-  await updateOne('users', { _id: user._id }, {
-    $set:   { password: hashed, mustResetPassword: false, updatedAt: new Date() },
-    $unset: { passwordResetToken: '', passwordResetExpires: '', refreshTokenHash: '', refreshTokenExpiresAt: '' },
+  await knex('users').where({ id: user.id }).update({
+    password: hashed, mustResetPassword: false, updatedAt: new Date(),
+    passwordResetToken: null, passwordResetExpires: null,
+    refreshTokenHash: null, refreshTokenExpiresAt: null,
     // Revokes any access token issued before this reset — the exact scenario a forgot-
     // password flow exists for (an account may have been compromised) needs the old
     // session killed immediately, not just left to expire on its own.
-    $inc: { tokenVersion: 1 },
+    tokenVersion: knex.raw('"tokenVersion" + 1'),
   });
 
   return returnFunction(res, 200, true, 'Password reset successfully. Please log in.');
@@ -233,14 +238,14 @@ const resetPassword = async (req, res) => {
 
 // ── MFA: Setup (generate secret + QR code) ───────────────────────────────────
 const setupMfa = async (req, res) => {
-  const user = await findOne('users', { _id: req.user._id });
+  const user = await findOne('users', { id: req.user.id });
   if (!user) return returnFunction(res, 404, false, 'User not found.');
   if (user.mfaEnabled) return returnFunction(res, 400, false, 'MFA is already enabled.');
 
   const secret = speakeasy.generateSecret({ name: `${COMPANY_NAME} (${user.email})`, length: 20 });
 
-  await updateOne('users', { _id: user._id }, {
-    $set: { mfaSecret: secret.base32, mfaEnabled: false, updatedAt: new Date() },
+  await updateOne('users', { id: user.id }, {
+    mfaSecret: secret.base32, mfaEnabled: false, updatedAt: new Date(),
   });
 
   const qrDataUrl = await QRCode.toDataURL(secret.otpauth_url);
@@ -253,7 +258,7 @@ const setupMfa = async (req, res) => {
 // ── MFA: Verify + Activate ────────────────────────────────────────────────────
 const verifyMfa = async (req, res) => {
   if (!validateRequiredFields(req, res, ['code'])) return;
-  const user = await findOne('users', { _id: req.user._id });
+  const user = await findOne('users', { id: req.user.id });
   if (!user?.mfaSecret) return returnFunction(res, 400, false, 'MFA setup not started. Call /auth/mfa/setup first.');
 
   const valid = speakeasy.totp.verify({
@@ -265,14 +270,14 @@ const verifyMfa = async (req, res) => {
 
   if (!valid) return returnFunction(res, 401, false, 'Invalid code. Try again.');
 
-  await updateOne('users', { _id: user._id }, { $set: { mfaEnabled: true, updatedAt: new Date() } });
+  await updateOne('users', { id: user.id }, { mfaEnabled: true, updatedAt: new Date() });
   return returnFunction(res, 200, true, 'MFA enabled successfully.');
 };
 
 // ── MFA: Disable ─────────────────────────────────────────────────────────────
 const disableMfa = async (req, res) => {
   if (!validateRequiredFields(req, res, ['code'])) return;
-  const user = await findOne('users', { _id: req.user._id });
+  const user = await findOne('users', { id: req.user.id });
   if (!user?.mfaEnabled) return returnFunction(res, 400, false, 'MFA is not enabled.');
 
   const valid = speakeasy.totp.verify({
@@ -283,9 +288,8 @@ const disableMfa = async (req, res) => {
   });
   if (!valid) return returnFunction(res, 401, false, 'Invalid code.');
 
-  await updateOne('users', { _id: user._id }, {
-    $set:   { mfaEnabled: false, updatedAt: new Date() },
-    $unset: { mfaSecret: '' },
+  await updateOne('users', { id: user.id }, {
+    mfaEnabled: false, updatedAt: new Date(), mfaSecret: null,
   });
   return returnFunction(res, 200, true, 'MFA disabled.');
 };

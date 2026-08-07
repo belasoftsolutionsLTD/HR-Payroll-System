@@ -3,7 +3,16 @@ const path = require('path');
 const fs = require('fs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// employees, job_history, and their supporting lookups now live in Postgres. Everything
+// this file still touches that HASN'T been migrated yet (leave_types, leave_balances,
+// leave_requests, offboarding_records, onboarding, notifications) stays on the Mongo
+// helpers via commonDBFunctions/global.dbo, imported separately below.
+const {
+  findOne, findMany, insertOne, updateOne, deleteOne, countDocuments,
+  knex, replaceChildRows, addChildRow, deleteChildRow,
+} = require('../../functions/Database/pgDBFunctions');
+const { findOne: mongoFindOne, findMany: mongoFindMany } = require('../../functions/Database/commonDBFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
@@ -14,10 +23,7 @@ const { runAccrual } = require('../../lib/leave/accrualEngine');
 
 const DEPARTMENTS = ['Administration','Human Resources','Finance & Accounts','Information Technology','Operations','Sales & Marketing','Customer Service','Legal & Compliance','Procurement','Logistics & Supply Chain','Research & Development','Communications','Health & Safety','Facilities Management','Executive'];
 
-// Compensation/financial fields — only super_admin and hr_manager may ever see these.
-// department_head can manage their department's people but must never see pay/bank/tax info.
 const SENSITIVE_FIELDS = ['grossPay', 'kraPin', 'paymentMethod', 'bankName', 'bankAccountNumber', 'mpesaNumber', 'paypalEmail', 'cryptoWalletAddress', 'cryptoNetwork'];
-const SENSITIVE_PROJECTION = Object.fromEntries(SENSITIVE_FIELDS.map(f => [f, 0]));
 const stripSensitiveFields = (doc) => {
   if (!doc) return doc;
   const copy = { ...doc };
@@ -34,16 +40,17 @@ const JOB_HISTORY_TRACKED_FIELDS = ['designation', 'department', 'managerId', 'g
 const logJobHistoryChange = async ({ employeeId, changeType, effectiveDate, previousValues, newValues, reason, changedBy, changedByName }) => {
   await insertOne('job_history', {
     employeeId, changeType, effectiveDate: effectiveDate || new Date(),
-    previousValues, newValues, reason: reason || null,
+    previousValues: JSON.stringify(previousValues || {}), newValues: JSON.stringify(newValues || {}),
+    reason: reason || null,
     changedBy: changedBy || null, changedByName: changedByName || null,
     createdAt: new Date(),
   });
 };
 
-// Diffs `existing` (the employee doc before update) against `update` (the $set payload)
-// across JOB_HISTORY_TRACKED_FIELDS, resolves manager names if managerId changed, picks
-// the most specific changeType, and writes one job_history entry covering all changed
-// tracked fields. No-ops if nothing tracked actually changed.
+// Diffs `existing` (the employee row before update) against `update` (the new-values
+// payload) across JOB_HISTORY_TRACKED_FIELDS, resolves manager names if managerId
+// changed, picks the most specific changeType, and writes one job_history entry
+// covering all changed tracked fields. No-ops if nothing tracked actually changed.
 const recordJobHistoryIfChanged = async (existing, update, req) => {
   const changedFields = JOB_HISTORY_TRACKED_FIELDS.filter(f =>
     update[f] !== undefined && String(update[f] ?? '') !== String(existing[f] ?? '')
@@ -55,8 +62,8 @@ const recordJobHistoryIfChanged = async (existing, update, req) => {
 
   if (changedFields.includes('managerId')) {
     const [prevMgr, newMgr] = await Promise.all([
-      existing.managerId ? findOne('employees', { _id: existing.managerId }, { projection: { fullName: 1 } }) : null,
-      update.managerId   ? findOne('employees', { _id: update.managerId },   { projection: { fullName: 1 } }) : null,
+      existing.managerId ? findOne('employees', { id: existing.managerId }) : null,
+      update.managerId   ? findOne('employees', { id: update.managerId })   : null,
     ]);
     previousValues.managerName = prevMgr?.fullName ?? null;
     newValues.managerName = newMgr?.fullName ?? null;
@@ -69,9 +76,9 @@ const recordJobHistoryIfChanged = async (existing, update, req) => {
   else if (changedFields.includes('grossPay'))    changeType = 'salaryChange';
 
   await logJobHistoryChange({
-    employeeId: existing._id, changeType, effectiveDate: new Date(),
+    employeeId: existing.id, changeType, effectiveDate: new Date(),
     previousValues, newValues, reason: req.body.changeReason || null,
-    changedBy: req.user._id, changedByName: req.user.name,
+    changedBy: req.user.id, changedByName: req.user.name,
   });
 
   return changedFields;
@@ -91,14 +98,15 @@ const FIELD_CHANGE_LABELS = {
 // 'terminated' (or offboarding's 'inactive') must actually block access, not just
 // record it on the employee document.
 const revokeLoginAccess = async (employeeId) => {
-  await global.dbo.collection('users').updateMany({ employeeId }, { $set: { isActive: false } });
+  await knex('users').where({ employeeId }).update({ isActive: false });
 };
 
 // Status going to 'terminated' should always be backed by an offboarding record.
 // We don't auto-create one (offboarding needs a template + exit type HR must choose)
 // — just flag HR if this employee has none, so it isn't silently forgotten.
+// offboarding_records is unmigrated (Phase 3/4) — stays on Mongo.
 const flagMissingOffboardingIfNeeded = async (employee) => {
-  const activeRecord = await findOne('offboarding_records', { employeeId: employee._id, status: { $ne: 'completed' } });
+  const activeRecord = await mongoFindOne('offboarding_records', { employeeId: new ObjectId(employee.id), status: { $ne: 'completed' } });
   if (activeRecord) return;
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Offboarding Not Started',
@@ -106,7 +114,7 @@ const flagMissingOffboardingIfNeeded = async (employee) => {
     type: 'offboarding',
   }).catch(() => {});
 
-  const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+  const hrUsers = await knex('users').whereIn('role', ['super_admin', 'hr_manager']).whereNot('isActive', false).select('email');
   const tokens = { employeeName: employee.fullName };
   hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
     trigger: 'offboardingNotStarted', to: u.email, tokens,
@@ -119,19 +127,21 @@ const flagMissingOffboardingIfNeeded = async (employee) => {
 const MPESA_NUMBER_REGEX = /^254(7|1)\d{8}$/;
 const MPESA_NUMBER_ERROR = 'M-Pesa number must start with 254 and be a valid Kenyan mobile number (e.g. 254712345678).';
 
+// leave_requests is unmigrated (Phase 3) — stays on Mongo; only the employees.status
+// write is Postgres.
 const revertExpiredLeaveStatuses = async () => {
   const today = new Date();
-  const onLeaveEmployees = await findMany('employees', { status: 'on_leave' }, { projection: { _id: 1 } });
+  const onLeaveEmployees = await findMany('employees', { status: 'on_leave' });
   if (!onLeaveEmployees.length) return;
 
   await Promise.all(onLeaveEmployees.map(async (emp) => {
     const activeLeave = await global.dbo.collection('leave_requests').findOne({
-      employeeId: emp._id,
+      employeeId: new ObjectId(emp.id),
       status: 'approved',
       endDate: { $gte: today },
     });
     if (!activeLeave) {
-      await updateOne('employees', { _id: emp._id }, { $set: { status: 'active', updatedAt: new Date() } });
+      await updateOne('employees', { id: emp.id }, { status: 'active', updatedAt: new Date() });
     }
   }));
 };
@@ -140,35 +150,38 @@ const listEmployees = async (req, res) => {
   revertExpiredLeaveStatuses().catch(() => {}); // fire-and-forget
   const { designation, employmentType, status, search } = req.query;
   let { department } = req.query;
-  const filter = {};
 
   // Dept heads can only see their own department
   if (req.user.role === 'department_head') {
     const empRecord = req.user.employeeId
-      ? await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1 } })
+      ? await findOne('employees', { id: req.user.employeeId.toString() })
       : null;
     if (empRecord?.department) department = empRecord.department;
     else return returnFunction(res, 200, true, req.locale.success, { data: [], total: 0, page: 1, totalPages: 0 });
   }
 
-  if (department) filter.department = department;
+  let query = knex('employees');
+  if (department) query = query.where({ department });
   // Substring, case-insensitive — callers like Logistics' driver picker filter by role
   // keyword (e.g. "driver") rather than an exact, HR-typed job title string.
-  if (designation) filter.designation = { $regex: designation.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-  if (employmentType) filter.employmentType = employmentType;
-  if (status) filter.status = status;
-  if (search) filter.$or = [
-    { fullName: { $regex: search, $options: 'i' } },
-    { staffNumber: { $regex: search, $options: 'i' } },
-  ];
+  if (designation) query = query.whereILike('designation', `%${designation}%`);
+  if (employmentType) query = query.where({ employmentType });
+  if (status) query = query.where({ status });
+  if (search) {
+    query = query.where(function () {
+      this.whereILike('fullName', `%${search}%`).orWhereILike('staffNumber', `%${search}%`);
+    });
+  }
 
   const { page, limit, skip } = getPagination(req.query, 500);
-  const projection = req.user.role === 'department_head' ? { password: 0, ...SENSITIVE_PROJECTION } : { password: 0 };
-  const [total, data] = await Promise.all([
-    countDocuments('employees', filter),
-    findMany('employees', filter, { skip, limit, sort: { fullName: 1 }, projection }),
+  const isDeptHead = req.user.role === 'department_head';
+
+  const [{ count }, rows] = await Promise.all([
+    query.clone().count('* as count').first(),
+    query.clone().orderBy('fullName', 'asc').offset(skip).limit(limit),
   ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, total, page, limit));
+  const data = (isDeptHead ? rows.map(stripSensitiveFields) : rows).map((r) => ({ ...r, _id: new ObjectId(r.id) }));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, Number(count), page, limit));
 };
 
 // Wraps a CSV field in quotes and escapes embedded quotes if it contains a comma,
@@ -181,27 +194,26 @@ const csvField = (v) => {
 
 const exportEmployeesCSV = async (req, res) => {
   const { designation, employmentType, status, search, department } = req.query;
-  const filter = {};
-  if (department) filter.department = department;
-  // Substring, case-insensitive — callers like Logistics' driver picker filter by role
-  // keyword (e.g. "driver") rather than an exact, HR-typed job title string.
-  if (designation) filter.designation = { $regex: designation.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-  if (employmentType) filter.employmentType = employmentType;
-  if (status) filter.status = status;
-  if (search) filter.$or = [
-    { fullName: { $regex: search, $options: 'i' } },
-    { staffNumber: { $regex: search, $options: 'i' } },
-  ];
+  let query = knex('employees');
+  if (department) query = query.where({ department });
+  if (designation) query = query.whereILike('designation', `%${designation}%`);
+  if (employmentType) query = query.where({ employmentType });
+  if (status) query = query.where({ status });
+  if (search) {
+    query = query.where(function () {
+      this.whereILike('fullName', `%${search}%`).orWhereILike('staffNumber', `%${search}%`);
+    });
+  }
 
-  const employees = await findMany('employees', filter, { sort: { fullName: 1 }, limit: 5000 });
-  const jobGroupIds = [...new Set(employees.map(e => e.jobGroupId).filter(Boolean).map(String))].map(id => new ObjectId(id));
-  const jobGroups = jobGroupIds.length ? await findMany('job_groups', { _id: { $in: jobGroupIds } }, { projection: { name: 1 } }) : [];
-  const jobGroupNameById = Object.fromEntries(jobGroups.map(g => [String(g._id), g.name]));
+  const employees = await query.orderBy('fullName', 'asc').limit(5000);
+  const jobGroupIds = [...new Set(employees.map(e => e.jobGroupId).filter(Boolean))];
+  const jobGroups = jobGroupIds.length ? await knex('job_groups').whereIn('id', jobGroupIds).select('id', 'name') : [];
+  const jobGroupNameById = Object.fromEntries(jobGroups.map(g => [g.id, g.name]));
 
   const header = ['Staff Number', 'Full Name', 'Email', 'Phone', 'Department', 'Designation', 'Employment Type', 'Status', 'Location', 'Job Group', 'Date of Hire', 'Gross Pay'];
   const rows = employees.map(e => [
     e.staffNumber, e.fullName, e.email, e.phone, e.department, e.designation, e.employmentType, e.status,
-    e.location, e.jobGroupId ? (jobGroupNameById[String(e.jobGroupId)] ?? '') : '',
+    e.location, e.jobGroupId ? (jobGroupNameById[e.jobGroupId] ?? '') : '',
     e.dateOfHire ? new Date(e.dateOfHire).toISOString().slice(0, 10) : '', e.grossPay ?? '',
   ].map(csvField).join(','));
 
@@ -212,11 +224,12 @@ const exportEmployeesCSV = async (req, res) => {
 };
 
 const getEmployee = async (req, res) => {
-  const employee = await findOne('employees', { _id: new ObjectId(req.params.id) });
+  const employee = await findOne('employees', { id: req.params.id });
   if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
   let manager = null;
   if (employee.managerId) {
-    manager = await findOne('employees', { _id: employee.managerId }, { projection: { fullName: 1, designation: 1, department: 1 } });
+    manager = await findOne('employees', { id: employee.managerId });
+    if (manager) manager = { fullName: manager.fullName, designation: manager.designation, department: manager.department };
   }
   const safeEmployee = req.user.role === 'department_head' ? stripSensitiveFields(employee) : employee;
   return returnFunction(res, 200, true, req.locale.success, { ...safeEmployee, manager: manager ?? null });
@@ -233,9 +246,9 @@ const createEmployee = async (req, res) => {
   const existing = await findOne('employees', { nationalId: req.body.nationalId });
   if (existing) return returnFunction(res, 409, false, 'An employee with this National ID already exists.');
 
-  // employees.email has a unique index — without this pre-check a duplicate falls
-  // through to a raw MongoDB E11000 error, which the generic error handler turns into
-  // an opaque "Internal Server Error" (meaningless to a non-technical user).
+  // employees.email has a unique constraint — without this pre-check a duplicate falls
+  // through to a raw Postgres unique-violation error, which the generic error handler
+  // turns into an opaque "Internal Server Error" (meaningless to a non-technical user).
   const existingEmail = await findOne('employees', { email: String(req.body.email).trim().toLowerCase() });
   if (existingEmail) return returnFunction(res, 409, false, 'An employee with this email already exists.');
 
@@ -251,7 +264,7 @@ const createEmployee = async (req, res) => {
     designation: req.body.designation,
     employmentType: req.body.employmentType,
     department: req.body.department,
-    jobGroupId: new ObjectId(req.body.jobGroupId),
+    jobGroupId: req.body.jobGroupId,
     dateOfHire: new Date(req.body.dateOfHire),
     dateOfBirth: req.body.dateOfBirth ? new Date(req.body.dateOfBirth) : null,
     contractEndDate: req.body.contractEndDate ? new Date(req.body.contractEndDate) : null,
@@ -267,7 +280,7 @@ const createEmployee = async (req, res) => {
     passportNumber: req.body.passportNumber || null,
     passportExpiryDate: req.body.passportExpiryDate ? new Date(req.body.passportExpiryDate) : null,
     address: req.body.address || null,
-    emergencyContacts: Array.isArray(req.body.emergencyContacts) ? req.body.emergencyContacts : [],
+    nextOfKin: req.body.nextOfKin ? JSON.stringify(req.body.nextOfKin) : null,
     grossPay: req.body.grossPay ? Number(req.body.grossPay) : null,
     kraPin: req.body.kraPin || null,
     paymentMethod: req.body.paymentMethod || 'bank_transfer',
@@ -279,16 +292,11 @@ const createEmployee = async (req, res) => {
     cryptoNetwork: req.body.cryptoNetwork || null,
     email: String(req.body.email).trim().toLowerCase(),
     phone: req.body.phone || null,
-    nextOfKin: req.body.nextOfKin || null,
     profilePhoto: null,
-    documents: [],
-    skills: [],
-    certifications: [],
-    educationHistory: [],
     location:    req.body.location    || null,
-    branchId:    req.body.branchId    ? new ObjectId(req.body.branchId) : null,
+    branchId:    req.body.branchId    || null,
     costCenter:  req.body.costCenter  || null,
-    managerId:   req.body.managerId   ? new ObjectId(req.body.managerId) : null,
+    managerId:   req.body.managerId   || null,
     payGroup:    req.body.payGroup    || 'all',
     payFrequency: req.body.payFrequency || 'monthly',
     status: 'active',
@@ -297,18 +305,20 @@ const createEmployee = async (req, res) => {
   };
 
   const result = await insertOne('employees', doc);
+  const employeeId = result.id;
 
   // Keep the payroll engine's actual "Basic Pay" earnings line in sync with the salary
   // just entered — see lib/payroll/syncBasicPay.js for why this can't be skipped.
-  await syncBasicPayCompensation(result.insertedId, doc.grossPay, req.user._id, doc.dateOfHire);
+  await syncBasicPayCompensation(employeeId, doc.grossPay, req.user.id, doc.dateOfHire);
 
   // Create one leave_balances record per active leave type for the current year —
   // starts at 0 and builds up via the monthly accrual cron (lib/leave/accrualEngine.js).
+  // leave_types/leave_balances are unmigrated (Phase 3) — stay on Mongo.
   const year = new Date().getFullYear();
-  const activeLeaveTypes = await findMany('leave_types', { isActive: true }, { projection: { _id: 1 } });
+  const activeLeaveTypes = await mongoFindMany('leave_types', { isActive: true }, { projection: { _id: 1 } });
   if (activeLeaveTypes.length) {
     await global.dbo.collection('leave_balances').insertMany(activeLeaveTypes.map(lt => ({
-      employeeId: result.insertedId, leaveTypeId: lt._id, year,
+      employeeId: new ObjectId(employeeId), leaveTypeId: lt._id, year,
       openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, carryOverExpiry: null,
       closingBalance: 0, lastAccrualDate: null, updatedAt: new Date(),
     })));
@@ -316,19 +326,19 @@ const createEmployee = async (req, res) => {
 
   // Grant this employee's first accrual immediately rather than making them wait for
   // the 1st-of-month cron — otherwise every new hire shows 0 days for up to a month.
-  runAccrual(req.user._id, [result.insertedId]).catch(() => {});
+  runAccrual(req.user.id, [employeeId]).catch(() => {});
 
   // Auto-start onboarding from the best-matching template, if any exist (fire-and-forget)
   (async () => {
     const template = await resolveDefaultTemplate(doc.department);
-    if (template) await initiateOnboarding(result.insertedId, template._id, req.body.dateOfHire || new Date(), null);
+    if (template) await initiateOnboarding(employeeId, template._id, req.body.dateOfHire || new Date(), null);
   })().catch(() => {});
 
   // Job history: the initial hire entry
   await logJobHistoryChange({
-    employeeId: result.insertedId, changeType: 'hire', effectiveDate: doc.dateOfHire,
+    employeeId, changeType: 'hire', effectiveDate: doc.dateOfHire,
     previousValues: {}, newValues: { designation: doc.designation, department: doc.department, status: doc.status, employmentType: doc.employmentType, grossPay: doc.grossPay },
-    changedBy: req.user._id, changedByName: req.user.name,
+    changedBy: req.user.id, changedByName: req.user.name,
   });
 
   // Notify HR managers and super admins about new employee (fire-and-forget)
@@ -338,33 +348,34 @@ const createEmployee = async (req, res) => {
     type: 'hr', subType: 'new_employee',
     title: '👤 New Employee Added',
     subtitle: newEmpMsg,
-    referenceId: result.insertedId, referenceModel: 'employees',
+    referenceId: new ObjectId(employeeId), referenceModel: 'employees',
     requiresAction: false,
     triggeredBy: req.user._id,
   }).catch(() => {});
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, staffNumber });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: employeeId, staffNumber });
 };
 
 const updateEmployee = async (req, res) => {
   if (req.body.paymentMethod === 'mpesa' && req.body.mpesaNumber !== undefined && !MPESA_NUMBER_REGEX.test(String(req.body.mpesaNumber || '').trim())) {
     return returnFunction(res, 400, false, MPESA_NUMBER_ERROR);
   }
-  const existing = await findOne('employees', { _id: new ObjectId(req.params.id) });
+  const existing = await findOne('employees', { id: req.params.id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
 
-  // Same crash this collection's unique email index would otherwise cause on
+  // Same crash this collection's unique email constraint would otherwise cause on
   // createEmployee — editing an employee's email to one already in use must fail with
-  // a real message, not an unhandled E11000 turned into "Internal Server Error."
+  // a real message, not an unhandled unique-violation turned into "Internal Server Error."
   if (req.body.email) {
     const normalizedEmail = String(req.body.email).trim().toLowerCase();
-    const emailTaken = await findOne('employees', { email: normalizedEmail, _id: { $ne: existing._id } });
+    const emailTaken = await knex('employees').where({ email: normalizedEmail }).whereNot('id', existing.id).first();
     if (emailTaken) return returnFunction(res, 409, false, 'An employee with this email already exists.');
     req.body.email = normalizedEmail;
   }
 
   const update = { ...req.body, updatedAt: new Date() };
   delete update._id;
+  delete update.id;
   delete update.staffNumber;
   delete update.nationalId;
   delete update.changeReason; // consumed by job-history logging below, not a real employee field
@@ -374,30 +385,31 @@ const updateEmployee = async (req, res) => {
   if (update.probationEndDate) update.probationEndDate = new Date(update.probationEndDate);
   if (update.confirmationDate) update.confirmationDate = new Date(update.confirmationDate);
   if (update.terminationDate) update.terminationDate = new Date(update.terminationDate);
-  if (update.jobGroupId) update.jobGroupId = new ObjectId(update.jobGroupId);
-  if (update.managerId !== undefined) update.managerId = update.managerId ? new ObjectId(update.managerId) : null;
-  if (update.branchId !== undefined) update.branchId = update.branchId ? new ObjectId(update.branchId) : null;
+  if (update.nextOfKin !== undefined) update.nextOfKin = update.nextOfKin ? JSON.stringify(update.nextOfKin) : null;
+  // jobGroupId/managerId/branchId are already plain id strings from the client — no
+  // ObjectId wrapping needed against Postgres (undefined stays untouched-in-update;
+  // explicit null clears the FK).
 
-  await updateOne('employees', { _id: existing._id }, { $set: update });
+  await updateOne('employees', { id: existing.id }, update);
   const changedFields = await recordJobHistoryIfChanged(existing, update, req);
   if (update.status === 'terminated' && existing.status !== 'terminated') {
-    await revokeLoginAccess(existing._id);
+    await revokeLoginAccess(existing.id);
     await flagMissingOffboardingIfNeeded(existing);
   }
   if (update.grossPay !== undefined && update.grossPay !== existing.grossPay) {
-    await syncBasicPayCompensation(existing._id, update.grossPay, req.user._id, existing.dateOfHire);
+    await syncBasicPayCompensation(existing.id, update.grossPay, req.user.id, existing.dateOfHire);
   }
 
   const notifiableFields = (changedFields || []).filter((f) => f !== 'status');
   if (notifiableFields.length) {
     const labels = notifiableFields.map((f) => FIELD_CHANGE_LABELS[f] || f).join(', ');
-    notifyEmployee(existing._id, {
+    notifyEmployee(existing.id, {
       title: 'Profile Updated',
       body: `Your ${labels} ${notifiableFields.length > 1 ? 'have' : 'has'} been updated by HR. Contact HR if you have any questions.`,
       type: 'general',
     }).catch(() => {});
 
-    const empUser = await findOne('users', { employeeId: existing._id }, { projection: { email: 1 } });
+    const empUser = await findOne('users', { employeeId: existing.id });
     if (empUser?.email) {
       const tokens = { employeeName: existing.fullName, fields: labels, plural: notifiableFields.length > 1 ? 'have' : 'has' };
       sendTemplatedEmail({
@@ -415,47 +427,52 @@ const patchEmployeeStatus = async (req, res) => {
   if (!validateRequiredFields(req, res, ['status'])) return;
   const allowed = ['active', 'on_leave', 'suspended', 'terminated'];
   if (!allowed.includes(req.body.status)) return returnFunction(res, 400, false, 'Invalid status.');
-  const existing = await findOne('employees', { _id: new ObjectId(req.params.id) });
+  const existing = await findOne('employees', { id: req.params.id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   const set = { status: req.body.status, updatedAt: new Date() };
   if (req.body.status === 'terminated') {
     set.terminationDate = new Date();
     set.terminationReason = req.body.terminationReason || null;
   }
-  await updateOne('employees', { _id: existing._id }, { $set: set });
+  await updateOne('employees', { id: existing.id }, set);
   await recordJobHistoryIfChanged(existing, { status: req.body.status }, req);
   if (req.body.status === 'terminated') {
-    await revokeLoginAccess(existing._id);
+    await revokeLoginAccess(existing.id);
     await flagMissingOffboardingIfNeeded(existing);
   }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteEmployee = async (req, res) => {
-  const existing = await findOne('employees', { _id: new ObjectId(req.params.id) });
+  const existing = await findOne('employees', { id: req.params.id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
-  await updateOne('employees', { _id: existing._id }, {
-    $set: { status: 'terminated', terminationDate: new Date(), terminationReason: req.body.terminationReason || null, updatedAt: new Date() },
+  await updateOne('employees', { id: existing.id }, {
+    status: 'terminated', terminationDate: new Date(), terminationReason: req.body.terminationReason || null, updatedAt: new Date(),
   });
   await recordJobHistoryIfChanged(existing, { status: 'terminated' }, req);
-  await revokeLoginAccess(existing._id);
+  await revokeLoginAccess(existing.id);
   await flagMissingOffboardingIfNeeded(existing);
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 const getJobHistory = async (req, res) => {
-  const history = await findMany('job_history', { employeeId: new ObjectId(req.params.id) }, { sort: { effectiveDate: -1, createdAt: -1 } });
+  const history = await findMany('job_history', { employeeId: req.params.id }, {
+    orderBy: [{ column: 'effectiveDate', order: 'desc' }, { column: 'createdAt', order: 'desc' }],
+  });
   return returnFunction(res, 200, true, req.locale.success, history);
 };
 
 // ── Emergency Contacts (multiple; separate from the single legacy nextOfKin field) ──
+
 const updateEmergencyContacts = async (req, res) => {
   if (!Array.isArray(req.body.emergencyContacts)) return returnFunction(res, 400, false, 'emergencyContacts must be an array.');
   const emergencyContacts = req.body.emergencyContacts.map(c => ({
     id: c.id || new ObjectId().toString(),
+    employeeId: req.params.id,
     name: c.name, relationship: c.relationship || null, phone: c.phone, email: c.email || null,
   }));
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $set: { emergencyContacts, updatedAt: new Date() } });
+  await replaceChildRows('employee_emergency_contacts', 'employeeId', req.params.id, emergencyContacts);
+  await updateOne('employees', { id: req.params.id }, { updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully, emergencyContacts);
 };
 
@@ -464,45 +481,49 @@ const updateEmergencyContacts = async (req, res) => {
 const updateSkills = async (req, res) => {
   if (!Array.isArray(req.body.skills)) return returnFunction(res, 400, false, 'skills must be an array of strings.');
   const skills = req.body.skills.map(s => String(s).trim()).filter(Boolean);
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $set: { skills, updatedAt: new Date() } });
+  await replaceChildRows('employee_skills', 'employeeId', req.params.id,
+    skills.map((skill, position) => ({ employeeId: req.params.id, skill, position })));
+  await updateOne('employees', { id: req.params.id }, { updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully, skills);
 };
 
 const addCertification = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'issuingOrganization', 'issueDate'])) return;
-  const cert = {
-    id: new ObjectId().toString(),
+  const cert = await addChildRow('employee_certifications', {
+    employeeId: req.params.id,
     name: req.body.name,
     issuingOrganization: req.body.issuingOrganization,
     issueDate: new Date(req.body.issueDate),
     expiryDate: req.body.expiryDate ? new Date(req.body.expiryDate) : null,
     fileUrl: req.body.fileUrl || null,
-  };
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $push: { certifications: cert }, $set: { updatedAt: new Date() } });
+  });
+  await updateOne('employees', { id: req.params.id }, { updatedAt: new Date() });
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, cert);
 };
 
 const deleteCertification = async (req, res) => {
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $pull: { certifications: { id: req.params.certId } }, $set: { updatedAt: new Date() } });
+  await deleteChildRow('employee_certifications', 'employeeId', req.params.id, req.params.certId);
+  await updateOne('employees', { id: req.params.id }, { updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 const addEducation = async (req, res) => {
   if (!validateRequiredFields(req, res, ['institution', 'degree', 'fieldOfStudy', 'startYear'])) return;
-  const edu = {
-    id: new ObjectId().toString(),
+  const edu = await addChildRow('employee_education_history', {
+    employeeId: req.params.id,
     institution: req.body.institution,
     degree: req.body.degree,
     fieldOfStudy: req.body.fieldOfStudy,
     startYear: Number(req.body.startYear),
     endYear: req.body.endYear ? Number(req.body.endYear) : null,
-  };
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $push: { educationHistory: edu }, $set: { updatedAt: new Date() } });
+  });
+  await updateOne('employees', { id: req.params.id }, { updatedAt: new Date() });
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, edu);
 };
 
 const deleteEducation = async (req, res) => {
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $pull: { educationHistory: { id: req.params.eduId } }, $set: { updatedAt: new Date() } });
+  await deleteChildRow('employee_education_history', 'employeeId', req.params.id, req.params.eduId);
+  await updateOne('employees', { id: req.params.id }, { updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -510,51 +531,67 @@ const uploadDocument = async (req, res) => {
   if (!req.file) return returnFunction(res, 400, false, req.locale.missingRequiredFields);
   if (!req.body.docType) return returnFunction(res, 400, false, req.locale.missingRequiredFields);
 
-  const doc = {
-    docId: new ObjectId(),
+  const doc = await addChildRow('employee_documents', {
+    employeeId: req.params.id,
     docType: req.body.docType,
     fileName: req.file.originalname,
     filePath: req.file.path,
     uploadedAt: new Date(),
-  };
-  await updateOne('employees', { _id: new ObjectId(req.params.id) }, { $push: { documents: doc } });
+  });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully, doc);
 };
 
 const downloadDocument = async (req, res) => {
-  const employee = await findOne('employees', { _id: new ObjectId(req.params.id) });
+  const employee = await findOne('employees', { id: req.params.id });
   if (!employee) return returnFunction(res, 404, false, req.locale.notFound);
-  const doc = (employee.documents || []).find((d) => String(d.docId) === req.params.docId);
+  const doc = await findOne('employee_documents', { id: req.params.docId, employeeId: req.params.id });
   if (!doc) return returnFunction(res, 404, false, req.locale.notFound);
   if (!fs.existsSync(doc.filePath)) return returnFunction(res, 404, false, 'File not found on server.');
   res.download(doc.filePath, doc.fileName);
 };
 
 const getOrgChart = async (req, res) => {
-  const employees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, {
-    projection: { fullName: 1, designation: 1, department: 1, managerId: 1, profilePhoto: 1 },
-  });
+  let query = knex('employees').whereNot('status', 'terminated');
 
-  // Build a map for O(1) child lookup
+  // Dept heads only see their own department's branch — matches listEmployees' scoping.
+  if (req.user.role === 'department_head') {
+    const empRecord = req.user.employeeId
+      ? await findOne('employees', { id: req.user.employeeId.toString() })
+      : null;
+    if (empRecord?.department) query = query.where({ department: empRecord.department });
+    else return returnFunction(res, 200, true, req.locale.success, { departments: [], total: 0 });
+  }
+
+  const employees = await query
+    .select('id', 'fullName', 'designation', 'department', 'status', 'staffNumber', 'profilePhoto', 'email', 'managerId')
+    .orderBy('fullName', 'asc');
+
+  // Real managerId-based hierarchy. An employee whose manager isn't in this
+  // (possibly department-scoped) result set becomes a root — e.g. a department
+  // head's own manager sits in a different department and won't be in a
+  // department-scoped fetch, so their subtree still needs a place to attach.
   const nodeMap = {};
-  employees.forEach(e => { nodeMap[String(e._id)] = { ...e, reports: [] }; });
-
+  employees.forEach(e => { nodeMap[e.id] = { ...e, _id: new ObjectId(e.id), reports: [] }; });
   const roots = [];
   employees.forEach(e => {
-    if (e.managerId && nodeMap[String(e.managerId)]) {
-      nodeMap[String(e.managerId)].reports.push(nodeMap[String(e._id)]);
+    const node = nodeMap[e.id];
+    if (e.managerId && nodeMap[e.managerId]) {
+      nodeMap[e.managerId].reports.push(node);
     } else {
-      roots.push(nodeMap[String(e._id)]);
+      roots.push(node);
     }
   });
 
-  return returnFunction(res, 200, true, 'Org chart fetched', roots);
-};
+  const deptMap = {};
+  for (const emp of employees) {
+    const dept = emp.department || 'Unassigned';
+    if (!deptMap[dept]) deptMap[dept] = { name: dept, employees: [] };
+    deptMap[dept].employees.push({ ...emp, _id: new ObjectId(emp.id) });
+  }
 
-// ── Payroll Readiness Check ───────────────────────────────────────────────────
-// GET /api/employees/payroll-readiness
-// Returns all active/on-leave employees that are missing fields required for
-// payroll to run correctly. Designed to be called before creating a cycle.
+  const departments = Object.values(deptMap).sort((a, b) => b.employees.length - a.employees.length);
+  return returnFunction(res, 200, true, req.locale.success, { tree: roots, departments, total: employees.length });
+};
 
 const READINESS_CHECKS = [
   { key: 'grossPay',       label: 'Gross Pay',       critical: true,  test: e => e.grossPay && e.grossPay > 0 },
@@ -572,11 +609,9 @@ const getMissingCriticalFields = (emp) => READINESS_CHECKS.filter(c => c.critica
 const isPayrollReady = (emp) => getMissingCriticalFields(emp).length === 0;
 
 const getPayrollReadiness = async (req, res) => {
-  const employees = await findMany(
-    'employees',
-    { status: { $in: ['active', 'on_leave'] } },
-    { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, grossPay: 1, jobGroupId: 1, kraPin: 1, bankAccountNumber: 1, mpesaNumber: 1 } },
-  );
+  const employees = await knex('employees')
+    .whereIn('status', ['active', 'on_leave'])
+    .select('id', 'fullName', 'staffNumber', 'department', 'designation', 'grossPay', 'jobGroupId', 'kraPin', 'bankAccountNumber', 'mpesaNumber');
 
   const incomplete = employees
     .map(emp => {
@@ -585,7 +620,7 @@ const getPayrollReadiness = async (req, res) => {
       const hasCritical     = missing.some(c => c.critical);
       if (!missing.length) return null;
       return {
-        _id:          emp._id,
+        _id:          new ObjectId(emp.id),
         fullName:     emp.fullName,
         staffNumber:  emp.staffNumber ?? '—',
         department:   emp.department  ?? '—',
@@ -611,7 +646,7 @@ const getPayrollReadiness = async (req, res) => {
 // and bulk-set a frequency for everyone in one.
 
 const listPayGroups = async (req, res) => {
-  const employees = await findMany('employees', { status: { $in: ['active', 'on_leave'] } }, { projection: { payGroup: 1, payFrequency: 1 } });
+  const employees = await knex('employees').whereIn('status', ['active', 'on_leave']).select('payGroup', 'payFrequency');
   const groups = {};
   for (const e of employees) {
     const g = e.payGroup || 'all';
@@ -634,10 +669,7 @@ const setPayGroupFrequency = async (req, res) => {
   if (!['weekly', 'biweekly', 'monthly'].includes(req.body.payFrequency)) {
     return returnFunction(res, 400, false, 'payFrequency must be weekly, biweekly, or monthly.');
   }
-  await global.dbo.collection('employees').updateMany(
-    { payGroup: req.params.payGroup },
-    { $set: { payFrequency: req.body.payFrequency, updatedAt: new Date() } }
-  );
+  await knex('employees').where({ payGroup: req.params.payGroup }).update({ payFrequency: req.body.payFrequency, updatedAt: new Date() });
   return returnFunction(res, 200, true, `Pay frequency updated for "${req.params.payGroup}".`);
 };
 
@@ -645,29 +677,18 @@ const setPayGroupFrequency = async (req, res) => {
 //  Workforce Analytics — HR only
 // ══════════════════════════════════════════════════════════════════════════════
 
-const NOT_TERMINATED = { status: { $ne: 'terminated' } };
-
 const getHeadcountAnalytics = async (req, res) => {
-  const [total, byDepartment, byEmploymentType, byStatus] = await Promise.all([
-    countDocuments('employees', NOT_TERMINATED),
-    global.dbo.collection('employees').aggregate([
-      { $match: NOT_TERMINATED },
-      { $group: { _id: '$department', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]).toArray(),
-    global.dbo.collection('employees').aggregate([
-      { $match: NOT_TERMINATED },
-      { $group: { _id: '$employmentType', count: { $sum: 1 } } },
-    ]).toArray(),
-    global.dbo.collection('employees').aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]).toArray(),
+  const [{ count: total }, byDepartment, byEmploymentType, byStatus] = await Promise.all([
+    knex('employees').whereNot('status', 'terminated').count('* as count').first(),
+    knex('employees').whereNot('status', 'terminated').select('department').count('* as count').groupBy('department').orderBy('count', 'desc'),
+    knex('employees').whereNot('status', 'terminated').select('employmentType').count('* as count').groupBy('employmentType'),
+    knex('employees').select('status').count('* as count').groupBy('status'),
   ]);
   return returnFunction(res, 200, true, req.locale.success, {
-    total,
-    byDepartment: byDepartment.map(d => ({ department: d._id || 'Unassigned', count: d.count })),
-    byEmploymentType: byEmploymentType.map(d => ({ employmentType: d._id || 'Unspecified', count: d.count })),
-    byStatus: byStatus.map(d => ({ status: d._id, count: d.count })),
+    total: Number(total),
+    byDepartment: byDepartment.map(d => ({ department: d.department || 'Unassigned', count: Number(d.count) })),
+    byEmploymentType: byEmploymentType.map(d => ({ employmentType: d.employmentType || 'Unspecified', count: Number(d.count) })),
+    byStatus: byStatus.map(d => ({ status: d.status, count: Number(d.count) })),
   });
 };
 
@@ -676,20 +697,23 @@ const getTurnoverAnalytics = async (req, res) => {
   const now = new Date();
   const start = new Date(now.getFullYear(), now.getMonth() - months + 1, 1);
 
-  const [hires, terminations] = await Promise.all([
-    global.dbo.collection('employees').aggregate([
-      { $match: { dateOfHire: { $gte: start } } },
-      { $group: { _id: { y: { $year: '$dateOfHire' }, m: { $month: '$dateOfHire' } }, count: { $sum: 1 } } },
-    ]).toArray(),
-    global.dbo.collection('employees').aggregate([
-      { $match: { terminationDate: { $gte: start } } },
-      { $group: { _id: { y: { $year: '$terminationDate' }, m: { $month: '$terminationDate' } }, count: { $sum: 1 } } },
-    ]).toArray(),
+  const [hireRows, termRows] = await Promise.all([
+    knex('employees').where('dateOfHire', '>=', start).select('dateOfHire'),
+    knex('employees').where('terminationDate', '>=', start).select('terminationDate'),
   ]);
 
   const key = (y, m) => `${y}-${String(m).padStart(2, '0')}`;
-  const hireMap = Object.fromEntries(hires.map(h => [key(h._id.y, h._id.m), h.count]));
-  const termMap = Object.fromEntries(terminations.map(t => [key(t._id.y, t._id.m), t.count]));
+  const bucketCounts = (rows, field) => {
+    const map = {};
+    for (const r of rows) {
+      const d = new Date(r[field]);
+      const k = key(d.getFullYear(), d.getMonth() + 1);
+      map[k] = (map[k] || 0) + 1;
+    }
+    return map;
+  };
+  const hireMap = bucketCounts(hireRows, 'dateOfHire');
+  const termMap = bucketCounts(termRows, 'terminationDate');
 
   const series = [];
   for (let i = months - 1; i >= 0; i--) {
@@ -701,7 +725,7 @@ const getTurnoverAnalytics = async (req, res) => {
 };
 
 const getTenureAnalytics = async (req, res) => {
-  const employees = await findMany('employees', NOT_TERMINATED, { projection: { department: 1, dateOfHire: 1 } });
+  const employees = await knex('employees').whereNot('status', 'terminated').select('department', 'dateOfHire');
   const now = new Date();
   const byDept = {};
   for (const e of employees) {
@@ -719,39 +743,35 @@ const getTenureAnalytics = async (req, res) => {
 };
 
 const getDemographicsAnalytics = async (req, res) => {
-  const [byGender, byNationality] = await Promise.all([
-    global.dbo.collection('employees').aggregate([
-      { $match: NOT_TERMINATED },
-      { $group: { _id: { $ifNull: ['$gender', 'Not specified'] }, count: { $sum: 1 } } },
-    ]).toArray(),
-    global.dbo.collection('employees').aggregate([
-      { $match: NOT_TERMINATED },
-      { $group: { _id: { $ifNull: ['$nationality', 'Not specified'] }, count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-    ]).toArray(),
+  const [byGenderRows, byNationalityRows] = await Promise.all([
+    knex('employees').whereNot('status', 'terminated').select('gender').count('* as count').groupBy('gender'),
+    knex('employees').whereNot('status', 'terminated').select('nationality').count('* as count').groupBy('nationality').orderBy('count', 'desc'),
   ]);
   return returnFunction(res, 200, true, req.locale.success, {
-    byGender: byGender.map(g => ({ gender: g._id, count: g.count })),
-    byNationality: byNationality.map(n => ({ nationality: n._id, count: n.count })),
+    byGender: byGenderRows.map(g => ({ gender: g.gender || 'Not specified', count: Number(g.count) })),
+    byNationality: byNationalityRows.map(n => ({ nationality: n.nationality || 'Not specified', count: Number(n.count) })),
   });
 };
 
 const getUpcomingAnalytics = async (req, res) => {
   const now = new Date();
   const in90 = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
-  const projection = { fullName: 1, staffNumber: 1, department: 1, probationEndDate: 1, passportExpiryDate: 1, contractEndDate: 1 };
+  const cols = ['id', 'fullName', 'staffNumber', 'department', 'probationEndDate', 'passportExpiryDate', 'contractEndDate'];
 
   const [probations, passports, contracts] = await Promise.all([
-    findMany('employees', { ...NOT_TERMINATED, probationEndDate: { $gte: now, $lte: in90 } }, { projection, sort: { probationEndDate: 1 } }),
-    findMany('employees', { ...NOT_TERMINATED, passportExpiryDate: { $gte: now, $lte: in90 } }, { projection, sort: { passportExpiryDate: 1 } }),
-    findMany('employees', { ...NOT_TERMINATED, contractEndDate: { $gte: now, $lte: in90 } }, { projection, sort: { contractEndDate: 1 } }),
+    knex('employees').whereNot('status', 'terminated').whereBetween('probationEndDate', [now, in90]).orderBy('probationEndDate', 'asc').select(cols),
+    knex('employees').whereNot('status', 'terminated').whereBetween('passportExpiryDate', [now, in90]).orderBy('passportExpiryDate', 'asc').select(cols),
+    knex('employees').whereNot('status', 'terminated').whereBetween('contractEndDate', [now, in90]).orderBy('contractEndDate', 'asc').select(cols),
   ]);
 
   const bucket = (date) => {
     const days = Math.ceil((new Date(date) - now) / (1000 * 60 * 60 * 24));
     return days <= 30 ? 30 : days <= 60 ? 60 : 90;
   };
-  const withBucket = (list, dateField) => list.map(e => ({ ...e, daysRemaining: Math.ceil((new Date(e[dateField]) - now) / (1000 * 60 * 60 * 24)), bucket: bucket(e[dateField]) }));
+  const withBucket = (list, dateField) => list.map(e => ({
+    ...e, _id: new ObjectId(e.id),
+    daysRemaining: Math.ceil((new Date(e[dateField]) - now) / (1000 * 60 * 60 * 24)), bucket: bucket(e[dateField]),
+  }));
 
   return returnFunction(res, 200, true, req.locale.success, {
     probationEndings: withBucket(probations, 'probationEndDate'),

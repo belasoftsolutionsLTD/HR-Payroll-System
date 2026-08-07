@@ -4,6 +4,11 @@ const fs   = require('fs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// departments/branches/job_groups/designations/company_accounts now live in Postgres;
+// jd_templates/scheduled_events/communication_settings are unmigrated, so they stay on
+// the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyStaffByAudience } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -11,14 +16,15 @@ const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 // its own pass rather than modifying that shared helper, since other callers of
 // notifyStaffByAudience don't necessarily want an email fired too.
 const emailStaffByAudience = async (audience, department, trigger, tokens, fallbackSubject, fallbackHtml) => {
-  const employeeFilter = audience === 'department' && department ? { department } : {};
-  const employees = await findMany('employees', employeeFilter, { projection: { _id: 1 } });
+  let employeeQuery = pgDB.knex('employees');
+  if (audience === 'department' && department) employeeQuery = employeeQuery.where({ department });
+  const employees = await employeeQuery.select('id');
   if (!employees.length) return;
-  const users = await findMany('users', { employeeId: { $in: employees.map(e => e._id) } }, { projection: { email: 1 } });
+  const users = await pgDB.knex('users').whereIn('employeeId', employees.map(e => e.id)).select('email');
   users.filter(u => u.email).forEach(u => sendTemplatedEmail({ trigger, to: u.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {}));
 };
 
-// ── Generic CRUD factory ─────────────────────────────────────────────────────
+// ── Generic CRUD factory (Mongo collections) ──────────────────────────────────
 
 const makeList = (collection) => async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
@@ -61,21 +67,66 @@ const makeBulkDelete = (collection) => async (req, res) => {
   return returnFunction(res, 200, true, `${result.deletedCount} deleted.`, { deletedCount: result.deletedCount });
 };
 
+// ── Generic CRUD factory (Postgres tables) ────────────────────────────────────
+
+const pgMakeList = (table) => async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const [{ count }, rows] = await Promise.all([
+    pgDB.knex(table).count('* as count').first(),
+    pgDB.knex(table).orderBy('name', 'asc').offset(skip).limit(limit),
+  ]);
+  const data = rows.map((r) => ({ ...r, _id: new ObjectId(r.id) }));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, Number(count), page, limit));
+};
+
+const pgMakeCreate = (table, requiredFields) => async (req, res) => {
+  if (!validateRequiredFields(req, res, requiredFields)) return;
+  const existing = await pgDB.findOne(table, { name: req.body.name });
+  if (existing) return returnFunction(res, 409, false, `A ${table.replace(/_/g, ' ')} with this name already exists.`);
+  const doc = { ...req.body, createdAt: new Date(), updatedAt: new Date() };
+  delete doc._id;
+  delete doc.id;
+  const result = await pgDB.insertOne(table, doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
+};
+
+const pgMakeUpdate = (table) => async (req, res) => {
+  const update = { ...req.body, updatedAt: new Date() };
+  delete update._id;
+  delete update.id;
+  await pgDB.updateOne(table, { id: req.params.id }, update);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const pgMakeDelete = (table) => async (req, res) => {
+  await pgDB.deleteOne(table, { id: req.params.id });
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
+};
+
+const pgMakeBulkDelete = (table) => async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || !ids.length) {
+    return returnFunction(res, 400, false, 'ids must be a non-empty array.');
+  }
+  const deletedCount = await pgDB.knex(table).whereIn('id', ids).del();
+  return returnFunction(res, 200, true, `${deletedCount} deleted.`, { deletedCount });
+};
+
 // ── Departments ──────────────────────────────────────────────────────────────
-const listDepartments  = makeList('departments');
-const createDepartment = makeCreate('departments', ['name']);
-const updateDepartment = makeUpdate('departments');
-const deleteDepartment = makeDelete('departments');
-const bulkDeleteDepartments = makeBulkDelete('departments');
+const listDepartments  = pgMakeList('departments');
+const createDepartment = pgMakeCreate('departments', ['name']);
+const updateDepartment = pgMakeUpdate('departments');
+const deleteDepartment = pgMakeDelete('departments');
+const bulkDeleteDepartments = pgMakeBulkDelete('departments');
 
 // ── Branches (name + contact info — a company with multiple physical offices) ──
-const listBranches  = makeList('branches');
-const createBranch  = makeCreate('branches', ['name']);
-const updateBranch  = makeUpdate('branches');
-const deleteBranch  = makeDelete('branches');
+const listBranches  = pgMakeList('branches');
+const createBranch  = pgMakeCreate('branches', ['name']);
+const updateBranch  = pgMakeUpdate('branches');
+const deleteBranch  = pgMakeDelete('branches');
 
 // ── Job Groups (with salary range) ───────────────────────────────────────────
-const listJobGroups = makeList('job_groups');
+const listJobGroups = pgMakeList('job_groups');
 
 const createJobGroup = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'salaryMin', 'salaryMax'])) return;
@@ -85,48 +136,78 @@ const createJobGroup = async (req, res) => {
   if (isNaN(min) || isNaN(max) || min >= max) {
     return returnFunction(res, 400, false, 'salaryMin must be less than salaryMax.');
   }
-  const existing = await findOne('job_groups', { name });
+  const existing = await pgDB.findOne('job_groups', { name });
   if (existing) return returnFunction(res, 409, false, 'A job group with this name already exists.');
   const doc = { name, salaryMin: min, salaryMax: max, description: description || '', createdAt: new Date(), updatedAt: new Date() };
-  const result = await insertOne('job_groups', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const result = await pgDB.insertOne('job_groups', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const updateJobGroup = async (req, res) => {
   const update = { ...req.body, updatedAt: new Date() };
   delete update._id;
+  delete update.id;
   if (update.salaryMin !== undefined) update.salaryMin = Number(update.salaryMin);
   if (update.salaryMax !== undefined) update.salaryMax = Number(update.salaryMax);
   if (update.salaryMin !== undefined && update.salaryMax !== undefined && update.salaryMin >= update.salaryMax) {
     return returnFunction(res, 400, false, 'salaryMin must be less than salaryMax.');
   }
-  await updateOne('job_groups', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await pgDB.updateOne('job_groups', { id: req.params.id }, update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
-const deleteJobGroup = makeDelete('job_groups');
+const deleteJobGroup = pgMakeDelete('job_groups');
 
-// ── Designations (linked to departments) ─────────────────────────────────────
+// ── Designations (linked to departments via designation_departments) ─────────
 const listDesignations = async (req, res) => {
-  const data = await findMany('designations', {}, { sort: { name: 1 } });
+  const [designations, links] = await Promise.all([
+    pgDB.knex('designations').orderBy('name', 'asc'),
+    pgDB.knex('designation_departments'),
+  ]);
+  const deptIdsByDesignation = {};
+  for (const l of links) {
+    (deptIdsByDesignation[l.designationId] ??= []).push(l.departmentId);
+  }
+  const data = designations.map((d) => ({ ...d, _id: new ObjectId(d.id), departmentIds: deptIdsByDesignation[d.id] || [] }));
   return returnFunction(res, 200, true, req.locale.success, data);
 };
 
 const createDesignation = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name'])) return;
-  const existing = await findOne('designations', { name: req.body.name.trim() });
+  const name = req.body.name.trim();
+  const existing = await pgDB.findOne('designations', { name });
   if (existing) return returnFunction(res, 409, false, 'A designation with this name already exists.');
-  const doc = {
-    name:          req.body.name.trim(),
-    departmentIds: Array.isArray(req.body.departmentIds) ? req.body.departmentIds : [],
-    createdAt: new Date(), updatedAt: new Date(),
-  };
-  const result = await insertOne('designations', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const departmentIds = Array.isArray(req.body.departmentIds) ? req.body.departmentIds : [];
+
+  const result = await pgDB.insertOne('designations', { name, createdAt: new Date(), updatedAt: new Date() });
+  if (departmentIds.length) {
+    await pgDB.knex('designation_departments').insert(departmentIds.map((departmentId) => ({ designationId: result.id, departmentId })));
+  }
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
-const updateDesignation = makeUpdate('designations');
-const deleteDesignation = makeDelete('designations');
+const updateDesignation = async (req, res) => {
+  const { departmentIds, ...rest } = req.body;
+  const update = { ...rest, updatedAt: new Date() };
+  delete update._id;
+  delete update.id;
+  if (update.name) update.name = update.name.trim();
+  await pgDB.updateOne('designations', { id: req.params.id }, update);
+
+  // Wholesale-replace the join rows — the Postgres equivalent of Mongo's $set on the
+  // old embedded departmentIds[] array.
+  if (Array.isArray(departmentIds)) {
+    await pgDB.knex.transaction(async (trx) => {
+      await trx('designation_departments').where({ designationId: req.params.id }).del();
+      if (departmentIds.length) {
+        await trx('designation_departments').insert(departmentIds.map((departmentId) => ({ designationId: req.params.id, departmentId })));
+      }
+    });
+  }
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteDesignation = pgMakeDelete('designations'); // designation_departments rows cascade via FK ON DELETE CASCADE
 
 // ── JD Templates (reusable job description PDFs) ──────────────────────────────
 const listJdTemplates = async (req, res) => {
@@ -181,10 +262,10 @@ const serveJdTemplate = async (req, res) => {
 };
 
 // ── Company Accounts (payment sources) ───────────────────────────────────────
-const listCompanyAccounts  = makeList('company_accounts');
-const createCompanyAccount = makeCreate('company_accounts', ['name', 'accountType']);
-const updateCompanyAccount = makeUpdate('company_accounts');
-const deleteCompanyAccount = makeDelete('company_accounts');
+const listCompanyAccounts  = pgMakeList('company_accounts');
+const createCompanyAccount = pgMakeCreate('company_accounts', ['name', 'accountType']);
+const updateCompanyAccount = pgMakeUpdate('company_accounts');
+const deleteCompanyAccount = pgMakeDelete('company_accounts');
 
 // ── Scheduled Events (Training sessions & Team Building events with dates) ────
 const listScheduledEvents = async (req, res) => {

@@ -1,6 +1,9 @@
 const bcrypt = require('bcryptjs');
 const { ObjectId } = require('mongodb');
-const { findMany, findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// `users` and `employees` now live in Postgres. `knex` is used directly for the one
+// query beyond pgDBFunctions' plain-equality shim (an atomic tokenVersion increment).
+const { findMany, findOne, insertOne, updateOne, knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { sendEmail } = require('../../services/emailService');
@@ -15,6 +18,13 @@ const generatePassword = () => {
   return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 };
 
+// training/autoEnrollment.js and other not-yet-migrated Mongo modules still expect a
+// real Mongo ObjectId on `_id` (it gets written straight into Mongo-side documents like
+// enrollments.employeeId) — this wraps a Postgres users row for that handoff. Safe only
+// because ids were deliberately kept as unchanged ObjectId-hex strings across the whole
+// migration (see the plan's "IDs stay as-is" decision).
+const withMongoId = (userRow) => ({ ...userRow, _id: new ObjectId(userRow.id) });
+
 const ALLOWED_CREATE_ROLES = [HR_MANAGER, DEPT_HEAD, STAFF];
 
 // ── List all user accounts ─────────────────────────────────────────────────────
@@ -23,11 +33,9 @@ const listAccounts = async (req, res) => {
   if (req.query.role) filter.role = req.query.role;
   if (req.query.isActive !== undefined) filter.isActive = req.query.isActive === 'true';
 
-  const users = await findMany('users', filter, {
-    sort: { createdAt: -1 },
-    projection: { password: 0 },
-  });
-  return returnFunction(res, 200, true, 'OK', users);
+  const users = await findMany('users', filter, { orderBy: { column: 'createdAt', order: 'desc' } });
+  const safeUsers = users.map(({ password, ...rest }) => rest);
+  return returnFunction(res, 200, true, 'OK', safeUsers);
 };
 
 // ── HR creates an account for staff or dept_head ───────────────────────────────
@@ -54,9 +62,9 @@ const createAccount = async (req, res) => {
   // If linking to an employee, verify that employee exists
   let linkedEmployeeId = null;
   if (employeeId) {
-    const emp = await findOne('employees', { _id: new ObjectId(employeeId) });
+    const emp = await findOne('employees', { id: employeeId });
     if (!emp) return returnFunction(res, 404, false, 'Employee not found.');
-    linkedEmployeeId = emp._id;
+    linkedEmployeeId = emp.id;
   }
 
   const rawPassword = generatePassword();
@@ -71,7 +79,7 @@ const createAccount = async (req, res) => {
     department: department || null,
     mustResetPassword: true,
     isActive: true,
-    createdBy: new ObjectId(req.user._id),
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
@@ -101,10 +109,10 @@ const createAccount = async (req, res) => {
 
   // Training auto-enrollment — a new account is the point at which someone becomes
   // trainable (has a role/department to target and can log in to take courses).
-  evaluateRulesForUser('onHire', { ...doc, _id: result.insertedId }).catch(() => {});
+  evaluateRulesForUser('onHire', withMongoId(result)).catch(() => {});
 
   return returnFunction(res, 201, true, 'Account created. Credentials sent via email.', {
-    _id: result.insertedId,
+    _id: result.id,
   });
 };
 
@@ -113,7 +121,7 @@ const updateAccount = async (req, res) => {
   const { role, department, isActive, employeeId } = req.body;
   const update = { updatedAt: new Date() };
 
-  const before = await findOne('users', { _id: new ObjectId(req.params.id) });
+  const before = await findOne('users', { id: req.params.id });
 
   if (role) {
     if (!ALLOWED_CREATE_ROLES.includes(role)) {
@@ -124,25 +132,25 @@ const updateAccount = async (req, res) => {
   if (department !== undefined) update.department = department;
   if (isActive !== undefined) update.isActive = Boolean(isActive);
   if (employeeId !== undefined) {
-    update.employeeId = employeeId ? new ObjectId(employeeId) : null;
+    update.employeeId = employeeId || null;
   }
 
-  const patch = { $set: update };
   // Deactivating an account must kill all active sessions immediately
   if (isActive === false || isActive === 'false') {
-    patch.$unset = { refreshTokenHash: '', refreshTokenExpiresAt: '' };
+    update.refreshTokenHash = null;
+    update.refreshTokenExpiresAt = null;
   }
 
-  await updateOne('users', { _id: new ObjectId(req.params.id) }, patch);
+  await updateOne('users', { id: req.params.id }, update);
 
   // Training auto-enrollment on role/department change
   if (before) {
     const roleChanged = role && role !== before.role;
     const deptChanged = department !== undefined && department !== before.department;
     if (roleChanged || deptChanged) {
-      const after = await findOne('users', { _id: new ObjectId(req.params.id) });
-      if (roleChanged) evaluateRulesForUser('onRoleChange', after).catch(() => {});
-      if (deptChanged) evaluateRulesForUser('onDepartmentChange', after).catch(() => {});
+      const after = await findOne('users', { id: req.params.id });
+      if (roleChanged) evaluateRulesForUser('onRoleChange', withMongoId(after)).catch(() => {});
+      if (deptChanged) evaluateRulesForUser('onDepartmentChange', withMongoId(after)).catch(() => {});
     }
   }
   return returnFunction(res, 200, true, 'Account updated.');
@@ -150,20 +158,20 @@ const updateAccount = async (req, res) => {
 
 // ── HR resets a user's password (generates new one, sends email) ───────────────
 const adminResetPassword = async (req, res) => {
-  const user = await findOne('users', { _id: new ObjectId(req.params.id) }, { projection: { name: 1, email: 1 } });
+  const user = await findOne('users', { id: req.params.id });
   if (!user) return returnFunction(res, 404, false, 'User not found.');
 
   const rawPassword = generatePassword();
   const hashed = await bcrypt.hash(rawPassword, 12);
 
-  await updateOne('users', { _id: user._id }, {
-    $set:   { password: hashed, mustResetPassword: true, updatedAt: new Date() },
-    $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
+  await knex('users').where({ id: user.id }).update({
+    password: hashed, mustResetPassword: true, updatedAt: new Date(),
+    refreshTokenHash: null, refreshTokenExpiresAt: null,
     // Revokes any access token already issued to this account — see the tokenVersion
     // check in AuthMiddleware.js. Without this, an admin-forced password reset (e.g.
     // because the account was thought to be compromised) wouldn't actually kick out
     // whoever's currently using it until their token's own natural expiry.
-    $inc: { tokenVersion: 1 },
+    tokenVersion: knex.raw('"tokenVersion" + 1'),
   });
 
   sendEmail({
@@ -193,7 +201,7 @@ const changeOwnPassword = async (req, res) => {
   // otherwise surfaces as a confusing "Current password is incorrect."
   const currentPassword = String(req.body.currentPassword || '').trim();
   const newPassword = String(req.body.newPassword || '').trim();
-  const user = await findOne('users', { _id: new ObjectId(req.user._id) });
+  const user = await findOne('users', { id: req.user.id });
   if (!user) return returnFunction(res, 404, false, 'User not found.');
 
   // If not first-time reset, require current password
@@ -206,13 +214,13 @@ const changeOwnPassword = async (req, res) => {
   if (newPassword.length < 6) return returnFunction(res, 400, false, 'Password must be at least 6 characters.');
 
   const hashed = await bcrypt.hash(newPassword, 12);
-  await updateOne('users', { _id: user._id }, {
-    $set:   { password: hashed, mustResetPassword: false, updatedAt: new Date() },
+  await knex('users').where({ id: user.id }).update({
+    password: hashed, mustResetPassword: false, updatedAt: new Date(),
     // Invalidate all existing sessions — forces re-login on all devices. tokenVersion
     // is what makes this actually true for a still-time-valid access token too, not
     // just future refreshes (see AuthMiddleware.js).
-    $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' },
-    $inc: { tokenVersion: 1 },
+    refreshTokenHash: null, refreshTokenExpiresAt: null,
+    tokenVersion: knex.raw('"tokenVersion" + 1'),
   });
 
   return returnFunction(res, 200, true, 'Password updated successfully.');

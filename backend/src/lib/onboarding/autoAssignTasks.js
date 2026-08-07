@@ -1,6 +1,10 @@
 const bcrypt = require('bcryptjs');
 const { ObjectId } = require('mongodb');
 const { findOne, findMany, insertOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
+// `employees`/`users` now live in Postgres; `onboarding_templates`/`onboarding_records`
+// are unmigrated, so they stay on the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyUser, notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyManager } = require('../../routes/inbox/inboxFunctions');
 const { sendEmail } = require('../../services/emailService');
@@ -23,20 +27,20 @@ const generatePassword = () => {
 const ensureLoginAccount = async (employeeId, employee) => {
   if (!employee.email) return null;
 
-  const existing = await findOne('users', { employeeId: new ObjectId(employeeId) }, { projection: { _id: 1 } });
+  const existing = await pgDB.findOne('users', { employeeId: String(employeeId) });
   if (existing) return null;
 
-  const byEmail = await findOne('users', { email: employee.email.toLowerCase().trim() }, { projection: { _id: 1 } });
+  const byEmail = await pgDB.findOne('users', { email: employee.email.toLowerCase().trim() });
   if (byEmail) return null;
 
   const rawPassword = generatePassword();
   const hashed = await bcrypt.hash(rawPassword, 12);
-  await insertOne('users', {
+  await pgDB.insertOne('users', {
     name: employee.fullName,
     email: employee.email.toLowerCase().trim(),
     password: hashed,
     role: STAFF,
-    employeeId: new ObjectId(employeeId),
+    employeeId: String(employeeId),
     department: employee.department || null,
     mustResetPassword: true,
     isActive: true,
@@ -74,17 +78,17 @@ const notifyStakeholder = async (assignedTo, employeeId, payload) => {
   }
   const department = STAKEHOLDER_DEPARTMENTS[assignedTo];
   if (!department) return;
-  const deptEmployees = await findMany('employees', { department }, { projection: { _id: 1 } });
+  const deptEmployees = await pgDB.knex('employees').where({ department }).select('id');
   if (!deptEmployees.length) return;
-  const deptUsers = await findMany('users', { employeeId: { $in: deptEmployees.map(e => e._id) } }, { projection: { _id: 1 } });
-  await Promise.all(deptUsers.map(u => notifyUser(u._id, payload)));
+  const deptUsers = await pgDB.knex('users').whereIn('employeeId', deptEmployees.map(e => e.id)).select('id');
+  await Promise.all(deptUsers.map(u => notifyUser(u.id, payload)));
 };
 
 const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) => {
   const template = await findOne('onboarding_templates', { _id: new ObjectId(templateId) });
   if (!template) throw new Error('Onboarding template not found.');
 
-  const employee = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { fullName: 1, email: 1, department: 1 } });
+  const employee = await pgDB.findOne('employees', { id: String(employeeId) });
   if (!employee) throw new Error('Employee not found.');
 
   const start = new Date(startDate);
