@@ -12,13 +12,16 @@ const calculateWorkingDays = (startDate, endDate, holidaySet = new Set()) => {
   return count;
 };
 
-// Async version that fetches public holidays from DB and excludes them
+// Async version that fetches public holidays from DB and excludes them.
+// public_holidays now lives in Postgres (Phase 3a — see
+// /home/carole/.claude/plans/abundant-dreaming-flurry.md).
 const calculateWorkingDaysDB = async (startDate, endDate) => {
   let holidaySet = new Set();
   try {
-    const holidays = await global.dbo.collection('public_holidays')
-      .find({ date: { $gte: startDate, $lte: endDate } }, { projection: { date: 1 } })
-      .toArray();
+    const knex = require('../Database/pgClient');
+    const holidays = await knex('public_holidays')
+      .where('date', '>=', startDate).where('date', '<=', endDate)
+      .select('date');
     holidaySet = new Set(holidays.map(h => h.date));
   } catch {
     // Fall back to weekend-only calculation if DB unavailable

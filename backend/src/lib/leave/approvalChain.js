@@ -1,5 +1,6 @@
-const { ObjectId } = require('mongodb');
-const { findOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 3a) —
+// employees/users now live in Postgres.
+const { findOne, knex } = require('../../functions/Database/pgDBFunctions');
 
 // Days above this threshold always escalate to HR as the final approval level,
 // regardless of how many levels already exist — matches the spec's "Level 3:
@@ -19,13 +20,13 @@ const resolveApprovalChain = async (employee, totalDays) => {
   let level = 0;
 
   if (employee.managerId) {
-    const manager = await findOne('employees', { _id: new ObjectId(employee.managerId) });
+    const manager = await findOne('employees', { id: employee.managerId });
     if (manager) {
-      const managerUser = await findOne('users', { employeeId: manager._id });
+      const managerUser = await findOne('users', { employeeId: manager.id });
       if (managerUser) {
         level += 1;
         chain.push({
-          level, approverId: managerUser._id, approverName: manager.fullName,
+          level, approverId: managerUser.id, approverName: manager.fullName,
           approverRole: 'manager', status: 'pending', actedAt: null, comment: null,
         });
       }
@@ -33,20 +34,20 @@ const resolveApprovalChain = async (employee, totalDays) => {
   }
 
   const deptHeadUser = await findOne('users', { role: 'department_head', department: employee.department });
-  if (deptHeadUser && String(deptHeadUser.employeeId) !== String(employee._id)) {
+  if (deptHeadUser && deptHeadUser.employeeId !== employee.id) {
     level += 1;
     chain.push({
-      level, approverId: deptHeadUser._id, approverName: deptHeadUser.name,
+      level, approverId: deptHeadUser.id, approverName: deptHeadUser.name,
       approverRole: 'department_head', status: 'pending', actedAt: null, comment: null,
     });
   }
 
   if (totalDays > HR_ESCALATION_THRESHOLD_DAYS || chain.length === 0) {
-    const hrUser = await findOne('users', { role: { $in: ['super_admin', 'hr_manager'] } });
+    const hrUser = await knex('users').whereIn('role', ['super_admin', 'hr_manager']).first();
     if (hrUser) {
       level += 1;
       chain.push({
-        level, approverId: hrUser._id, approverName: hrUser.name,
+        level, approverId: hrUser.id, approverName: hrUser.name,
         approverRole: hrUser.role, status: 'pending', actedAt: null, comment: null,
       });
     }

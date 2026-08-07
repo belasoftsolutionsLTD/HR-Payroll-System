@@ -1,9 +1,7 @@
-const { ObjectId } = require('mongodb');
-const { findMany, findOne, updateOne, insertOne } = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// `employees`/`users` now live in Postgres; leave_accrual_policies/leave_balances/
-// leave_audit_log/leave_types are unmigrated, so they stay on the Mongo helpers above.
-const pgDB = require('../../functions/Database/pgDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// employees/users (Phase 1) and leave_accrual_policies/leave_balances/leave_audit_log/
+// leave_types (Phase 3a) all now live in Postgres.
+const { findMany, findOne, updateOne, insertOne, knex } = require('../../functions/Database/pgDBFunctions');
 
 const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 
@@ -20,20 +18,17 @@ const runAccrual = async (triggeredBy = null, onlyEmployeeIds = null) => {
   const policies = await findMany('leave_accrual_policies', { isActive: true });
   if (!policies.length) return { processed: 0, message: 'No active accrual policies.' };
 
-  let employeeQuery = pgDB.knex('employees').whereNot('status', 'inactive');
+  let employeeQuery = knex('employees').whereNot('status', 'inactive');
   if (onlyEmployeeIds) employeeQuery = employeeQuery.whereIn('id', onlyEmployeeIds.map(String));
-  // Raw knex rows only carry `.id` — `_id` (a real ObjectId) is added back here since
-  // the rest of this file, and the Mongo leave_balances/leave_audit_log documents it
-  // writes below, still expect employee._id in the Mongo-document-shaped sense.
-  const employees = (await employeeQuery).map((e) => ({ ...e, _id: new ObjectId(e.id) }));
+  const employees = await employeeQuery;
   const users = employees.length
-    ? await pgDB.knex('users').whereIn('employeeId', employees.map(e => e.id)).select('employeeId', 'role')
+    ? await knex('users').whereIn('employeeId', employees.map(e => e.id)).select('employeeId', 'role')
     : [];
-  const roleByEmployeeId = Object.fromEntries(users.map(u => [String(u.employeeId), u.role]));
+  const roleByEmployeeId = Object.fromEntries(users.map(u => [u.employeeId, u.role]));
 
   const policyApplies = (policy, employee) => {
     const { roles, departments, employmentTypes } = policy.appliesTo || {};
-    if (roles?.length && !roles.includes(roleByEmployeeId[String(employee._id)])) return false;
+    if (roles?.length && !roles.includes(roleByEmployeeId[employee.id])) return false;
     if (departments?.length && !departments.includes(employee.department)) return false;
     if (employmentTypes?.length && !employmentTypes.includes(employee.employmentType)) return false;
     return true;
@@ -52,14 +47,13 @@ const runAccrual = async (triggeredBy = null, onlyEmployeeIds = null) => {
     for (const employee of employees) {
       if (!policyApplies(policy, employee)) continue;
 
-      let balance = await findOne('leave_balances', { employeeId: employee._id, leaveTypeId: policy.leaveTypeId, year });
+      let balance = await findOne('leave_balances', { employeeId: employee.id, leaveTypeId: policy.leaveTypeId, year });
       if (!balance) {
-        const { insertedId } = await insertOne('leave_balances', {
-          employeeId: employee._id, leaveTypeId: policy.leaveTypeId, year,
+        balance = await insertOne('leave_balances', {
+          employeeId: employee.id, leaveTypeId: policy.leaveTypeId, year,
           openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, carryOverExpiry: null,
           closingBalance: 0, lastAccrualDate: null, updatedAt: now,
         });
-        balance = { _id: insertedId, openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, lastAccrualDate: null };
       }
 
       const alreadyRunThisPeriod = isMonthly
@@ -71,16 +65,16 @@ const runAccrual = async (triggeredBy = null, onlyEmployeeIds = null) => {
       const amount = Math.min(policy.accrualAmount, room);
       if (amount <= 0) continue;
 
-      const newAccrued = balance.accrued + amount;
-      const newClosing = balance.openingBalance + newAccrued + balance.carriedOver - balance.used - balance.pending;
-      await updateOne('leave_balances', { _id: balance._id }, {
-        $set: { accrued: newAccrued, closingBalance: newClosing, lastAccrualDate: now, updatedAt: now },
+      const newAccrued = Number(balance.accrued) + Number(amount);
+      const newClosing = Number(balance.openingBalance) + newAccrued + Number(balance.carriedOver) - Number(balance.used) - Number(balance.pending);
+      await updateOne('leave_balances', { id: balance.id }, {
+        accrued: newAccrued, closingBalance: newClosing, lastAccrualDate: now, updatedAt: now,
       });
 
       await insertOne('leave_audit_log', {
-        leaveRequestId: null, employeeId: employee._id, action: 'balanceAdjusted',
-        performedBy: triggeredBy, performedByName: triggeredBy ? null : 'System (cron)',
-        previousValue: { accrued: balance.accrued }, newValue: { accrued: newAccrued },
+        leaveRequestId: null, employeeId: employee.id, action: 'balanceAdjusted',
+        performedBy: triggeredBy ? String(triggeredBy) : null, performedByName: triggeredBy ? null : 'System (cron)',
+        previousValue: JSON.stringify({ accrued: balance.accrued }), newValue: JSON.stringify({ accrued: newAccrued }),
         comment: `${isMonthly ? 'Monthly' : 'Annual'} accrual: +${amount} days (${policy.name})`, timestamp: now,
       });
       processed += 1;
@@ -101,9 +95,9 @@ const runYearEndCarryOver = async (triggeredBy = null) => {
 
   let processed = 0;
   for (const lt of leaveTypes) {
-    const balances = await findMany('leave_balances', { leaveTypeId: lt._id, year: previousYear });
+    const balances = await findMany('leave_balances', { leaveTypeId: lt.id, year: previousYear });
     for (const bal of balances) {
-      const existing = await findOne('leave_balances', { employeeId: bal.employeeId, leaveTypeId: lt._id, year: currentYear });
+      const existing = await findOne('leave_balances', { employeeId: bal.employeeId, leaveTypeId: lt.id, year: currentYear });
       if (existing) continue;
 
       const unused = Math.max(0, bal.closingBalance);
@@ -113,7 +107,7 @@ const runYearEndCarryOver = async (triggeredBy = null) => {
         : null;
 
       await insertOne('leave_balances', {
-        employeeId: bal.employeeId, leaveTypeId: lt._id, year: currentYear,
+        employeeId: bal.employeeId, leaveTypeId: lt.id, year: currentYear,
         openingBalance: 0, accrued: 0, used: 0, pending: 0,
         carriedOver, carryOverExpiry, closingBalance: carriedOver,
         lastAccrualDate: null, updatedAt: now,
@@ -121,8 +115,8 @@ const runYearEndCarryOver = async (triggeredBy = null) => {
 
       await insertOne('leave_audit_log', {
         leaveRequestId: null, employeeId: bal.employeeId, action: 'balanceAdjusted',
-        performedBy: triggeredBy, performedByName: triggeredBy ? null : 'System (cron)',
-        previousValue: null, newValue: { carriedOver },
+        performedBy: triggeredBy ? String(triggeredBy) : null, performedByName: triggeredBy ? null : 'System (cron)',
+        previousValue: null, newValue: JSON.stringify({ carriedOver }),
         comment: `Year-end carry-over from ${previousYear}: ${carriedOver} days (${lt.name})`, timestamp: now,
       });
       processed += 1;

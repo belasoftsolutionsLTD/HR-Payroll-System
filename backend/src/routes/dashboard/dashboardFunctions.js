@@ -1,6 +1,13 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// employees/users (Phase 1) and leave_balances/leave_requests/leave_types/
+// public_holidays (Phase 3a) now live in Postgres. Everything this file still touches
+// that HASN'T been migrated yet (expense_claims, goals, job_postings, payroll_runs,
+// communication_posts, scheduled_events, attendance_records, inbox_items, shifts) stays
+// on the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 
 const today = () => new Date().toISOString().split('T')[0];
 
@@ -11,16 +18,16 @@ const getDashboardSummary = async (req, res) => {
   const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0];
 
   if (role === 'staff') {
-    const empId = req.user.employeeId;
+    const empId = req.user.employeeId ? String(req.user.employeeId) : null;
     const year = new Date().getFullYear();
 
     const [balances, pendingExpenses, goals] = await Promise.all([
-      empId ? findMany('leave_balances', { employeeId: empId, year }) : [],
-      empId ? countDocuments('expense_claims', { employeeId: empId, status: 'submitted' }) : 0,
-      empId ? countDocuments('goals', { employeeId: empId, status: { $in: ['at_risk', 'behind'] } }) : 0,
+      empId ? pgDB.findMany('leave_balances', { employeeId: empId, year }) : [],
+      empId ? countDocuments('expense_claims', { employeeId: new ObjectId(empId), status: 'submitted' }) : 0,
+      empId ? countDocuments('goals', { employeeId: new ObjectId(empId), status: { $in: ['at_risk', 'behind'] } }) : 0,
     ]);
 
-    const totalLeaveBalance = balances.reduce((sum, b) => sum + Math.max(0, b.closingBalance), 0);
+    const totalLeaveBalance = balances.reduce((sum, b) => sum + Math.max(0, Number(b.closingBalance)), 0);
     return returnFunction(res, 200, true, 'ok', {
       role: 'staff',
       leaveBalance: totalLeaveBalance,
@@ -31,16 +38,17 @@ const getDashboardSummary = async (req, res) => {
 
   if (role === 'department_head') {
     const now = new Date();
-    const emp = req.user.employeeId ? await findOne('employees', { _id: req.user.employeeId }) : null;
+    const empId = req.user.employeeId ? String(req.user.employeeId) : null;
+    const emp = empId ? await pgDB.findOne('employees', { id: empId }) : null;
     const dept = emp?.department;
 
-    const teamEmps = dept ? await findMany('employees', { department: dept, status: 'active' }, { projection: { _id: 1 } }) : [];
-    const teamIds = teamEmps.map(e => e._id);
+    const teamEmps = dept ? await pgDB.knex('employees').where({ department: dept, status: 'active' }).select('id') : [];
+    const teamIds = teamEmps.map(e => e.id);
 
     const [teamSize, onLeaveToday, pendingLeave, pendingExpenses] = await Promise.all([
-      countDocuments('employees', { ...(dept ? { department: dept } : {}), status: 'active' }),
-      teamIds.length ? countDocuments('leave_requests', { employeeId: { $in: teamIds }, status: 'approved', startDate: { $lte: now }, endDate: { $gte: now } }) : 0,
-      teamIds.length ? countDocuments('leave_requests', { employeeId: { $in: teamIds }, status: 'pending' }) : 0,
+      pgDB.knex('employees').where({ status: 'active' }).modify((qb) => { if (dept) qb.where({ department: dept }); }).count('* as count').first().then(r => Number(r.count)),
+      teamIds.length ? pgDB.knex('leave_requests').whereIn('employeeId', teamIds).where({ status: 'approved' }).where('startDate', '<=', now).where('endDate', '>=', now).count('* as count').first().then(r => Number(r.count)) : 0,
+      teamIds.length ? pgDB.knex('leave_requests').whereIn('employeeId', teamIds).where({ status: 'pending' }).count('* as count').first().then(r => Number(r.count)) : 0,
       countDocuments('expense_claims', { status: 'pending' }),
     ]);
 
@@ -48,7 +56,7 @@ const getDashboardSummary = async (req, res) => {
     let missingClockIn = 0;
     if (dept) {
       const clockedIn = await global.dbo.collection('attendance_records')
-        .countDocuments({ date: todayStr, employeeId: { $in: teamIds }, checkInTime: { $ne: null } });
+        .countDocuments({ date: todayStr, employeeId: { $in: teamIds.map((id) => new ObjectId(id)) }, checkInTime: { $ne: null } });
       missingClockIn = Math.max(0, teamIds.length - clockedIn);
     }
 
@@ -63,12 +71,15 @@ const getDashboardSummary = async (req, res) => {
 
   // HR / super_admin
   const [totalHeadcount, newHires, openPositions] = await Promise.all([
-    countDocuments('employees', { status: 'active' }),
-    countDocuments('employees', { status: 'active', startDate: { $gte: monthStart } }),
+    pgDB.knex('employees').where({ status: 'active' }).count('* as count').first().then(r => Number(r.count)),
+    pgDB.knex('employees').where({ status: 'active' }).where('createdAt', '>=', monthStart).count('* as count').first().then(r => Number(r.count)),
     countDocuments('job_postings', { status: { $in: ['open', 'active'] } }),
   ]);
 
-  // Payroll cycle status
+  // Payroll cycle status — payroll_runs is a stale/legacy collection name predating
+  // payroll_cycles (see reportFunctions.js's own note on the same legacy-model issue);
+  // this always resolves to "No active cycle" today regardless of migration, so left
+  // exactly as-is rather than silently "fixed" into something the app never actually did.
   const currentPayroll = await findOne('payroll_runs', {}, { sort: { createdAt: -1 } });
 
   return returnFunction(res, 200, true, 'ok', {
@@ -87,11 +98,11 @@ const getFeedPreview = async (req, res) => {
     sort: { createdAt: -1 },
   });
 
-  const authorIds = [...new Set(posts.filter(p => p.authorId).map(p => String(p.authorId)))].map(id => new ObjectId(id));
+  const authorIds = [...new Set(posts.filter(p => p.authorId).map(p => String(p.authorId)))];
   const authors = authorIds.length
-    ? await findMany('employees', { _id: { $in: authorIds } }, { projection: { fullName: 1 } })
+    ? await pgDB.knex('employees').whereIn('id', authorIds).select('id', 'fullName')
     : [];
-  const authorById = Object.fromEntries(authors.map(a => [String(a._id), a]));
+  const authorById = Object.fromEntries(authors.map(a => [a.id, a]));
   const enriched = posts.map(p => ({ ...p, authorName: (p.authorId && authorById[String(p.authorId)]?.fullName) || 'Unknown' }));
 
   return returnFunction(res, 200, true, 'ok', enriched);
@@ -113,9 +124,7 @@ const getCelebrations = async (req, res) => {
   const weekEnd = new Date(now);
   weekEnd.setDate(now.getDate() + 7);
 
-  const employees = await findMany('employees', { status: 'active' }, {
-    projection: { fullName: 1, dateOfBirth: 1, startDate: 1 },
-  });
+  const employees = await pgDB.knex('employees').where({ status: 'active' }).select('id', 'fullName', 'dateOfBirth', 'dateOfHire');
 
   const celebrations = [];
   const thisYear = now.getFullYear();
@@ -132,8 +141,8 @@ const getCelebrations = async (req, res) => {
       }
     }
     // Work anniversary this week
-    if (emp.startDate) {
-      const start = new Date(emp.startDate);
+    if (emp.dateOfHire) {
+      const start = new Date(emp.dateOfHire);
       const anniv = new Date(thisYear, start.getMonth(), start.getDate()).getTime();
       const years = thisYear - start.getFullYear();
       if (years > 0 && anniv >= todayMs && anniv <= weekEndMs) {
@@ -150,7 +159,7 @@ const getCelebrations = async (req, res) => {
 const getLiveAttendance = async (req, res) => {
   const todayStr = today();
   const [totalActive, records] = await Promise.all([
-    countDocuments('employees', { status: 'active' }),
+    pgDB.knex('employees').where({ status: 'active' }).count('* as count').first().then(r => Number(r.count)),
     global.dbo.collection('attendance_records').find({ date: todayStr }).toArray(),
   ]);
 
@@ -158,7 +167,7 @@ const getLiveAttendance = async (req, res) => {
   const onBreak   = records.filter(r => r.checkInTime && (r.breaks || []).find(b => !b.endTime)).length;
   const clockedOut = records.filter(r => r.checkOutTime).length;
   const now = new Date();
-  const onLeave   = await countDocuments('leave_requests', { status: 'approved', startDate: { $lte: now }, endDate: { $gte: now } });
+  const onLeave   = await pgDB.knex('leave_requests').where({ status: 'approved' }).where('startDate', '<=', now).where('endDate', '>=', now).count('* as count').first().then(r => Number(r.count));
   const notIn     = Math.max(0, totalActive - clockedIn - onBreak - clockedOut - onLeave);
 
   // Recent clock-ins (last 5)
@@ -167,11 +176,11 @@ const getLiveAttendance = async (req, res) => {
     .sort((a, b) => new Date(b.checkInTime) - new Date(a.checkInTime))
     .slice(0, 5);
 
-  const recentEmpIds = [...new Set(recent.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const recentEmpIds = [...new Set(recent.map(r => String(r.employeeId)))];
   const recentEmps = recentEmpIds.length
-    ? await findMany('employees', { _id: { $in: recentEmpIds } }, { projection: { fullName: 1 } })
+    ? await pgDB.knex('employees').whereIn('id', recentEmpIds).select('id', 'fullName')
     : [];
-  const recentEmpById = Object.fromEntries(recentEmps.map(e => [String(e._id), e]));
+  const recentEmpById = Object.fromEntries(recentEmps.map(e => [e.id, e]));
   const recentEnriched = recent.map(r => ({ name: recentEmpById[String(r.employeeId)]?.fullName || 'Unknown', checkInTime: r.checkInTime }));
 
   return returnFunction(res, 200, true, 'ok', {
@@ -203,28 +212,27 @@ const getPendingActions = async (req, res) => {
 // ── Today's schedule ──────────────────────────────────────────────────────────
 const getTodaySchedule = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 200, true, 'ok', null);
+  const empId = String(req.user.employeeId);
   const todayStr = today();
 
   // Check if employee is on leave
   const now = new Date();
-  const onLeave = await findOne('leave_requests', {
-    employeeId: req.user.employeeId,
-    status: 'approved',
-    startDate: { $lte: now },
-    endDate: { $gte: now },
-  });
+  const onLeave = await pgDB.knex('leave_requests')
+    .where({ employeeId: empId, status: 'approved' }).where('startDate', '<=', now).where('endDate', '>=', now)
+    .first();
   if (onLeave) {
-    const leaveType = await findOne('leave_types', { _id: onLeave.leaveTypeId }, { projection: { name: 1 } });
+    const leaveType = await pgDB.findOne('leave_types', { id: onLeave.leaveTypeId });
     return returnFunction(res, 200, true, 'ok', { type: 'leave', leaveType: leaveType?.name || 'Leave' });
   }
 
   // Check public holiday
-  const holiday = await findOne('public_holidays', { date: todayStr });
+  const holiday = await pgDB.findOne('public_holidays', { date: todayStr });
   if (holiday) return returnFunction(res, 200, true, 'ok', { type: 'holiday', name: holiday.name });
 
-  // Get assigned shift or default schedule
-  const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { shiftId: 1 } });
-  const shift = emp?.shiftId ? await findOne('shifts', { _id: emp.shiftId }) : null;
+  // Get assigned shift or default schedule. shifts is unmigrated — stays Mongo; employees'
+  // own shiftId lookup is Postgres.
+  const emp = await pgDB.findOne('employees', { id: empId });
+  const shift = emp?.shiftId ? await findOne('shifts', { _id: new ObjectId(emp.shiftId) }) : null;
 
   return returnFunction(res, 200, true, 'ok', {
     type: 'work',

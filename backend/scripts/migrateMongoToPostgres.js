@@ -383,6 +383,79 @@ async function main() {
       createdBy: idStr(s.createdBy), createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
     })));
 
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase 3a — leave: types, public holidays, accrual policies, balances,
+    // requests, audit log, blackouts.
+    // ══════════════════════════════════════════════════════════════════════
+
+    const leaveTypes = await dbo.collection('leave_types').find({}).toArray();
+    counts.leave_types = await upsertBatched('leave_types', leaveTypes.map((lt) => ({
+      id: idStr(lt._id), name: lt.name, code: lt.code ?? null, description: lt.description ?? null,
+      isPaid: lt.isPaid ?? true, isCarryOverAllowed: lt.isCarryOverAllowed ?? false,
+      maxCarryOverDays: lt.maxCarryOverDays ?? null, carryOverExpiryMonths: lt.carryOverExpiryMonths ?? null,
+      requiresApproval: lt.requiresApproval ?? true, requiresAttachment: lt.requiresAttachment ?? false,
+      minNoticeDays: lt.minNoticeDays ?? null, maxConsecutiveDays: lt.maxConsecutiveDays ?? null,
+      eligibilityMonths: lt.eligibilityMonths ?? null, countPublicHolidays: lt.countPublicHolidays ?? false,
+      color: lt.color ?? '#3b82f6', isActive: lt.isActive ?? true,
+      appliesTo: lt.appliesTo ? JSON.stringify(lt.appliesTo) : null,
+      createdBy: idStr(lt.createdBy), createdAt: toDate(lt.createdAt), updatedAt: toDate(lt.updatedAt),
+    })));
+
+    const holidays = await dbo.collection('public_holidays').find({}).toArray();
+    counts.public_holidays = await upsertBatched('public_holidays', holidays.map((h) => ({
+      id: idStr(h._id), name: h.name, date: h.date, isRecurringAnnually: h.isRecurringAnnually ?? false,
+      appliesTo: h.appliesTo ? JSON.stringify(h.appliesTo) : null,
+      createdBy: idStr(h.createdBy), createdAt: toDate(h.createdAt),
+    })));
+
+    const accrualPolicies = await dbo.collection('leave_accrual_policies').find({}).toArray();
+    counts.leave_accrual_policies = await upsertBatched('leave_accrual_policies', accrualPolicies.map((p) => ({
+      id: idStr(p._id), name: p.name, leaveTypeId: idStr(p.leaveTypeId), accrualFrequency: p.accrualFrequency,
+      accrualAmount: p.accrualAmount, maxAnnualEntitlement: p.maxAnnualEntitlement,
+      appliesTo: p.appliesTo ? JSON.stringify(p.appliesTo) : null, isActive: p.isActive ?? true,
+      createdBy: idStr(p.createdBy), createdAt: toDate(p.createdAt),
+    })));
+
+    const balances = await dbo.collection('leave_balances').find({}).toArray();
+    counts.leave_balances = await upsertBatched('leave_balances', balances.map((b) => ({
+      id: idStr(b._id), employeeId: idStr(b.employeeId), leaveTypeId: idStr(b.leaveTypeId), year: b.year,
+      openingBalance: b.openingBalance ?? 0, accrued: b.accrued ?? 0, used: b.used ?? 0, pending: b.pending ?? 0,
+      carriedOver: b.carriedOver ?? 0, carryOverExpiry: toDate(b.carryOverExpiry), closingBalance: b.closingBalance ?? 0,
+      lastAccrualDate: toDate(b.lastAccrualDate), updatedAt: toDate(b.updatedAt),
+    })));
+
+    const leaveRequests = await dbo.collection('leave_requests').find({}).toArray();
+    counts.leave_requests = await upsertBatched('leave_requests', leaveRequests.map((r) => ({
+      id: idStr(r._id), employeeId: idStr(r.employeeId), leaveTypeId: idStr(r.leaveTypeId),
+      startDate: toDate(r.startDate), endDate: toDate(r.endDate), totalDays: r.totalDays,
+      halfDay: r.halfDay ?? null, reason: r.reason ?? null, attachmentUrl: r.attachmentUrl ?? null,
+      status: r.status, approvalChain: r.approvalChain ? JSON.stringify(r.approvalChain) : null,
+      currentApprovalLevel: r.currentApprovalLevel ?? 0, rejectionReason: r.rejectionReason ?? null,
+      cancelledAt: toDate(r.cancelledAt), cancelledBy: idStr(r.cancelledBy),
+      revokedAt: toDate(r.revokedAt), revokedBy: idStr(r.revokedBy),
+      disputeReason: r.disputeReason ?? null, disputeSource: r.disputeSource ?? null,
+      disputeResolvedAt: toDate(r.disputeResolvedAt), disputeResolvedBy: idStr(r.disputeResolvedBy),
+      proposedDays: r.proposedDays ?? null, counterOfferReason: r.counterOfferReason ?? null,
+      payrollRunId: idStr(r.payrollRunId),
+      leaveStartReminderSent: r.leaveStartReminderSent ?? false, leaveEndReminderSent: r.leaveEndReminderSent ?? false,
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    const leaveAuditLog = await dbo.collection('leave_audit_log').find({}).toArray();
+    counts.leave_audit_log = await upsertBatched('leave_audit_log', leaveAuditLog.map((a) => ({
+      id: idStr(a._id), leaveRequestId: idStr(a.leaveRequestId), employeeId: idStr(a.employeeId), action: a.action,
+      performedBy: idStr(a.performedBy), performedByName: a.performedByName ?? null,
+      previousValue: a.previousValue !== undefined ? JSON.stringify(a.previousValue) : null,
+      newValue: a.newValue !== undefined ? JSON.stringify(a.newValue) : null,
+      comment: a.comment ?? null, timestamp: toDate(a.timestamp),
+    })));
+
+    const blackouts = await dbo.collection('leave_blackouts').find({}).toArray();
+    counts.leave_blackouts = await upsertBatched('leave_blackouts', blackouts.map((b) => ({
+      id: idStr(b._id), name: b.name, startDate: toDate(b.startDate), endDate: toDate(b.endDate),
+      departments: b.departments || [], createdBy: idStr(b.createdBy), createdAt: toDate(b.createdAt),
+    })));
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

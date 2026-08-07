@@ -4,13 +4,13 @@ const { ObjectId } = require('mongodb');
 const archiver = require('archiver');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 2) —
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // payroll_concepts, employee_compensations, payroll_cycles, payroll_results (+ its child
-// tables), payslips, employees, departments, users, compensation_audit_logs all now live
-// in Postgres. Everything this file still touches that HASN'T been migrated yet
-// (timesheets, expense_claims, leave_requests/leave_types, tax_config, overtime_config,
-// public_holidays, company_settings, GL accounting) stays on the Mongo helpers via
-// commonDBFunctions/global.dbo, imported separately below.
+// tables), payslips, employees, departments, users, compensation_audit_logs (Phase 2),
+// plus leave_requests/leave_types/public_holidays (Phase 3a), now live in Postgres.
+// Everything this file still touches that HASN'T been migrated yet (timesheets,
+// expense_claims, tax_config, overtime_config, company_settings, GL accounting) stays on
+// the Mongo helpers via commonDBFunctions/global.dbo, imported separately below.
 const { findOne, findMany, insertOne, updateOne, countDocuments, knex, newId, addChildRow } = require('../../functions/Database/pgDBFunctions');
 const { generatePayslipFromResult } = require('../../services/payslipService');
 const { generateP9Form } = require('../../services/p9Service');
@@ -397,10 +397,10 @@ async function doLockCycleInternal(req, res, cycle) {
   const alertConcepts = await findMany('payroll_concepts', { alertIfUndefined: true, isActive: true });
 
   // Public holidays inside this period, loaded once (avoids N+1 DB calls in the leave calc
-  // below). public_holidays is unmigrated — stays Mongo.
+  // below). public_holidays now lives in Postgres (Phase 3a).
   const cycleStartStr = cycle.periodStartDate.toISOString().slice(0, 10);
   const cycleEndStr   = cycle.periodEndDate.toISOString().slice(0, 10);
-  const holidays = await global.dbo.collection('public_holidays').find({ date: { $gte: cycleStartStr, $lte: cycleEndStr } }, { projection: { date: 1 } }).toArray();
+  const holidays = await knex('public_holidays').where('date', '>=', cycleStartStr).where('date', '<=', cycleEndStr).select('date');
   const holidaySet = new Set(holidays.map(h => h.date));
 
   for (const emp of employees) {
@@ -559,20 +559,19 @@ async function doLockCycleInternal(req, res, cycle) {
     // Pull approved leave overlapping this cycle period. Every approved leave type shows as
     // its own named line on the payslip; only 'unpaid' leave actually deducts from net pay —
     // the daily rate is the standard 22-working-day monthly rate, matching the overtime calc.
-    // leave_requests/leave_types are unmigrated — stay Mongo.
-    const leaveDocs = await global.dbo.collection('leave_requests').find({
-      employeeId: empObjectId, status: 'approved',
-      startDate: { $lte: cycle.periodEndDate }, endDate: { $gte: cycle.periodStartDate },
-    }).toArray();
-    const leaveTypeIds = [...new Set(leaveDocs.map(lr => String(lr.leaveTypeId)))].map(id => new ObjectId(id));
-    const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }).toArray();
-    const leaveTypeById = Object.fromEntries(leaveTypes.map(lt => [String(lt._id), lt]));
+    // leave_requests/leave_types now live in Postgres (Phase 3a).
+    const leaveDocs = await knex('leave_requests')
+      .where({ employeeId: emp.id, status: 'approved' })
+      .where('startDate', '<=', cycle.periodEndDate).where('endDate', '>=', cycle.periodStartDate);
+    const leaveTypeIds = [...new Set(leaveDocs.map(lr => lr.leaveTypeId))];
+    const leaveTypes = leaveTypeIds.length ? await knex('leave_types').whereIn('id', leaveTypeIds) : [];
+    const leaveTypeById = Object.fromEntries(leaveTypes.map(lt => [lt.id, lt]));
     const dailyRate = grossPay ? grossPay / 22 : 0;
     const leave = leaveDocs.map((lr) => {
       const clampedStart = lr.startDate < cycle.periodStartDate ? cycleStartStr : lr.startDate.toISOString().slice(0, 10);
       const clampedEnd    = lr.endDate   > cycle.periodEndDate   ? cycleEndStr   : lr.endDate.toISOString().slice(0, 10);
       const days = calculateWorkingDays(clampedStart, clampedEnd, holidaySet);
-      const leaveType = leaveTypeById[String(lr.leaveTypeId)];
+      const leaveType = leaveTypeById[lr.leaveTypeId];
       const amount = leaveType && !leaveType.isPaid ? Math.round(dailyRate * days * 100) / 100 : 0;
       return { leaveType: leaveType?.name || 'Unknown', startDate: clampedStart, endDate: clampedEnd, days, amount };
     });

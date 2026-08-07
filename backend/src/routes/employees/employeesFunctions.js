@@ -3,16 +3,17 @@ const path = require('path');
 const fs = require('fs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// employees, job_history, and their supporting lookups now live in Postgres. Everything
-// this file still touches that HASN'T been migrated yet (leave_types, leave_balances,
-// leave_requests, offboarding_records, onboarding, notifications) stays on the Mongo
-// helpers via commonDBFunctions/global.dbo, imported separately below.
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// employees, job_history, and their supporting lookups (Phase 1), plus leave_types/
+// leave_balances/leave_requests (Phase 3a), now live in Postgres. Everything this file
+// still touches that HASN'T been migrated yet (offboarding_records, onboarding,
+// notifications) stays on the Mongo helpers via commonDBFunctions/global.dbo, imported
+// separately below.
 const {
-  findOne, findMany, insertOne, updateOne, deleteOne, countDocuments,
+  findOne, findMany, insertOne, insertMany, updateOne, deleteOne, countDocuments,
   knex, replaceChildRows, addChildRow, deleteChildRow,
 } = require('../../functions/Database/pgDBFunctions');
-const { findOne: mongoFindOne, findMany: mongoFindMany } = require('../../functions/Database/commonDBFunctions');
+const { findOne: mongoFindOne } = require('../../functions/Database/commonDBFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
@@ -127,19 +128,17 @@ const flagMissingOffboardingIfNeeded = async (employee) => {
 const MPESA_NUMBER_REGEX = /^254(7|1)\d{8}$/;
 const MPESA_NUMBER_ERROR = 'M-Pesa number must start with 254 and be a valid Kenyan mobile number (e.g. 254712345678).';
 
-// leave_requests is unmigrated (Phase 3) — stays on Mongo; only the employees.status
-// write is Postgres.
+// leave_requests now lives in Postgres (Phase 3a).
 const revertExpiredLeaveStatuses = async () => {
   const today = new Date();
   const onLeaveEmployees = await findMany('employees', { status: 'on_leave' });
   if (!onLeaveEmployees.length) return;
 
   await Promise.all(onLeaveEmployees.map(async (emp) => {
-    const activeLeave = await global.dbo.collection('leave_requests').findOne({
-      employeeId: new ObjectId(emp.id),
-      status: 'approved',
-      endDate: { $gte: today },
-    });
+    const activeLeave = await knex('leave_requests')
+      .where({ employeeId: emp.id, status: 'approved' })
+      .where('endDate', '>=', today)
+      .first();
     if (!activeLeave) {
       await updateOne('employees', { id: emp.id }, { status: 'active', updatedAt: new Date() });
     }
@@ -313,12 +312,12 @@ const createEmployee = async (req, res) => {
 
   // Create one leave_balances record per active leave type for the current year —
   // starts at 0 and builds up via the monthly accrual cron (lib/leave/accrualEngine.js).
-  // leave_types/leave_balances are unmigrated (Phase 3) — stay on Mongo.
+  // leave_types/leave_balances now live in Postgres (Phase 3a).
   const year = new Date().getFullYear();
-  const activeLeaveTypes = await mongoFindMany('leave_types', { isActive: true }, { projection: { _id: 1 } });
+  const activeLeaveTypes = await knex('leave_types').where({ isActive: true }).select('id');
   if (activeLeaveTypes.length) {
-    await global.dbo.collection('leave_balances').insertMany(activeLeaveTypes.map(lt => ({
-      employeeId: new ObjectId(employeeId), leaveTypeId: lt._id, year,
+    await insertMany('leave_balances', activeLeaveTypes.map(lt => ({
+      employeeId, leaveTypeId: lt.id, year,
       openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, carryOverExpiry: null,
       closingBalance: 0, lastAccrualDate: null, updatedAt: new Date(),
     })));

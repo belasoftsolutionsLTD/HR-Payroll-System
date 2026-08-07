@@ -125,11 +125,12 @@ const getInboxItem = async (req, res) => {
   }
 
   // Enrich with reference data. referenceModel is a collection name picked at write
-  // time by whatever module created this item — 'employees'/'users' now live in
-  // Postgres (Phase 1), everything else is still Mongo.
+  // time by whatever module created this item — 'employees'/'users' (Phase 1) and
+  // 'leave_requests' (Phase 3a) now live in Postgres, everything else is still Mongo.
+  const PG_REFERENCE_MODELS = ['employees', 'users', 'leave_requests'];
   let referenceData = null;
   if (item.referenceId && item.referenceModel) {
-    referenceData = ['employees', 'users'].includes(item.referenceModel)
+    referenceData = PG_REFERENCE_MODELS.includes(item.referenceModel)
       ? await pgDB.findOne(item.referenceModel, { id: String(item.referenceId) })
       : await findOne(item.referenceModel, { _id: item.referenceId });
 
@@ -145,7 +146,7 @@ const getInboxItem = async (req, res) => {
     // leaveFunctions.js but scoped to just the two mismatched field names.
     if (item.type === 'leave' && item.referenceModel === 'leave_requests' && referenceData) {
       const leaveType = referenceData.leaveTypeId
-        ? await findOne('leave_types', { _id: referenceData.leaveTypeId }, { projection: { name: 1 } })
+        ? await pgDB.findOne('leave_types', { id: referenceData.leaveTypeId })
         : null;
       referenceData = { ...referenceData, leaveType: leaveType?.name ?? null, numberOfDays: referenceData.totalDays };
     }

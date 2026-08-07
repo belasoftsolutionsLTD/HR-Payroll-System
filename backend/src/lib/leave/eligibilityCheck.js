@@ -1,5 +1,6 @@
-const { ObjectId } = require('mongodb');
-const { findOne, findMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 3a) —
+// employees and leave_requests now live in Postgres.
+const { findOne, knex } = require('../../functions/Database/pgDBFunctions');
 
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
 const monthsBetween = (from, to) => (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth());
@@ -39,14 +40,13 @@ const checkMaxConsecutive = (leaveType, totalDays) => {
 // request overlapping the given date range (optionally excluding one request,
 // for edit-in-place scenarios).
 const checkOverlap = async (employeeId, startDate, endDate, excludeRequestId = null) => {
-  const filter = {
-    employeeId: new ObjectId(employeeId),
-    status: { $in: ['pending', 'approved'] },
-    startDate: { $lte: new Date(endDate) },
-    endDate: { $gte: new Date(startDate) },
-  };
-  if (excludeRequestId) filter._id = { $ne: new ObjectId(excludeRequestId) };
-  const existing = await findOne('leave_requests', filter);
+  let query = knex('leave_requests')
+    .where({ employeeId: String(employeeId) })
+    .whereIn('status', ['pending', 'approved'])
+    .where('startDate', '<=', new Date(endDate))
+    .where('endDate', '>=', new Date(startDate));
+  if (excludeRequestId) query = query.whereNot('id', String(excludeRequestId));
+  const existing = await query.first();
   return !!existing;
 };
 
@@ -54,15 +54,13 @@ const checkOverlap = async (employeeId, startDate, endDate, excludeRequestId = n
 // department are already approved for an overlapping period.
 const TEAM_OVERLAP_WARNING_THRESHOLD = 2;
 const checkTeamOverlap = async (department, startDate, endDate, excludeEmployeeId = null) => {
-  const deptEmployees = await findMany('employees', { department }, { projection: { _id: 1 } });
-  const deptIds = deptEmployees.map(e => e._id).filter(id => String(id) !== String(excludeEmployeeId));
+  const deptEmployees = await knex('employees').where({ department }).select('id');
+  const deptIds = deptEmployees.map(e => e.id).filter(id => id !== String(excludeEmployeeId));
   if (!deptIds.length) return { count: 0, warn: false };
-  const count = await global.dbo.collection('leave_requests').countDocuments({
-    employeeId: { $in: deptIds },
-    status: 'approved',
-    startDate: { $lte: new Date(endDate) },
-    endDate: { $gte: new Date(startDate) },
-  });
+  const count = await knex('leave_requests')
+    .whereIn('employeeId', deptIds).where({ status: 'approved' })
+    .where('startDate', '<=', new Date(endDate)).where('endDate', '>=', new Date(startDate))
+    .count('* as count').first().then((r) => Number(r.count));
   return { count, warn: count > TEAM_OVERLAP_WARNING_THRESHOLD };
 };
 

@@ -7,15 +7,20 @@ const { getEffectiveScheduleForEmployee } = require('../../routes/attendance/att
 const { runDueScheduledReports } = require('../../routes/reports/reportFunctions');
 const { getLowStockLevels } = require('../../routes/inventory/inventoryLocationsFunctions');
 const { updateOne, findOne, findMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// employees/users (Phase 1) and leave_requests/leave_types (Phase 3a) now live in
+// Postgres; attendance_records/shifts/work_schedules/offboarding_records stay on the
+// Mongo helpers above until their own phase.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 const emailEmployee = async (employeeId, trigger, tokens, fallbackSubject, fallbackHtml) => {
-  const user = await findOne('users', { employeeId: new ObjectId(employeeId) }, { projection: { email: 1 } });
+  const user = await pgDB.knex('users').where({ employeeId: String(employeeId) }).select('email').first();
   if (!user?.email) return;
   return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
 };
 const emailUser = async (userId, trigger, tokens, fallbackSubject, fallbackHtml) => {
-  const user = await findOne('users', { _id: new ObjectId(userId) }, { projection: { email: 1 } });
+  const user = await pgDB.findOne('users', { id: String(userId) });
   if (!user?.email) return;
   return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
 };
@@ -205,31 +210,22 @@ async function detectMissedClockOuts() {
 
 // Reset on_leave status for employees whose approved leave has ended
 async function resetOnLeaveStatus() {
-  if (!global.dbo) return;
   const today = new Date();
 
-  const onLeaveEmps = await global.dbo.collection('employees')
-    .find({ status: 'on_leave' }, { projection: { _id: 1 } })
-    .toArray();
-
+  const onLeaveEmps = await pgDB.knex('employees').where({ status: 'on_leave' }).select('id');
   if (!onLeaveEmps.length) return;
-  const empIds = onLeaveEmps.map(e => e._id);
+  const empIds = onLeaveEmps.map(e => e.id);
 
   // Find which of these employees have NO currently-active approved leave
-  const activeLeaves = await global.dbo.collection('leave_requests').find({
-    employeeId: { $in: empIds },
-    status: 'approved',
-    endDate: { $gte: today },
-  }, { projection: { employeeId: 1 } }).toArray();
+  const activeLeaves = await pgDB.knex('leave_requests')
+    .whereIn('employeeId', empIds).where({ status: 'approved' }).where('endDate', '>=', today)
+    .select('employeeId');
 
-  const stillOnLeave = new Set(activeLeaves.map(l => String(l.employeeId)));
-  const toReset = empIds.filter(id => !stillOnLeave.has(String(id)));
+  const stillOnLeave = new Set(activeLeaves.map(l => l.employeeId));
+  const toReset = empIds.filter(id => !stillOnLeave.has(id));
 
   if (toReset.length) {
-    await global.dbo.collection('employees').updateMany(
-      { _id: { $in: toReset } },
-      { $set: { status: 'active', updatedAt: new Date() } }
-    );
+    await pgDB.knex('employees').whereIn('id', toReset).update({ status: 'active', updatedAt: new Date() });
     console.log(`[CRON] Reset ${toReset.length} employee(s) from on_leave → active`);
   }
 }
@@ -250,15 +246,14 @@ async function flipOffboardingEmployeeStatus() {
   }, { projection: { employeeId: 1 } }).toArray();
 
   if (!dueRecords.length) return;
-  const empIds = dueRecords.map(r => r.employeeId);
+  const empIds = dueRecords.map(r => String(r.employeeId));
 
-  const result = await global.dbo.collection('employees').updateMany(
-    { _id: { $in: empIds }, status: { $in: ['active', 'on_leave'] } },
-    { $set: { status: 'offboarding', updatedAt: now } }
-  );
+  const modifiedCount = await pgDB.knex('employees')
+    .whereIn('id', empIds).whereIn('status', ['active', 'on_leave'])
+    .update({ status: 'offboarding', updatedAt: now });
 
-  if (result.modifiedCount > 0) {
-    console.log(`[CRON] Flipped ${result.modifiedCount} employee(s) to 'offboarding' status (past last working day)`);
+  if (modifiedCount > 0) {
+    console.log(`[CRON] Flipped ${modifiedCount} employee(s) to 'offboarding' status (past last working day)`);
   }
 }
 
@@ -343,30 +338,29 @@ async function autoMarkAbsent() {
   const dow = now.getDay();
   if (dow === 0 || dow === 6) return;
 
-  // Get all active employees
-  const activeEmps = await global.dbo.collection('employees')
-    .find({ status: { $in: ['active'] } }, { projection: { _id: 1 } })
-    .toArray();
-
+  // Get all active employees. employees now lives in Postgres (Phase 1); empObjectIds
+  // is kept alongside the plain-string empIds for the still-Mongo attendance_records
+  // queries/writes below.
+  const activeEmps = await pgDB.knex('employees').where({ status: 'active' }).select('id');
   if (!activeEmps.length) return;
-  const empIds = activeEmps.map(e => e._id);
+  const empIds = activeEmps.map(e => e.id);
+  const empObjectIds = empIds.map((id) => new ObjectId(id));
 
   // Find employees who already have a record today
   const existing = await global.dbo.collection('attendance_records')
-    .find({ date: todayStr, employeeId: { $in: empIds } }, { projection: { employeeId: 1 } })
+    .find({ date: todayStr, employeeId: { $in: empObjectIds } }, { projection: { employeeId: 1 } })
     .toArray();
   const hasRecord = new Set(existing.map(r => String(r.employeeId)));
 
-  // Employees on approved leave today are not absent
-  const onLeave = await global.dbo.collection('leave_requests').find({
-    employeeId: { $in: empIds },
-    status: 'approved',
-    startDate: { $lte: now },
-    endDate:   { $gte: now },
-  }, { projection: { employeeId: 1 } }).toArray();
-  const onLeaveIds = new Set(onLeave.map(l => String(l.employeeId)));
+  // Employees on approved leave today are not absent. leave_requests now lives in
+  // Postgres (Phase 3a).
+  const onLeave = await pgDB.knex('leave_requests')
+    .whereIn('employeeId', empIds).where({ status: 'approved' })
+    .where('startDate', '<=', now).where('endDate', '>=', now)
+    .select('employeeId');
+  const onLeaveIds = new Set(onLeave.map(l => l.employeeId));
 
-  const noRecordIds = empIds.filter(id => !hasRecord.has(String(id)));
+  const noRecordIds = empObjectIds.filter(id => !hasRecord.has(String(id)));
   const absentIds = noRecordIds.filter(id => !onLeaveIds.has(String(id)));
   const onLeaveNoRecordIds = noRecordIds.filter(id => onLeaveIds.has(String(id)));
 
@@ -401,62 +395,51 @@ async function autoMarkAbsent() {
 // employment types for informational tracking only, with no prior expectation that it
 // would ever trigger deactivation.
 async function deactivateExpiredContractors() {
-  if (!global.dbo) return;
   const now = new Date();
 
-  const expired = await global.dbo.collection('employees').find({
-    employmentType: 'contract',
-    contractEndDate: { $ne: null, $lte: now },
-    status: { $in: ['active', 'on_leave'] },
-  }, { projection: { _id: 1 } }).toArray();
+  const expired = await pgDB.knex('employees')
+    .where({ employmentType: 'contract' }).whereNotNull('contractEndDate').where('contractEndDate', '<=', now)
+    .whereIn('status', ['active', 'on_leave']).select('id');
 
   if (!expired.length) return;
-  const empIds = expired.map(e => e._id);
+  const empIds = expired.map(e => e.id);
 
-  await global.dbo.collection('employees').updateMany(
-    { _id: { $in: empIds } },
-    { $set: { status: 'offboarding', updatedAt: now } }
-  );
+  await pgDB.knex('employees').whereIn('id', empIds).update({ status: 'offboarding', updatedAt: now });
 
-  const result = await global.dbo.collection('users').updateMany(
-    { employeeId: { $in: empIds }, isActive: true },
-    { $set: { isActive: false, updatedAt: now }, $unset: { refreshTokenHash: '', refreshTokenExpiresAt: '' } }
-  );
+  const modifiedCount = await pgDB.knex('users').whereIn('employeeId', empIds).where({ isActive: true })
+    .update({ isActive: false, updatedAt: now, refreshTokenHash: null, refreshTokenExpiresAt: null });
 
-  console.log(`[CRON] Contract expiry: deactivated ${result.modifiedCount} user account(s), flipped ${empIds.length} employee(s) to 'offboarding'`);
+  console.log(`[CRON] Contract expiry: deactivated ${modifiedCount} user account(s), flipped ${empIds.length} employee(s) to 'offboarding'`);
 }
 
 // Leave: 3-day advance reminder before an approved leave starts. Matches by
 // calendar date only (a UTC day range), not time-of-day. leaveStartReminderSent
 // guards against re-sending on the next run once a request has been notified.
 async function leaveStartReminder() {
-  if (!global.dbo) return;
   const target = new Date();
   target.setUTCDate(target.getUTCDate() + 3);
   const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
   const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
 
-  const upcoming = await global.dbo.collection('leave_requests').find({
-    status: 'approved',
-    startDate: { $gte: dayStart, $lt: dayEnd },
-    leaveStartReminderSent: { $ne: true },
-  }).toArray();
+  const upcoming = await pgDB.knex('leave_requests')
+    .where({ status: 'approved' }).where('startDate', '>=', dayStart).where('startDate', '<', dayEnd)
+    .whereNot('leaveStartReminderSent', true);
   if (!upcoming.length) return;
 
-  const leaveTypeIds = [...new Set(upcoming.map(r => String(r.leaveTypeId)))].map(id => new ObjectId(id));
-  const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }, { projection: { name: 1 } }).toArray();
-  const nameById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t.name]));
+  const leaveTypeIds = [...new Set(upcoming.map(r => r.leaveTypeId))];
+  const leaveTypes = leaveTypeIds.length ? await pgDB.knex('leave_types').whereIn('id', leaveTypeIds).select('id', 'name') : [];
+  const nameById = Object.fromEntries(leaveTypes.map(t => [t.id, t.name]));
 
   for (const r of upcoming) {
     const dateStr = new Date(r.startDate).toISOString().split('T')[0];
     notifyEmployee(r.employeeId, {
       title: 'Upcoming Leave',
-      body: `Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.`,
+      body: `Your ${nameById[r.leaveTypeId] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.`,
       type: 'leave',
     }).catch(() => {});
-    emailEmployee(r.employeeId, 'upcomingLeaveReminder', { leaveType: nameById[String(r.leaveTypeId)] || 'leave', startDate: dateStr },
-      'Upcoming Leave', `<p>Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.</p>`);
-    await global.dbo.collection('leave_requests').updateOne({ _id: r._id }, { $set: { leaveStartReminderSent: true, updatedAt: new Date() } });
+    emailEmployee(r.employeeId, 'upcomingLeaveReminder', { leaveType: nameById[r.leaveTypeId] || 'leave', startDate: dateStr },
+      'Upcoming Leave', `<p>Your ${nameById[r.leaveTypeId] || 'leave'} leave begins in 3 days, on ${dateStr}. Please make any necessary arrangements.</p>`);
+    await pgDB.knex('leave_requests').where({ id: r.id }).update({ leaveStartReminderSent: true, updatedAt: new Date() });
   }
   console.log(`[CRON] Sent ${upcoming.length} leave-start reminder(s)`);
 }
@@ -464,33 +447,30 @@ async function leaveStartReminder() {
 // Leave: "welcome back" reminder 3 days after an approved leave ended. Same
 // date-only matching + sent-flag guard as leaveStartReminder above.
 async function leaveEndReminder() {
-  if (!global.dbo) return;
   const target = new Date();
   target.setUTCDate(target.getUTCDate() - 3);
   const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
   const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
 
-  const ended = await global.dbo.collection('leave_requests').find({
-    status: 'approved',
-    endDate: { $gte: dayStart, $lt: dayEnd },
-    leaveEndReminderSent: { $ne: true },
-  }).toArray();
+  const ended = await pgDB.knex('leave_requests')
+    .where({ status: 'approved' }).where('endDate', '>=', dayStart).where('endDate', '<', dayEnd)
+    .whereNot('leaveEndReminderSent', true);
   if (!ended.length) return;
 
-  const leaveTypeIds = [...new Set(ended.map(r => String(r.leaveTypeId)))].map(id => new ObjectId(id));
-  const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }, { projection: { name: 1 } }).toArray();
-  const nameById = Object.fromEntries(leaveTypes.map(t => [String(t._id), t.name]));
+  const leaveTypeIds = [...new Set(ended.map(r => r.leaveTypeId))];
+  const leaveTypes = leaveTypeIds.length ? await pgDB.knex('leave_types').whereIn('id', leaveTypeIds).select('id', 'name') : [];
+  const nameById = Object.fromEntries(leaveTypes.map(t => [t.id, t.name]));
 
   for (const r of ended) {
     const dateStr = new Date(r.endDate).toISOString().split('T')[0];
     notifyEmployee(r.employeeId, {
       title: 'Welcome Back',
-      body: `Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.`,
+      body: `Your ${nameById[r.leaveTypeId] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.`,
       type: 'leave',
     }).catch(() => {});
-    emailEmployee(r.employeeId, 'leaveWelcomeBack', { leaveType: nameById[String(r.leaveTypeId)] || 'leave', endDate: dateStr },
-      'Welcome Back', `<p>Your ${nameById[String(r.leaveTypeId)] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.</p>`);
-    await global.dbo.collection('leave_requests').updateOne({ _id: r._id }, { $set: { leaveEndReminderSent: true, updatedAt: new Date() } });
+    emailEmployee(r.employeeId, 'leaveWelcomeBack', { leaveType: nameById[r.leaveTypeId] || 'leave', endDate: dateStr },
+      'Welcome Back', `<p>Your ${nameById[r.leaveTypeId] || 'leave'} leave ended 3 days ago, on ${dateStr}. We hope you had a restful break.</p>`);
+    await pgDB.knex('leave_requests').where({ id: r.id }).update({ leaveEndReminderSent: true, updatedAt: new Date() });
   }
   console.log(`[CRON] Sent ${ended.length} leave-end reminder(s)`);
 }

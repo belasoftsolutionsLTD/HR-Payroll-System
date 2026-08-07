@@ -5,6 +5,11 @@ const { validateRequiredFields, getPagination, paginatedResponse } = require('..
 const {
   findOne, findMany, insertOne, updateOne, deleteOne, countDocuments, aggregate,
 } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// employees/users (Phase 1) and leave_types/leave_balances (Phase 3a) now live in
+// Postgres; candidates/applications/jobRequisitions/scorecards are unmigrated (Phase 4)
+// and stay on the Mongo helpers above.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
@@ -252,21 +257,26 @@ const hireCandidate = async (application, requisition, actingUser) => {
     grossPay: application.offerDetails?.salary || requisition.salaryRange?.min || null,
     nextOfKin: null,
     profilePhoto: null,
-    documents: candidate?.resumeUrl
-      ? [{ docId: new ObjectId(), docType: 'CV', fileName: 'resume', filePath: candidate.resumeUrl, uploadedAt: new Date() }]
-      : [],
     status: 'active',
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const empResult = await insertOne('employees', empDoc);
+  const empResult = await pgDB.insertOne('employees', empDoc);
+
+  // documents is its own child table now, not an embedded array — see Phase 1.
+  if (candidate?.resumeUrl) {
+    await pgDB.addChildRow('employee_documents', {
+      employeeId: empResult.id, docType: 'CV', fileName: 'resume', filePath: candidate.resumeUrl, uploadedAt: new Date(),
+    });
+  }
 
   // One leave_balances record per active leave type — builds up via the monthly
   // accrual cron (lib/leave/accrualEngine.js), same as direct employee creation.
-  const activeLeaveTypes = await global.dbo.collection('leave_types').find({ isActive: true }, { projection: { _id: 1 } }).toArray();
+  // leave_types/leave_balances now live in Postgres (Phase 3a).
+  const activeLeaveTypes = await pgDB.knex('leave_types').where({ isActive: true }).select('id');
   if (activeLeaveTypes.length) {
-    await global.dbo.collection('leave_balances').insertMany(activeLeaveTypes.map(lt => ({
-      employeeId: empResult.insertedId, leaveTypeId: lt._id, year: hireDate.getFullYear(),
+    await pgDB.insertMany('leave_balances', activeLeaveTypes.map(lt => ({
+      employeeId: empResult.id, leaveTypeId: lt.id, year: hireDate.getFullYear(),
       openingBalance: 0, accrued: 0, used: 0, pending: 0, carriedOver: 0, carryOverExpiry: null,
       closingBalance: 0, lastAccrualDate: null, updatedAt: new Date(),
     })));
@@ -274,7 +284,7 @@ const hireCandidate = async (application, requisition, actingUser) => {
 
   const onboardingTemplate = await resolveDefaultTemplate(empDoc.department);
   if (onboardingTemplate) {
-    await initiateOnboarding(empResult.insertedId, onboardingTemplate._id, hireDate, null).catch(() => {});
+    await initiateOnboarding(empResult.id, onboardingTemplate._id, hireDate, null).catch(() => {});
   }
 
   await updateOne('applications', { _id: application._id }, { $set: { status: 'hired', updatedAt: new Date() } });
@@ -292,7 +302,7 @@ const hireCandidate = async (application, requisition, actingUser) => {
     type: 'recruitment', subType: 'new_hire',
     title: 'New Hire',
     subtitle: `${fullName} has been hired as ${empDoc.designation}. Staff #: ${staffNumber}`,
-    referenceId: empResult.insertedId, referenceModel: 'employees',
+    referenceId: new ObjectId(empResult.id), referenceModel: 'employees',
     requiresAction: false, triggeredBy: actingUser?._id ?? null,
   }).catch(() => {});
   notifyByRoles(['super_admin', 'hr_manager'], {
@@ -301,7 +311,7 @@ const hireCandidate = async (application, requisition, actingUser) => {
     type: 'recruitment',
   }).catch(() => {});
 
-  return empResult.insertedId.toString();
+  return empResult.id;
 };
 
 // Shared by the plain HR-authenticated move route AND assignInterviewer, which also
