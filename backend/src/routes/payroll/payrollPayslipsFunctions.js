@@ -1,6 +1,9 @@
-const { ObjectId } = require('mongodb');
+const fs = require('fs');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 2) —
+// payslips/payroll_results now live in Postgres. pdfData (base64) is now pdfPath (a real
+// file on disk), matching how employee_documents/certifications already do it.
+const { findOne, findMany, countDocuments, knex } = require('../../functions/Database/pgDBFunctions');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 
 // Single source of truth for "an employee's payslips" — reads the Cycles engine's
@@ -8,9 +11,9 @@ const { getPagination, paginatedResponse } = require('../../functions/Route Fns/
 // Shared by the payroll module's own routes and by /api/me/payslips (see meFunctions.js)
 // so there is exactly one query implementation instead of two drifting copies.
 const getEmployeePayslipRecords = async (employeeId, { skip, limit } = {}) => {
-  const filter = { employeeId: new ObjectId(employeeId) };
-  const findOpts = { sort: { 'period.year': -1, 'period.month': -1 }, projection: { pdfData: 0 } };
-  if (skip !== undefined) findOpts.skip = skip;
+  const filter = { employeeId };
+  const findOpts = { orderBy: [{ column: 'periodYear', order: 'desc' }, { column: 'periodMonth', order: 'desc' }] };
+  if (skip !== undefined) findOpts.offset = skip;
   if (limit !== undefined) findOpts.limit = limit;
 
   const [total, slips] = await Promise.all([
@@ -19,10 +22,10 @@ const getEmployeePayslipRecords = async (employeeId, { skip, limit } = {}) => {
   ]);
 
   const resultIds = slips.filter((s) => s.resultId).map((s) => s.resultId);
-  const results = resultIds.length ? await findMany('payroll_results', { _id: { $in: resultIds } }) : [];
-  const resultMap = Object.fromEntries(results.map((r) => [String(r._id), r]));
+  const results = resultIds.length ? await knex('payroll_results').whereIn('id', resultIds) : [];
+  const resultMap = Object.fromEntries(results.map((r) => [r.id, r]));
 
-  const enriched = slips.map((s) => ({ ...s, result: resultMap[String(s.resultId)] || null }));
+  const enriched = slips.map((s) => ({ ...s, result: resultMap[s.resultId] || null }));
   return { total, data: enriched };
 };
 
@@ -31,30 +34,29 @@ const getMyPayslips = async (req, res) => {
   const employeeId = req.user?.employeeId;
   if (!employeeId) return returnFunction(res, 403, false, 'No employee record linked to this user.');
   const { page, limit, skip } = getPagination(req.query);
-  const { total, data } = await getEmployeePayslipRecords(employeeId, { skip, limit });
+  const { total, data } = await getEmployeePayslipRecords(String(employeeId), { skip, limit });
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, total, page, limit));
 };
 
 // Download single payslip as PDF — served from the PDF generated when the cycle was closed.
 const downloadPayslipPDF = async (req, res) => {
-  const slip = await findOne('payslips', { _id: new ObjectId(req.params.id) });
+  const slip = await findOne('payslips', { id: req.params.id });
   if (!slip) return returnFunction(res, 404, false, req.locale.notFound);
 
   const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
   if (!isHR && String(slip.employeeId) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Access denied.');
   }
-  if (!slip.pdfData) return returnFunction(res, 404, false, 'PDF not available for this payslip.');
+  if (!slip.pdfPath || !fs.existsSync(slip.pdfPath)) return returnFunction(res, 404, false, 'PDF not available for this payslip.');
 
-  const buffer = Buffer.from(slip.pdfData, 'base64');
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="payslip-${slip.period.year}-${String(slip.period.month).padStart(2, '0')}.pdf"`);
-  return res.send(buffer);
+  res.setHeader('Content-Disposition', `inline; filename="payslip-${slip.periodYear}-${String(slip.periodMonth).padStart(2, '0')}.pdf"`);
+  return res.sendFile(require('path').resolve(slip.pdfPath));
 };
 
 // Get single payslip metadata (with its full earnings/deductions breakdown via payroll_results)
 const getPayslip = async (req, res) => {
-  const slip = await findOne('payslips', { _id: new ObjectId(req.params.id) }, { projection: { pdfData: 0 } });
+  const slip = await findOne('payslips', { id: req.params.id });
   if (!slip) return returnFunction(res, 404, false, req.locale.notFound);
 
   const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
@@ -62,7 +64,7 @@ const getPayslip = async (req, res) => {
     return returnFunction(res, 403, false, 'Access denied.');
   }
 
-  const result = slip.resultId ? await findOne('payroll_results', { _id: slip.resultId }) : null;
+  const result = slip.resultId ? await findOne('payroll_results', { id: slip.resultId }) : null;
   return returnFunction(res, 200, true, req.locale.success, { ...slip, result });
 };
 

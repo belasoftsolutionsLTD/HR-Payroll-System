@@ -1,7 +1,8 @@
-const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 2) —
+// payroll_concepts and employee_compensations now live in Postgres.
+const { findOne, findMany, insertOne, updateOne, countDocuments, knex } = require('../../functions/Database/pgDBFunctions');
 
 const VALID_CATEGORIES = ['earnings', 'deductions', 'benefits', 'employer_contributions'];
 const VALID_TYPES      = ['fixed', 'variable', 'percentage', 'formula', 'bracket'];
@@ -82,11 +83,9 @@ async function validateStatutoryFields({ ownCode, category, type, cap, flatCredi
     // Reverse guard — some OTHER active concept may already depend on THIS concept's code;
     // if so, this concept can't take on a dependency of its own (would create a 2-level chain).
     if (ownCode) {
-      const dependents = await findMany('payroll_concepts', {
-        isActive: true,
-        deductConceptCodesFromBase: ownCode,
-        ...(excludeId ? { _id: { $ne: excludeId } } : {}),
-      });
+      let dependentsQuery = knex('payroll_concepts').where({ isActive: true }).whereRaw('?? @> ?', ['deductConceptCodesFromBase', [ownCode]]);
+      if (excludeId) dependentsQuery = dependentsQuery.whereNot('id', excludeId);
+      const dependents = await dependentsQuery;
       if (dependents.length > 0) {
         return `"${dependents[0].name}" already depends on this concept's amount — chaining more than one level deep isn't supported.`;
       }
@@ -96,10 +95,9 @@ async function validateStatutoryFields({ ownCode, category, type, cap, flatCredi
   if (statutoryKey) {
     if (category !== 'deductions') return 'A statutory key can only be set on a deductions-category concept.';
     if (!STATUTORY_KEYS.includes(statutoryKey)) return 'Invalid statutory key.';
-    const dupe = await findOne('payroll_concepts', {
-      statutoryKey, isActive: true,
-      ...(excludeId ? { _id: { $ne: excludeId } } : {}),
-    });
+    let dupeQuery = knex('payroll_concepts').where({ statutoryKey, isActive: true });
+    if (excludeId) dupeQuery = dupeQuery.whereNot('id', excludeId);
+    const dupe = await dupeQuery.first();
     if (dupe) return `"${dupe.name}" is already set as the ${statutoryKey.toUpperCase()} concept — only one concept may hold this key.`;
   }
 
@@ -116,13 +114,13 @@ const listConcepts = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const [total, data] = await Promise.all([
     countDocuments('payroll_concepts', filter),
-    findMany('payroll_concepts', filter, { skip, limit, sort: { category: 1, createdAt: -1 } }),
+    findMany('payroll_concepts', filter, { skip, limit, orderBy: [{ column: 'category' }, { column: 'createdAt', order: 'desc' }] }),
   ]);
 
   // Enrich with employee count using employee_compensations
   const enriched = await Promise.all(data.map(async concept => {
     const empCount = await countDocuments('employee_compensations', {
-      conceptId: concept._id,
+      conceptId: concept.id,
       isActive:  true,
     });
     return { ...concept, employeeCount: empCount };
@@ -179,7 +177,7 @@ const createConcept = async (req, res) => {
     percentageValue:  percentageValue   ? Number(percentageValue)   : null,
     formula:          formula           || null,
     brackets:         type === 'bracket' && Array.isArray(brackets)
-      ? brackets.map(b => ({ limit: b.limit != null && b.limit !== '' ? Number(b.limit) : null, rate: Number(b.rate) || 0 }))
+      ? JSON.stringify(brackets.map(b => ({ limit: b.limit != null && b.limit !== '' ? Number(b.limit) : null, rate: Number(b.rate) || 0 })))
       : null,
     loanType:         subCategory === 'loans' ? (loanType || null) : null,
     cap:              cap != null && cap !== '' ? Number(cap) : null,
@@ -193,20 +191,20 @@ const createConcept = async (req, res) => {
     isRecurring:      Boolean(isRecurring),
     appearsOnPayslip: appearsOnPayslip !== false,
     alertIfUndefined: Boolean(alertIfUndefined),
-    createdBy:        req.user?._id ?? null,
+    createdBy:        req.user?.id ?? null,
     createdAt:        new Date(),
     updatedAt:        new Date(),
   };
 
   const result = await insertOne('payroll_concepts', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 // ── Update Concept ────────────────────────────────────────────────────────────
 
 const updateConcept = async (req, res) => {
   const { id } = req.params;
-  const existing = await findOne('payroll_concepts', { _id: new ObjectId(id) });
+  const existing = await findOne('payroll_concepts', { id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
 
   const { name, code, category, subCategory, type, defaultAmount, currency,
@@ -215,7 +213,7 @@ const updateConcept = async (req, res) => {
           isTaxable, isRecurring, appearsOnPayslip, alertIfUndefined, isActive } = req.body;
 
   if (code && code.toUpperCase() !== existing.code) {
-    const dupe = await findOne('payroll_concepts', { code: code.toUpperCase(), _id: { $ne: new ObjectId(id) } });
+    const dupe = await knex('payroll_concepts').where({ code: code.toUpperCase() }).whereNot('id', id).first();
     if (dupe) return returnFunction(res, 409, false, `Concept code "${code.toUpperCase()}" is already in use.`);
   }
 
@@ -254,7 +252,7 @@ const updateConcept = async (req, res) => {
     ownCode: merged.code, category: merged.category, type: merged.type,
     cap: merged.cap, flatCredit: merged.flatCredit,
     deductConceptCodesFromBase: merged.deductConceptCodesFromBase, statutoryKey: merged.statutoryKey,
-    excludeId: new ObjectId(id),
+    excludeId: id,
   });
   if (statutoryError) return returnFunction(res, 400, false, statutoryError);
 
@@ -270,7 +268,7 @@ const updateConcept = async (req, res) => {
   if (percentageValue  !== undefined) update.percentageValue  = percentageValue ? Number(percentageValue) : null;
   if (formula          !== undefined) update.formula          = formula;
   if (brackets         !== undefined) update.brackets         = Array.isArray(brackets)
-    ? brackets.map(b => ({ limit: b.limit != null && b.limit !== '' ? Number(b.limit) : null, rate: Number(b.rate) || 0 }))
+    ? JSON.stringify(brackets.map(b => ({ limit: b.limit != null && b.limit !== '' ? Number(b.limit) : null, rate: Number(b.rate) || 0 })))
     : null;
   if (loanType         !== undefined) update.loanType         = loanType || null;
   if (cap              !== undefined) update.cap              = cap != null && cap !== '' ? Number(cap) : null;
@@ -285,7 +283,7 @@ const updateConcept = async (req, res) => {
   if (alertIfUndefined !== undefined) update.alertIfUndefined = Boolean(alertIfUndefined);
   if (isActive         !== undefined) update.isActive         = Boolean(isActive);
 
-  await updateOne('payroll_concepts', { _id: new ObjectId(id) }, { $set: update });
+  await updateOne('payroll_concepts', { id }, update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -293,18 +291,18 @@ const updateConcept = async (req, res) => {
 
 const deleteConcept = async (req, res) => {
   const { id } = req.params;
-  const existing = await findOne('payroll_concepts', { _id: new ObjectId(id) });
+  const existing = await findOne('payroll_concepts', { id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
 
   // Soft-delete: deactivate instead of hard-deleting (compensations reference this)
-  await updateOne('payroll_concepts', { _id: new ObjectId(id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await updateOne('payroll_concepts', { id }, { isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 // ── Get Single Concept ────────────────────────────────────────────────────────
 
 const getConcept = async (req, res) => {
-  const concept = await findOne('payroll_concepts', { _id: new ObjectId(req.params.id) });
+  const concept = await findOne('payroll_concepts', { id: req.params.id });
   if (!concept) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, concept);
 };

@@ -4,7 +4,14 @@ const { ObjectId } = require('mongodb');
 const archiver = require('archiver');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 2) —
+// payroll_concepts, employee_compensations, payroll_cycles, payroll_results (+ its child
+// tables), payslips, employees, departments, users, compensation_audit_logs all now live
+// in Postgres. Everything this file still touches that HASN'T been migrated yet
+// (timesheets, expense_claims, leave_requests/leave_types, tax_config, overtime_config,
+// public_holidays, company_settings, GL accounting) stays on the Mongo helpers via
+// commonDBFunctions/global.dbo, imported separately below.
+const { findOne, findMany, insertOne, updateOne, countDocuments, knex, newId, addChildRow } = require('../../functions/Database/pgDBFunctions');
 const { generatePayslipFromResult } = require('../../services/payslipService');
 const { generateP9Form } = require('../../services/p9Service');
 const { buildCalculator, loadTaxConfig } = require('../../functions/taxCalculator');
@@ -38,6 +45,30 @@ function resolveStatutoryLine(key, statutoryItems, taxCalc, adjustedGross) {
   return STATUTORY_CALC_FN[key](taxCalc, adjustedGross);
 }
 
+// Reassembles a payroll_results row's five line-item child tables (+ exceptions) back
+// into the Mongo-document shape generatePayslipFromResult/the API response already
+// expect (result.earnings/deductions/benefits/employerContributions/leave/exceptions,
+// result.statutoryDeductions{paye,nssf,sha,ahl,total,labels}) — the child tables and
+// flattened statutory columns are the real storage; this view is reconstructed on read.
+async function attachLineItems(result) {
+  const [earnings, deductions, benefits, employerContributions, leave, exceptions] = await Promise.all([
+    knex('payroll_result_earnings').where({ resultId: result.id }).orderBy('position'),
+    knex('payroll_result_deductions').where({ resultId: result.id }).orderBy('position'),
+    knex('payroll_result_benefits').where({ resultId: result.id }).orderBy('position'),
+    knex('payroll_result_employer_contributions').where({ resultId: result.id }).orderBy('position'),
+    knex('payroll_result_leave').where({ resultId: result.id }).orderBy('position'),
+    knex('payroll_result_exceptions').where({ resultId: result.id }).orderBy('position'),
+  ]);
+  return {
+    ...result,
+    earnings, deductions, benefits, employerContributions, leave, exceptions,
+    statutoryDeductions: {
+      paye: result.statutoryPaye, nssf: result.statutoryNssf, sha: result.statutorySha, ahl: result.statutoryAhl,
+      total: result.statutoryTotal, labels: result.statutoryLabels,
+    },
+  };
+}
+
 // ── List Cycles ───────────────────────────────────────────────────────────────
 
 const listCycles = async (req, res) => {
@@ -46,7 +77,7 @@ const listCycles = async (req, res) => {
   if (req.query.status) filter.status = req.query.status;
   const [total, data] = await Promise.all([
     countDocuments('payroll_cycles', filter),
-    findMany('payroll_cycles', filter, { skip, limit, sort: { 'period.year': -1, 'period.month': -1 } }),
+    findMany('payroll_cycles', filter, { skip, limit, orderBy: [{ column: 'periodYear', order: 'desc' }, { column: 'periodMonth', order: 'desc' }] }),
   ]);
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, total, page, limit));
 };
@@ -54,7 +85,7 @@ const listCycles = async (req, res) => {
 // ── Get Single Cycle ──────────────────────────────────────────────────────────
 
 const getCycle = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, cycle);
 };
@@ -69,30 +100,29 @@ const compareCycles = async (req, res) => {
   if (!cycleA || !cycleB) return returnFunction(res, 400, false, 'cycleA and cycleB are required.');
 
   const [cA, cB] = await Promise.all([
-    findOne('payroll_cycles', { _id: new ObjectId(cycleA) }),
-    findOne('payroll_cycles', { _id: new ObjectId(cycleB) }),
+    findOne('payroll_cycles', { id: cycleA }),
+    findOne('payroll_cycles', { id: cycleB }),
   ]);
   if (!cA || !cB) return returnFunction(res, 404, false, req.locale.notFound);
 
   const [resultsA, resultsB] = await Promise.all([
-    findMany('payroll_results', { cycleId: cA._id }, {}),
-    findMany('payroll_results', { cycleId: cB._id }, {}),
+    findMany('payroll_results', { cycleId: cA.id }),
+    findMany('payroll_results', { cycleId: cB.id }),
   ]);
-  const mapA = Object.fromEntries(resultsA.map((r) => [String(r.employeeId), r]));
-  const mapB = Object.fromEntries(resultsB.map((r) => [String(r.employeeId), r]));
-  const employeeIds = [...new Set([...Object.keys(mapA), ...Object.keys(mapB)])].map((id) => new ObjectId(id));
+  const mapA = Object.fromEntries(resultsA.map((r) => [r.employeeId, r]));
+  const mapB = Object.fromEntries(resultsB.map((r) => [r.employeeId, r]));
+  const employeeIds = [...new Set([...Object.keys(mapA), ...Object.keys(mapB)])];
 
   const employees = employeeIds.length
-    ? await findMany('employees', { _id: { $in: employeeIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    ? await knex('employees').whereIn('id', employeeIds).select('id', 'fullName', 'staffNumber', 'department')
     : [];
-  const empMap = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
 
-  const employeeDiffs = employeeIds.map((id) => {
-    const key = String(id);
+  const employeeDiffs = employeeIds.map((key) => {
     const rA = mapA[key], rB = mapB[key];
-    const grossA = rA?.grossPay || 0, grossB = rB?.grossPay || 0;
-    const dedA = rA?.totalDeductions || 0, dedB = rB?.totalDeductions || 0;
-    const netA = rA?.netPay || 0, netB = rB?.netPay || 0;
+    const grossA = Number(rA?.grossPay) || 0, grossB = Number(rB?.grossPay) || 0;
+    const dedA = Number(rA?.totalDeductions) || 0, dedB = Number(rB?.totalDeductions) || 0;
+    const netA = Number(rA?.netPay) || 0, netB = Number(rB?.netPay) || 0;
     return {
       employeeId: key,
       employee: empMap[key] || null,
@@ -103,10 +133,10 @@ const compareCycles = async (req, res) => {
     };
   }).sort((a, b) => Math.abs(b.netDiff) - Math.abs(a.netDiff));
 
+  const cycleSummary = (c) => ({ _id: c.id, name: c.name, period: { month: c.periodMonth, year: c.periodYear }, totalGross: c.totalGross, totalDeductions: c.totalDeductions, totalNet: c.totalNet, totalEmployerCost: c.totalEmployerCost, employeeCount: c.employeeCount, currency: c.currency });
+
   return returnFunction(res, 200, true, req.locale.success, {
-    cycleA: { _id: cA._id, name: cA.name, period: cA.period, totalGross: cA.totalGross, totalDeductions: cA.totalDeductions, totalNet: cA.totalNet, totalEmployerCost: cA.totalEmployerCost, employeeCount: cA.employeeCount, currency: cA.currency },
-    cycleB: { _id: cB._id, name: cB.name, period: cB.period, totalGross: cB.totalGross, totalDeductions: cB.totalDeductions, totalNet: cB.totalNet, totalEmployerCost: cB.totalEmployerCost, employeeCount: cB.employeeCount, currency: cB.currency },
-    employeeDiffs,
+    cycleA: cycleSummary(cA), cycleB: cycleSummary(cB), employeeDiffs,
   });
 };
 
@@ -143,11 +173,10 @@ const createCycle = async (req, res) => {
   // runs are for. Off-cycle runs are exempt so bonuses/corrections/terminations can always
   // be processed alongside the normal schedule without colliding with it.
   if (!isOffCycle) {
-    const overlapping = await findOne('payroll_cycles', {
-      payFrequency, runType: { $ne: 'off_cycle' },
-      'period.startDate': { $lte: endDate },
-      'period.endDate': { $gte: startDate },
-    });
+    const overlapping = await knex('payroll_cycles')
+      .where({ payFrequency }).whereNot('runType', 'off_cycle')
+      .where('periodStartDate', '<=', endDate).where('periodEndDate', '>=', startDate)
+      .first();
     if (overlapping) return returnFunction(res, 409, false, `A ${payFrequency} payroll cycle already covers this period ("${overlapping.name}").`);
   }
 
@@ -156,7 +185,7 @@ const createCycle = async (req, res) => {
 
   const doc = {
     name,
-    period:        { month, year, startDate, endDate },
+    periodMonth: month, periodYear: year, periodStartDate: startDate, periodEndDate: endDate,
     payDate:       payDate ? new Date(payDate) : null,
     status:        'open',
     payGroup:      payGroup || 'all',
@@ -164,20 +193,21 @@ const createCycle = async (req, res) => {
     runType:       isOffCycle ? 'off_cycle' : 'regular',
     offCycleReason: isOffCycle ? (req.body.offCycleReason || null) : null,
     targetEmployeeIds: Array.isArray(req.body.employeeIds) && req.body.employeeIds.length
-      ? req.body.employeeIds.map((id) => new ObjectId(id))
+      ? req.body.employeeIds.map((id) => String(id))
       : null,
-    departmentId:  departmentId ? new ObjectId(departmentId) : null,
-    jobGroupId:    jobGroupId   ? new ObjectId(jobGroupId)   : null,
+    departmentId:  departmentId || null,
+    jobGroupId:    jobGroupId   || null,
     employmentType: employmentType || null,
     currency:      currency  || 'KES',
     totalGross:    0, totalDeductions: 0, totalNet: 0, totalEmployerCost: 0, employeeCount: 0,
     hasExceptions: false, exceptionCount: 0,
+    isLocking: false, isClosing: false,
     lockedAt: null, lockedBy: null, closedAt: null, closedBy: null,
-    createdBy: req.user?._id ?? null,
+    createdBy: req.user?.id ?? null,
     createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('payroll_cycles', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 // ── Advance Cycle Status ──────────────────────────────────────────────────────
@@ -185,7 +215,7 @@ const createCycle = async (req, res) => {
 const STATUS_FLOW = { open: 'review', review: 'locked', locked: 'closed' };
 
 const advanceCycleStatus = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
   const next = STATUS_FLOW[cycle.status];
   if (!next) return returnFunction(res, 400, false, 'Cycle is already closed.');
@@ -193,7 +223,7 @@ const advanceCycleStatus = async (req, res) => {
   if (next === 'locked') return lockCycleInternal(req, res, cycle);
   if (next === 'closed') return closeCycleInternal(req, res, cycle);
 
-  await updateOne('payroll_cycles', { _id: cycle._id }, { $set: { status: next, updatedAt: new Date() } });
+  await updateOne('payroll_cycles', { id: cycle.id }, { status: next, updatedAt: new Date() });
   return returnFunction(res, 200, true, `Cycle moved to ${next}.`);
 };
 
@@ -201,32 +231,32 @@ const advanceCycleStatus = async (req, res) => {
 
 const getCycleResults = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const filter = { cycleId: new ObjectId(req.params.id) };
+  const filter = { cycleId: req.params.id };
   if (req.query.status) filter.status = req.query.status;
   if (req.query.hasException === 'true') filter.hasException = true;
   const [total, results] = await Promise.all([
     countDocuments('payroll_results', filter),
-    findMany('payroll_results', filter, { skip, limit, sort: { createdAt: 1 } }),
+    findMany('payroll_results', filter, { skip, limit, orderBy: 'createdAt' }),
   ]);
-  const resultEmpIds = [...new Set(results.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const resultEmpIds = [...new Set(results.map(r => r.employeeId))];
   const resultEmps = resultEmpIds.length
-    ? await findMany('employees', { _id: { $in: resultEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, bankAccountNumber: 1 } })
+    ? await knex('employees').whereIn('id', resultEmpIds).select('id', 'fullName', 'staffNumber', 'department', 'designation', 'bankAccountNumber')
     : [];
-  const resultEmpById = Object.fromEntries(resultEmps.map(e => [String(e._id), e]));
-  const enriched = results.map(r => ({ ...r, employee: resultEmpById[String(r.employeeId)] ?? null }));
+  const resultEmpById = Object.fromEntries(resultEmps.map(e => [e.id, e]));
+  const enriched = results.map(r => ({ ...r, employee: resultEmpById[r.employeeId] ?? null }));
   return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
 };
 
 // ── Get Exceptions ────────────────────────────────────────────────────────────
 
 const getCycleExceptions = async (req, res) => {
-  const results = await findMany('payroll_results', { cycleId: new ObjectId(req.params.id), hasException: true }, {});
-  const excEmpIds = [...new Set(results.map(r => String(r.employeeId)))].map(id => new ObjectId(id));
+  const results = await findMany('payroll_results', { cycleId: req.params.id, hasException: true });
+  const excEmpIds = [...new Set(results.map(r => r.employeeId))];
   const excEmps = excEmpIds.length
-    ? await findMany('employees', { _id: { $in: excEmpIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    ? await knex('employees').whereIn('id', excEmpIds).select('id', 'fullName', 'staffNumber', 'department')
     : [];
-  const excEmpById = Object.fromEntries(excEmps.map(e => [String(e._id), e]));
-  const enriched = results.map(r => ({ ...r, employee: excEmpById[String(r.employeeId)] ?? null }));
+  const excEmpById = Object.fromEntries(excEmps.map(e => [e.id, e]));
+  const enriched = await Promise.all(results.map(async (r) => ({ ...(await attachLineItems(r)), employee: excEmpById[r.employeeId] ?? null })));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -235,20 +265,18 @@ const getCycleExceptions = async (req, res) => {
 const approveEmployees = async (req, res) => {
   const { id: cycleId } = req.params;
   const { employeeIds, approveAll } = req.body;
-  const filter = { cycleId: new ObjectId(cycleId), status: 'pending' };
+  let query = knex('payroll_results').where({ cycleId, status: 'pending' });
   if (!approveAll && employeeIds?.length) {
-    filter.employeeId = { $in: employeeIds.map(id => new ObjectId(id)) };
+    query = query.whereIn('employeeId', employeeIds.map(String));
   }
-  const result = await global.dbo.collection('payroll_results').updateMany(filter, {
-    $set: { status: 'approved', approvedBy: req.user?._id ?? null, approvedAt: new Date(), updatedAt: new Date() },
-  });
-  return returnFunction(res, 200, true, `${result.modifiedCount} employee(s) approved.`);
+  const updated = await query.update({ status: 'approved', approvedBy: req.user?.id ?? null, approvedAt: new Date(), updatedAt: new Date() });
+  return returnFunction(res, 200, true, `${updated} employee(s) approved.`);
 };
 
 // ── Lock Cycle → Calculate Results ───────────────────────────────────────────
 
 const lockCycle = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
   return lockCycleInternal(req, res, cycle);
 };
@@ -283,17 +311,14 @@ const calculateProration = (emp, periodStart, periodEnd) => {
 // claim is released in a finally block so a mid-run crash can't leave the cycle stuck.
 async function lockCycleInternal(req, res, cycle) {
   if (cycle.status !== 'review') return returnFunction(res, 400, false, 'Cycle must be in Review to lock.');
-  const claim = await global.dbo.collection('payroll_cycles').updateOne(
-    { _id: cycle._id, status: 'review', isLocking: { $ne: true } },
-    { $set: { isLocking: true } }
-  );
-  if (claim.modifiedCount !== 1) {
+  const claimed = await knex('payroll_cycles').where({ id: cycle.id, status: 'review', isLocking: false }).update({ isLocking: true });
+  if (claimed !== 1) {
     return returnFunction(res, 409, false, 'This cycle is already being locked by another request.');
   }
   try {
     return await doLockCycleInternal(req, res, cycle);
   } finally {
-    await global.dbo.collection('payroll_cycles').updateOne({ _id: cycle._id }, { $set: { isLocking: false } }).catch(() => {});
+    await knex('payroll_cycles').where({ id: cycle.id }).update({ isLocking: false }).catch(() => {});
   }
 }
 
@@ -303,35 +328,32 @@ async function doLockCycleInternal(req, res, cycle) {
   // usual pay-group/frequency matching entirely. Otherwise: active employees, plus anyone
   // terminated during this period (so their prorated pay still gets run), narrowed to this
   // cycle's pay frequency and — optionally — a specific pay group.
-  let empFilter;
+  let employeeQuery = knex('employees');
   if (cycle.targetEmployeeIds?.length) {
-    empFilter = { _id: { $in: cycle.targetEmployeeIds } };
+    employeeQuery = employeeQuery.whereIn('id', cycle.targetEmployeeIds);
   } else {
     const cycleFrequency = cycle.payFrequency || 'monthly';
+    employeeQuery = employeeQuery.where((qb) => {
+      qb.where({ status: 'active' })
+        .orWhere((qb2) => qb2.where({ status: 'terminated' }).where('updatedAt', '>=', cycle.periodStartDate));
+    });
     // Employees created before pay-frequency existed have no payFrequency field at all —
     // treat that as 'monthly' (the default every employee effectively had before this
     // feature shipped) rather than excluding them from every monthly run.
-    const frequencyMatch = cycleFrequency === 'monthly'
-      ? { $or: [{ payFrequency: 'monthly' }, { payFrequency: { $exists: false } }, { payFrequency: null }] }
-      : { payFrequency: cycleFrequency };
-    empFilter = {
-      $and: [
-        { $or: [
-          { status: 'active' },
-          { status: 'terminated', updatedAt: { $gte: cycle.period.startDate } },
-        ] },
-        frequencyMatch,
-      ],
-    };
-    if (cycle.payGroup && cycle.payGroup !== 'all') empFilter.$and.push({ payGroup: cycle.payGroup });
-    if (cycle.jobGroupId) empFilter.$and.push({ jobGroupId: cycle.jobGroupId });
-    if (cycle.employmentType) empFilter.$and.push({ employmentType: cycle.employmentType });
+    if (cycleFrequency === 'monthly') {
+      employeeQuery = employeeQuery.where((qb) => qb.where({ payFrequency: 'monthly' }).orWhereNull('payFrequency'));
+    } else {
+      employeeQuery = employeeQuery.where({ payFrequency: cycleFrequency });
+    }
+    if (cycle.payGroup && cycle.payGroup !== 'all') employeeQuery = employeeQuery.where({ payGroup: cycle.payGroup });
+    if (cycle.jobGroupId) employeeQuery = employeeQuery.where({ jobGroupId: cycle.jobGroupId });
+    if (cycle.employmentType) employeeQuery = employeeQuery.where({ employmentType: cycle.employmentType });
     if (cycle.departmentId) {
-      const dept = await findOne('departments', { _id: cycle.departmentId });
-      empFilter.$and.push({ department: dept?.name ?? '__none__' });
+      const dept = await findOne('departments', { id: cycle.departmentId });
+      employeeQuery = employeeQuery.where({ department: dept?.name ?? '__none__' });
     }
   }
-  const allEmployeesInScope = await findMany('employees', empFilter, {});
+  const allEmployeesInScope = await employeeQuery;
 
   // Pay employees with a complete profile first — anyone missing a critical payroll
   // field (Gross Pay, Job Group) is excluded from this run entirely rather than
@@ -339,12 +361,12 @@ async function doLockCycleInternal(req, res, cycle) {
   // can see exactly who was skipped and why, fix their profile, and include them next run.
   const employees = allEmployeesInScope.filter(isPayrollReady);
   const excludedEmployees = allEmployeesInScope.filter(e => !isPayrollReady(e)).map(e => ({
-    employeeId: e._id, fullName: e.fullName, staffNumber: e.staffNumber || null,
+    employeeId: e.id, fullName: e.fullName, staffNumber: e.staffNumber || null,
     missingFields: getMissingCriticalFields(e),
   }));
 
-  // Delete any previous results for this cycle
-  await global.dbo.collection('payroll_results').deleteMany({ cycleId: cycle._id });
+  // Delete any previous results for this cycle — CASCADEs into their line-item child tables.
+  await knex('payroll_results').where({ cycleId: cycle.id }).del();
 
   let totalGross = 0, totalDeductions = 0, totalNet = 0, totalEmployerCost = 0, exceptionCount = 0;
   const matchedTimesheetIds = [];
@@ -352,12 +374,13 @@ async function doLockCycleInternal(req, res, cycle) {
 
   // Load tax config once for all employees (avoids N+1 DB calls) — the fallback for any
   // statutory line (PAYE/NSSF/SHA/AHL) no payroll_concept has claimed via statutoryKey
-  // yet; see resolveStatutoryLine below.
+  // yet; see resolveStatutoryLine below. tax_config is unmigrated — stays Mongo.
   const taxConfig = await loadTaxConfig();
   const taxCalc   = buildCalculator(taxConfig);
 
   // HR-defined overtime multipliers (weekday/weekend × day/night) — no hardcoded
   // defaults; falls back to 1x (no premium) for any bucket HR hasn't configured yet.
+  // overtime_config is unmigrated — stays Mongo.
   const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
   const otRate = (key) => overtimeConfig?.[key] != null ? overtimeConfig[key] : 1;
 
@@ -366,29 +389,25 @@ async function doLockCycleInternal(req, res, cycle) {
   // path was decommissioned once useUnifiedConceptsEngine was proven on a real cycle
   // lock (see the Concepts unification plan; git history has the removed code if it's
   // ever needed for reference).
-  const allConcepts = await findMany('payroll_concepts', { isActive: true }, {});
-  const conceptById = Object.fromEntries(allConcepts.map((c) => [String(c._id), c]));
-  const groupAssignments = await findMany('employee_compensations', { scope: 'group', isActive: true }, {});
+  const allConcepts = await findMany('payroll_concepts', { isActive: true });
+  const conceptById = Object.fromEntries(allConcepts.map((c) => [c.id, c]));
+  const groupAssignments = await findMany('employee_compensations', { scope: 'group', isActive: true });
 
   // Get all required alert concepts
-  const alertConcepts = await findMany('payroll_concepts', { alertIfUndefined: true, isActive: true }, {});
+  const alertConcepts = await findMany('payroll_concepts', { alertIfUndefined: true, isActive: true });
 
-  // Public holidays inside this period, loaded once (avoids N+1 DB calls in the leave calc below)
-  const cycleStartStr = cycle.period.startDate.toISOString().slice(0, 10);
-  const cycleEndStr   = cycle.period.endDate.toISOString().slice(0, 10);
+  // Public holidays inside this period, loaded once (avoids N+1 DB calls in the leave calc
+  // below). public_holidays is unmigrated — stays Mongo.
+  const cycleStartStr = cycle.periodStartDate.toISOString().slice(0, 10);
+  const cycleEndStr   = cycle.periodEndDate.toISOString().slice(0, 10);
   const holidays = await global.dbo.collection('public_holidays').find({ date: { $gte: cycleStartStr, $lte: cycleEndStr } }, { projection: { date: 1 } }).toArray();
   const holidaySet = new Set(holidays.map(h => h.date));
 
   for (const emp of employees) {
     // Get this employee's active compensations for this period
-    const comps = await findMany('employee_compensations', {
-      employeeId: emp._id,
-      isActive:   true,
-      $or: [
-        { effectiveTo: null },
-        { effectiveTo: { $gte: cycle.period.startDate } },
-      ],
-    }, {});
+    const comps = await knex('employee_compensations')
+      .where({ employeeId: emp.id, isActive: true })
+      .where((qb) => qb.whereNull('effectiveTo').orWhere('effectiveTo', '>=', cycle.periodStartDate));
 
     const conceptEngineWarnings = [];
 
@@ -398,7 +417,7 @@ async function doLockCycleInternal(req, res, cycle) {
     // timesheets are pulled further down) — formulas referencing it in an earnings/
     // pass-1 concept get 0 here; this is a known limitation, not a bug.
     const basicPayComp = comps.find(c => c.conceptCode === 'BASIC');
-    const basicSalary = basicPayComp?.amount ?? emp.grossPay ?? 0;
+    const basicSalary = Number(basicPayComp?.amount ?? emp.grossPay ?? 0);
     const pass1 = resolveConceptPass1({
       emp, individualComps: comps, groupAssignments, conceptById,
       context: { basic_salary: basicSalary, hours_worked: 0 },
@@ -417,7 +436,7 @@ async function doLockCycleInternal(req, res, cycle) {
 
     // Real proration — new hires / mid-cycle terminations only get paid for days actually
     // worked in this period. Fixed voluntary deductions (loans, etc.) are not prorated.
-    const proration    = calculateProration(emp, cycle.period.startDate, cycle.period.endDate);
+    const proration    = calculateProration(emp, cycle.periodStartDate, cycle.periodEndDate);
     const proratedGross = Math.round(grossPay * proration.factor * 100) / 100;
     const totalEmpCost  = proratedGross + empContribTotal;
 
@@ -428,15 +447,12 @@ async function doLockCycleInternal(req, res, cycle) {
 
     // Check alert concepts
     for (const ac of alertConcepts) {
-      const has = comps.some(c => String(c.conceptId) === String(ac._id));
+      const has = comps.some(c => c.conceptId === ac.id);
       if (!has) exceptions.push({ type: 'undefined_concept', message: `Required concept "${ac.name}" not defined.`, severity: 'warning' });
     }
 
     // Compare to last cycle (variance check)
-    const lastResult = await findOne('payroll_results',
-      { employeeId: emp._id, cycleId: { $ne: cycle._id } },
-      { sort: { createdAt: -1 } }
-    );
+    const lastResult = await knex('payroll_results').where({ employeeId: emp.id }).whereNot('cycleId', cycle.id).orderBy('createdAt', 'desc').first();
     if (lastResult && lastResult.grossPay > 0) {
       const variance = Math.abs(grossPay - lastResult.grossPay) / lastResult.grossPay;
       if (variance > 0.10) {
@@ -454,11 +470,13 @@ async function doLockCycleInternal(req, res, cycle) {
     // period — not raw attendance_records. A timesheet must go through the manager
     // approval gate before its overtime hours affect pay, and each one is stamped
     // with this cycle's id below so it's never counted into a payroll run twice.
+    // timesheets is unmigrated — stays Mongo.
+    const empObjectId = new ObjectId(emp.id);
     const cycleTimesheets = await global.dbo.collection('timesheets').find({
-      employeeId: emp._id,
+      employeeId: empObjectId,
       status: 'approved',
       payrollRunId: null,
-      weekStart: { $gte: cycle.period.startDate, $lte: cycle.period.endDate },
+      weekStart: { $gte: cycle.periodStartDate, $lte: cycle.periodEndDate },
     }).toArray();
     matchedTimesheetIds.push(...cycleTimesheets.map((t) => t._id));
     const overtimeMinutesTotal = cycleTimesheets.reduce((sum, t) => sum + (t.overtimeMinutes || 0), 0);
@@ -521,11 +539,12 @@ async function doLockCycleInternal(req, res, cycle) {
       exceptions.push({ type: 'concept_evaluation', message: w, severity: 'warning' });
     }
 
-    // Pull approved expense reimbursements for this cycle period
+    // Pull approved expense reimbursements for this cycle period. expense_claims is
+    // unmigrated — stays Mongo.
     const expenseDocs = await global.dbo.collection('expense_claims').find({
-      employeeId: emp._id,
+      employeeId: empObjectId,
       status: 'approved',
-      approvedAt: { $gte: cycle.period.startDate, $lte: cycle.period.endDate },
+      approvedAt: { $gte: cycle.periodStartDate, $lte: cycle.periodEndDate },
       payrollCycleId: null,
     }).toArray();
     const expenseReimbursements = expenseDocs.reduce((s, e) => s + (e.amount || 0), 0);
@@ -533,24 +552,25 @@ async function doLockCycleInternal(req, res, cycle) {
     if (expenseIds.length) {
       await global.dbo.collection('expense_claims').updateMany(
         { _id: { $in: expenseIds } },
-        { $set: { payrollCycleId: cycle._id, updatedAt: new Date() } }
+        { $set: { payrollCycleId: new ObjectId(cycle.id), updatedAt: new Date() } }
       );
     }
 
     // Pull approved leave overlapping this cycle period. Every approved leave type shows as
     // its own named line on the payslip; only 'unpaid' leave actually deducts from net pay —
     // the daily rate is the standard 22-working-day monthly rate, matching the overtime calc.
+    // leave_requests/leave_types are unmigrated — stay Mongo.
     const leaveDocs = await global.dbo.collection('leave_requests').find({
-      employeeId: emp._id, status: 'approved',
-      startDate: { $lte: cycle.period.endDate }, endDate: { $gte: cycle.period.startDate },
+      employeeId: empObjectId, status: 'approved',
+      startDate: { $lte: cycle.periodEndDate }, endDate: { $gte: cycle.periodStartDate },
     }).toArray();
     const leaveTypeIds = [...new Set(leaveDocs.map(lr => String(lr.leaveTypeId)))].map(id => new ObjectId(id));
     const leaveTypes = await global.dbo.collection('leave_types').find({ _id: { $in: leaveTypeIds } }).toArray();
     const leaveTypeById = Object.fromEntries(leaveTypes.map(lt => [String(lt._id), lt]));
     const dailyRate = grossPay ? grossPay / 22 : 0;
     const leave = leaveDocs.map((lr) => {
-      const clampedStart = lr.startDate < cycle.period.startDate ? cycleStartStr : lr.startDate.toISOString().slice(0, 10);
-      const clampedEnd    = lr.endDate   > cycle.period.endDate   ? cycleEndStr   : lr.endDate.toISOString().slice(0, 10);
+      const clampedStart = lr.startDate < cycle.periodStartDate ? cycleStartStr : lr.startDate.toISOString().slice(0, 10);
+      const clampedEnd    = lr.endDate   > cycle.periodEndDate   ? cycleEndStr   : lr.endDate.toISOString().slice(0, 10);
       const days = calculateWorkingDays(clampedStart, clampedEnd, holidaySet);
       const leaveType = leaveTypeById[String(lr.leaveTypeId)];
       const amount = leaveType && !leaveType.isPaid ? Math.round(dailyRate * days * 100) / 100 : 0;
@@ -580,40 +600,55 @@ async function doLockCycleInternal(req, res, cycle) {
       exceptions.push({ type: 'negative_net_pay', message: `Net pay is negative (${adjustedNet.toFixed(2)}) — deductions exceed what this employee earned this cycle.`, severity: 'error' });
     }
 
-    const resultDoc = {
-      cycleId:      cycle._id,
-      employeeId:   emp._id,
-      earnings:     jgAllowanceItems,
-      deductions:   [...jgFixedDeductionItems, ...jgPercentageDeductionItems, ...loanDeductionItems],
-      benefits:     benefits.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, amount: c.amount })),
-      employerContributions: employerContributions.map(c => ({ conceptId: c.conceptId, conceptName: c.conceptName, amount: c.amount })),
-      // Statutory deductions stored separately so the payslip PDF can render them as their own section
-      statutoryDeductions: {
-        paye: statPAYE, nssf: statNSSF, sha: statSHA, ahl: statAHL,
-        total: totalStatutory,
-        labels: {
-          paye: conceptStatutoryItems.find(i => i.statutoryKey === 'paye')?.conceptName || taxCalc.incomeTaxName,
-          nssf: conceptStatutoryItems.find(i => i.statutoryKey === 'nssf')?.conceptName || taxCalc.pensionName,
-          sha:  conceptStatutoryItems.find(i => i.statutoryKey === 'sha')?.conceptName  || taxCalc.healthName,
-          ahl:  conceptStatutoryItems.find(i => i.statutoryKey === 'ahl')?.conceptName  || taxCalc.housingLevyName,
-        },
-      },
-      grossPay:          adjustedGross,
-      totalDeductions:   totalDeds + totalStatutory + leaveDeductionTotal,
-      netPay:            adjustedNet,
+    const resultRow = {
+      cycleId: cycle.id, employeeId: emp.id,
+      grossPay: adjustedGross,
+      totalDeductions: totalDeds + totalStatutory + leaveDeductionTotal,
+      netPay: adjustedNet,
       totalEmployerCost: totalEmpCost + overtimeAmount,
       isProRata: proration.isProRata, proRataReason: proration.reason, proRataDays: proration.workedDays, workingDaysInCycle: proration.totalDays,
       overtimeHours, overtimeAmount, expenseReimbursements,
-      leave, leaveDeductionTotal,
+      leaveDeductionTotal,
+      // Statutory deductions stored flattened so payroll_results stays a plain row —
+      // reassembled into the {paye,nssf,sha,ahl,total,labels} shape by attachLineItems.
+      statutoryPaye: statPAYE, statutoryNssf: statNSSF, statutorySha: statSHA, statutoryAhl: statAHL, statutoryTotal: totalStatutory,
+      statutoryLabels: JSON.stringify({
+        paye: conceptStatutoryItems.find(i => i.statutoryKey === 'paye')?.conceptName || taxCalc.incomeTaxName,
+        nssf: conceptStatutoryItems.find(i => i.statutoryKey === 'nssf')?.conceptName || taxCalc.pensionName,
+        sha:  conceptStatutoryItems.find(i => i.statutoryKey === 'sha')?.conceptName  || taxCalc.healthName,
+        ahl:  conceptStatutoryItems.find(i => i.statutoryKey === 'ahl')?.conceptName  || taxCalc.housingLevyName,
+      }),
       hasException:  exceptions.length > 0,
-      exceptions,
       engine:        'concepts',
       status:        'pending',
       approvedBy:    null, approvedAt: null,
       payslipUrl:    null, payslipSentAt: null,
       createdAt:     new Date(), updatedAt: new Date(),
     };
-    await insertOne('payroll_results', resultDoc);
+    const insertedResult = await insertOne('payroll_results', resultRow);
+
+    // Five line-item child tables + exceptions — see the migration's file header.
+    const withPosition = (items) => items.map((item, position) => ({ resultId: insertedResult.id, position, ...item }));
+    const earningsRows = withPosition(jgAllowanceItems.map((i) => ({
+      conceptId: i.conceptId ? String(i.conceptId) : null, conceptName: i.conceptName ?? null, conceptCode: i.conceptCode ?? null,
+      subCategory: i.subCategory ?? null, amount: i.amount, source: i.source ?? null, isTaxable: i.isTaxable ?? null,
+    })));
+    const deductionRows = withPosition([...jgFixedDeductionItems, ...jgPercentageDeductionItems, ...loanDeductionItems].map((i) => ({
+      conceptId: i.conceptId ? String(i.conceptId) : null, conceptName: i.conceptName ?? null, conceptCode: i.conceptCode ?? null,
+      subCategory: i.subCategory ?? null, amount: i.amount, source: i.source ?? null,
+      loanAssignmentId: i.loanAssignmentId ? String(i.loanAssignmentId) : null, balanceAfter: i.balanceAfter ?? null,
+    })));
+    const benefitsRows = withPosition(benefits.map((c) => ({ conceptId: c.conceptId ? String(c.conceptId) : null, conceptName: c.conceptName ?? null, amount: c.amount })));
+    const employerContribRows = withPosition(employerContributions.map((c) => ({ conceptId: c.conceptId ? String(c.conceptId) : null, conceptName: c.conceptName ?? null, amount: c.amount })));
+    const leaveRows = withPosition(leave.map((l) => ({ leaveType: l.leaveType, startDate: l.startDate, endDate: l.endDate, days: l.days, amount: l.amount })));
+    const exceptionRows = withPosition(exceptions.map((e) => ({ type: e.type, message: e.message, severity: e.severity })));
+
+    if (earningsRows.length) await knex('payroll_result_earnings').insert(earningsRows);
+    if (deductionRows.length) await knex('payroll_result_deductions').insert(deductionRows);
+    if (benefitsRows.length) await knex('payroll_result_benefits').insert(benefitsRows);
+    if (employerContribRows.length) await knex('payroll_result_employer_contributions').insert(employerContribRows);
+    if (leaveRows.length) await knex('payroll_result_leave').insert(leaveRows);
+    if (exceptionRows.length) await knex('payroll_result_exceptions').insert(exceptionRows);
 
     totalGross        += adjustedGross;
     totalDeductions   += totalDeds + totalStatutory;
@@ -622,23 +657,21 @@ async function doLockCycleInternal(req, res, cycle) {
     if (exceptions.length > 0) exceptionCount++;
   }
 
-  await updateOne('payroll_cycles', { _id: cycle._id }, {
-    $set: {
-      status: 'locked',
-      totalGross, totalDeductions, totalNet, totalEmployerCost,
-      employeeCount:  employees.length,
-      hasExceptions:  exceptionCount > 0,
-      exceptionCount,
-      excludedEmployees,
-      lockedAt: new Date(), lockedBy: req.user?._id ?? null,
-      updatedAt: new Date(),
-    },
+  await updateOne('payroll_cycles', { id: cycle.id }, {
+    status: 'locked',
+    totalGross, totalDeductions, totalNet, totalEmployerCost,
+    employeeCount:  employees.length,
+    hasExceptions:  exceptionCount > 0,
+    exceptionCount,
+    excludedEmployees: JSON.stringify(excludedEmployees),
+    lockedAt: new Date(), lockedBy: req.user?.id ?? null,
+    updatedAt: new Date(),
   });
 
   if (matchedTimesheetIds.length) {
     await global.dbo.collection('timesheets').updateMany(
       { _id: { $in: matchedTimesheetIds } },
-      { $set: { payrollRunId: cycle._id, updatedAt: new Date() } }
+      { $set: { payrollRunId: new ObjectId(cycle.id), updatedAt: new Date() } }
     );
   }
 
@@ -646,21 +679,19 @@ async function doLockCycleInternal(req, res, cycle) {
   // convention every other compensation row already uses (no new concept needed) —
   // logged to the audit trail so it's visible, not a silent flip.
   for (const { assignmentId, installmentApplied } of conceptLoanApplications) {
-    const assignment = await findOne('employee_compensations', { _id: assignmentId });
+    const assignment = await findOne('employee_compensations', { id: String(assignmentId) });
     if (!assignment) continue;
     const newBalance = Math.round((assignment.balanceRemaining - installmentApplied) * 100) / 100;
     const isPaidOff = newBalance <= 0;
-    await updateOne('employee_compensations', { _id: assignmentId }, {
-      $set: {
-        balanceRemaining: Math.max(0, newBalance),
-        totalRepaid: Math.round(((assignment.totalRepaid || 0) + installmentApplied) * 100) / 100,
-        loanStatus: isPaidOff ? 'completed' : 'active',
-        isActive: isPaidOff ? false : assignment.isActive,
-        updatedAt: new Date(),
-      },
+    await updateOne('employee_compensations', { id: assignment.id }, {
+      balanceRemaining: Math.max(0, newBalance),
+      totalRepaid: Math.round(((assignment.totalRepaid || 0) + installmentApplied) * 100) / 100,
+      loanStatus: isPaidOff ? 'completed' : 'active',
+      isActive: isPaidOff ? false : assignment.isActive,
+      updatedAt: new Date(),
     });
     if (isPaidOff) {
-      logCompensationChange(assignment.employeeId, assignment._id, assignment.conceptName, 'updated',
+      logCompensationChange(assignment.employeeId, assignment.id, assignment.conceptName, 'updated',
         [{ field: 'loanStatus', oldValue: 'active', newValue: 'completed' },
          { field: 'isActive', oldValue: true, newValue: false }],
         null);
@@ -676,7 +707,7 @@ async function doLockCycleInternal(req, res, cycle) {
 // ── Close Cycle → Distribute Payslips ────────────────────────────────────────
 
 const closeCycle = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
   return closeCycleInternal(req, res, cycle);
 };
@@ -684,24 +715,21 @@ const closeCycle = async (req, res) => {
 // Same atomic-claim pattern as lockCycleInternal above — see that comment.
 async function closeCycleInternal(req, res, cycle) {
   if (cycle.status !== 'locked') return returnFunction(res, 400, false, 'Cycle must be locked to close.');
-  const claim = await global.dbo.collection('payroll_cycles').updateOne(
-    { _id: cycle._id, status: 'locked', isClosing: { $ne: true } },
-    { $set: { isClosing: true } }
-  );
-  if (claim.modifiedCount !== 1) {
+  const claimed = await knex('payroll_cycles').where({ id: cycle.id, status: 'locked', isClosing: false }).update({ isClosing: true });
+  if (claimed !== 1) {
     return returnFunction(res, 409, false, 'This cycle is already being closed by another request.');
   }
   try {
     return await doCloseCycleInternal(req, res, cycle);
   } finally {
-    await global.dbo.collection('payroll_cycles').updateOne({ _id: cycle._id }, { $set: { isClosing: false } }).catch(() => {});
+    await knex('payroll_cycles').where({ id: cycle.id }).update({ isClosing: false }).catch(() => {});
   }
 }
 
 async function doCloseCycleInternal(req, res, cycle) {
 
   // Block close if any results are still pending approval
-  const pendingCount = await countDocuments('payroll_results', { cycleId: cycle._id, status: 'pending' });
+  const pendingCount = await countDocuments('payroll_results', { cycleId: cycle.id, status: 'pending' });
   if (pendingCount > 0) {
     return returnFunction(res, 400, false, `Cannot close cycle: ${pendingCount} payroll result(s) are still pending approval. Approve or remove them first.`);
   }
@@ -710,53 +738,65 @@ async function doCloseCycleInternal(req, res, cycle) {
   // bank/M-Pesa details, negative net pay) — 'warning' severity is informational and
   // doesn't block; 'error' means this payslip cannot correctly be paid as calculated.
   // Approving a result doesn't clear its exceptions, so this check is independent of
-  // (and layered on top of) the pending-approval gate above.
-  const errorExceptionCount = await countDocuments('payroll_results', { cycleId: cycle._id, 'exceptions.severity': 'error' });
+  // (and layered on top of) the pending-approval gate above. A real child table (not a
+  // JSONB path query) is exactly why this stayed a plain WHERE — see the migration.
+  const errorExceptionCount = await knex('payroll_result_exceptions')
+    .whereIn('resultId', knex('payroll_results').where({ cycleId: cycle.id }).select('id'))
+    .where({ severity: 'error' }).count('* as count').first()
+    .then((r) => Number(r.count));
   if (errorExceptionCount > 0) {
     return returnFunction(res, 400, false, `Cannot close cycle: ${errorExceptionCount} payroll result(s) have an unresolved error (missing bank/M-Pesa details, or negative net pay). Fix these employees' records and re-lock the cycle first.`);
   }
 
-  const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
-  const period = `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}`;
+  const results = await findMany('payroll_results', { cycleId: cycle.id });
+  const period = `${MONTHS[cycle.periodMonth - 1]} ${cycle.periodYear}`;
   const notifyMessage = `Your payslip for ${period} has been generated. You can view and download it from your portal.`;
-  const companySettings = await findOne('company_settings', {});
+  // company_settings is unmigrated — stays Mongo.
+  const companySettings = await global.dbo.collection('company_settings').findOne({});
   const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   // Generate payslips for each employee
   for (const result of results) {
     try {
-      const emp = await findOne('employees', { _id: result.employeeId }, { projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccountNumber: 1 } });
-      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle, branding);
-      // Store PDF reference (in production: upload to storage, store URL)
+      const emp = await knex('employees').where({ id: result.employeeId }).first();
+      const fullResult = await attachLineItems(result);
+      const pdfBuffer = await generatePayslipFromResult(emp, fullResult, { period: { month: cycle.periodMonth, year: cycle.periodYear }, currency: cycle.currency, name: cycle.name }, branding);
+
+      // Write the PDF to disk once — pdfPath is referenced from both the payslips row
+      // (the dedicated payslip UI) and the employee's Documents/Payslips folder, per the
+      // plan's "drop the inline-base64 PDF blob" instruction (matches how certificates
+      // already do it).
+      const uploadDir = process.env.UPLOAD_DIR || 'uploads';
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      const payslipId = newId();
+      const filePath = path.join(uploadDir, `payslip-${payslipId}.pdf`);
+      fs.writeFileSync(filePath, pdfBuffer);
+
       const payslipDoc = {
+        id: payslipId,
         employeeId:  result.employeeId,
-        cycleId:     cycle._id,
-        resultId:    result._id,
-        period:      { month: cycle.period.month, year: cycle.period.year },
+        cycleId:     cycle.id,
+        resultId:    result.id,
+        periodMonth: cycle.periodMonth, periodYear: cycle.periodYear,
         grossPay:    result.grossPay,
         netPay:      result.netPay,
         status:      'paid',
-        pdfData:     pdfBuffer.toString('base64'),
+        pdfPath:     filePath,
         generatedAt: new Date(),
         createdAt:   new Date(),
       };
       const slip = await insertOne('payslips', payslipDoc);
-      await updateOne('payroll_results', { _id: result._id }, {
-        $set: { payslipUrl: `/api/payroll/payslips/${slip.insertedId}/pdf`, payslipSentAt: new Date(), status: 'paid', updatedAt: new Date() },
-      });
+      await updateOne('payroll_results', { id: result.id }, { payslipUrl: `/api/payroll/payslips/${slip.id}/pdf`, payslipSentAt: new Date(), status: 'paid', updatedAt: new Date() });
 
       // Also land a copy under the employee's Documents (Payslips folder) — the payslip
-      // module keeps its own base64 copy in `payslips` for the dedicated payslip UI, but
-      // Documents' download flow (downloadDocument) reads from disk via employee.documents[],
-      // so a real file has to exist there too for the Payslips folder to actually show it.
+      // module keeps its own file reference in `payslips` for the dedicated payslip UI,
+      // but Documents' download flow (downloadDocument) reads employee_documents, so a
+      // row has to exist there too for the Payslips folder to actually show it. Points
+      // at the SAME file on disk — no second copy.
       try {
-        const uploadDir = process.env.UPLOAD_DIR || 'uploads';
-        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-        const filePath = path.join(uploadDir, `payslip-${slip.insertedId}.pdf`);
-        fs.writeFileSync(filePath, pdfBuffer);
-        await updateOne('employees', { _id: result.employeeId }, { $push: { documents: {
-          docId: new ObjectId(), docType: 'payslip', fileName: `Payslip - ${period}.pdf`, filePath, uploadedAt: new Date(),
-        } } });
+        await addChildRow('employee_documents', {
+          employeeId: result.employeeId, docType: 'payslip', fileName: `Payslip - ${period}.pdf`, filePath, uploadedAt: new Date(),
+        });
       } catch (docErr) {
         console.error(`Payslip document upload failed for employee ${result.employeeId}:`, docErr.message);
       }
@@ -764,10 +804,10 @@ async function doCloseCycleInternal(req, res, cycle) {
       // Notify the employee (in-app + email) — separate from the manual emailPayslips action.
       notifyEmployee(result.employeeId, {
         title: 'Payslip Generated', body: notifyMessage, type: 'payroll',
-        link: `/payroll/payslips/${slip.insertedId}`,
+        link: `/payroll/payslips/${slip.id}`,
       }).catch(() => {});
 
-      const user = await findOne('users', { employeeId: result.employeeId }, { projection: { email: 1 } });
+      const user = await knex('users').where({ employeeId: result.employeeId }).first();
       if (user?.email) {
         sendTemplatedEmail({
           trigger: 'payslipGenerated',
@@ -783,30 +823,29 @@ async function doCloseCycleInternal(req, res, cycle) {
     }
   }
 
-  await updateOne('payroll_cycles', { _id: cycle._id }, {
-    $set: { status: 'closed', closedAt: new Date(), closedBy: req.user?._id ?? null, updatedAt: new Date() },
-  });
+  await updateOne('payroll_cycles', { id: cycle.id }, { status: 'closed', closedAt: new Date(), closedBy: req.user?.id ?? null, updatedAt: new Date() });
 
   // Salary Expense / Salary Payable, net-pay-denominated (statutory withholdings and
   // employer contributions are not separately booked as GL liabilities in v1 — everything
   // nets through at the net-pay figure). Never blocks the close itself. Lines are split
   // per department so a department_head's 'viewer' reports scope correctly later.
+  // GL accounting (gl_accounts/gl_journal_entries) is unmigrated — stays Mongo.
   {
-    const employeeIds = [...new Set(results.map((r) => String(r.employeeId)))].map((id) => new ObjectId(id));
-    const employees = employeeIds.length ? await findMany('employees', { _id: { $in: employeeIds } }, { projection: { department: 1 } }) : [];
-    const deptByEmployee = Object.fromEntries(employees.map((e) => [String(e._id), e.department || null]));
+    const employeeIds = [...new Set(results.map((r) => r.employeeId))];
+    const employees = employeeIds.length ? await knex('employees').whereIn('id', employeeIds).select('id', 'department') : [];
+    const deptByEmployee = Object.fromEntries(employees.map((e) => [e.id, e.department || null]));
 
     const netByDept = {};
     for (const r of results) {
-      const dept = deptByEmployee[String(r.employeeId)] || null;
-      netByDept[dept] = round2((netByDept[dept] || 0) + (r.netPay || 0));
+      const dept = deptByEmployee[r.employeeId] || null;
+      netByDept[dept] = round2((netByDept[dept] || 0) + (Number(r.netPay) || 0));
     }
     const totalNet = round2(Object.values(netByDept).reduce((s, v) => s + v, 0));
 
     if (totalNet > 0) {
       const payload = {
         date: new Date(), description: `Payroll cycle closed — ${period}`, source: 'payroll_cycle_close', sourceModule: 'payroll',
-        referenceId: cycle._id, referenceModel: 'payroll_cycles', lines: [],
+        referenceId: new ObjectId(cycle.id), referenceModel: 'payroll_cycles', lines: [],
       };
       try {
         const expenseAcct = await resolveSystemAccount('salary_expense');
@@ -819,9 +858,9 @@ async function doCloseCycleInternal(req, res, cycle) {
           lines.push({ accountId: payableAcct._id, credit: amount, department });
         }
         payload.lines = lines;
-        await postJournalEntry({ ...payload, postedBy: req.user?._id ?? null });
+        await postJournalEntry({ ...payload, postedBy: req.user?.id ? new ObjectId(req.user.id) : null });
       } catch (err) {
-        await logPostingFailure({ source: 'payroll_cycle_close', sourceModule: 'payroll', referenceId: cycle._id, referenceModel: 'payroll_cycles', attemptedPayload: payload, error: err });
+        await logPostingFailure({ source: 'payroll_cycle_close', sourceModule: 'payroll', referenceId: new ObjectId(cycle.id), referenceModel: 'payroll_cycles', attemptedPayload: payload, error: err });
       }
     }
   }
@@ -832,19 +871,22 @@ async function doCloseCycleInternal(req, res, cycle) {
 // ── Export CSV ────────────────────────────────────────────────────────────────
 
 const exportCycleCSV = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
-  const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
-  const rows = await Promise.all(results.map(async r => {
-    const emp = await findOne('employees', { _id: r.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const results = await findMany('payroll_results', { cycleId: cycle.id });
+  const employeeIds = [...new Set(results.map(r => r.employeeId))];
+  const employees = employeeIds.length ? await knex('employees').whereIn('id', employeeIds).select('id', 'fullName', 'staffNumber', 'department') : [];
+  const empById = Object.fromEntries(employees.map(e => [e.id, e]));
+  const rows = results.map(r => {
+    const emp = empById[r.employeeId];
     return [
       emp?.staffNumber ?? '', emp?.fullName ?? '', emp?.department ?? '',
       r.grossPay, r.totalDeductions, r.netPay, r.totalEmployerCost, r.status,
     ].join(',');
-  }));
+  });
   const csv = ['Staff No,Name,Department,Gross,Deductions,Net,Employer Cost,Status', ...rows].join('\n');
   res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="payroll-${cycle.period.year}-${cycle.period.month}.csv"`);
+  res.setHeader('Content-Disposition', `attachment; filename="payroll-${cycle.periodYear}-${cycle.periodMonth}.csv"`);
   return res.send(csv);
 };
 
@@ -853,28 +895,34 @@ const exportCycleCSV = async (req, res) => {
 // Only approved results are included; cycle must be locked or closed.
 
 const exportBankFile = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
   if (!['locked', 'closed'].includes(cycle.status)) {
     return returnFunction(res, 400, false, 'Bank file can only be exported once the cycle is locked or closed.');
   }
 
-  const results = await findMany('payroll_results', { cycleId: cycle._id, status: { $in: ['approved', 'paid'] } }, {});
+  const results = await knex('payroll_results').where({ cycleId: cycle.id }).whereIn('status', ['approved', 'paid']);
   if (!results.length) return returnFunction(res, 400, false, 'No approved payroll results to export.');
 
   // Never let a broken payment instruction (negative/zero net pay from a deduction
   // config error) reach the file HR actually uploads to the bank — block the whole
   // export rather than silently drop rows, so nobody accidentally goes unpaid without
   // HR noticing. Same "error" exceptions closeCycleInternal blocks on.
-  const badRows = results.filter(r => r.netPay <= 0 || (r.exceptions || []).some(e => e.severity === 'error'));
+  const resultIds = results.map(r => r.id);
+  const errorResultIds = new Set((await knex('payroll_result_exceptions').whereIn('resultId', resultIds).where({ severity: 'error' }).select('resultId')).map(e => e.resultId));
+  const badRows = results.filter(r => r.netPay <= 0 || errorResultIds.has(r.id));
   if (badRows.length) {
     return returnFunction(res, 400, false, `Cannot export bank file: ${badRows.length} result(s) have a negative/zero net pay or an unresolved error. Fix these employees' records and re-lock the cycle before exporting.`);
   }
 
-  const rows = await Promise.all(results.map(async r => {
-    const emp = await findOne('employees', { _id: r.employeeId }, {
-      projection: { fullName: 1, staffNumber: 1, bankName: 1, bankAccountNumber: 1, mpesaNumber: 1, paymentMethod: 1 },
-    });
+  const employeeIds = [...new Set(results.map(r => r.employeeId))];
+  const employees = employeeIds.length
+    ? await knex('employees').whereIn('id', employeeIds).select('id', 'fullName', 'staffNumber', 'bankName', 'bankAccountNumber', 'mpesaNumber', 'paymentMethod')
+    : [];
+  const empById = Object.fromEntries(employees.map(e => [e.id, e]));
+
+  const rows = results.map(r => {
+    const emp = empById[r.employeeId];
     const account = emp?.bankAccountNumber || emp?.mpesaNumber || '';
     const bank    = emp?.bankName || '';
     const method  = emp?.paymentMethod || 'bank_transfer';
@@ -884,30 +932,28 @@ const exportBankFile = async (req, res) => {
       method,
       bank,
       account,
-      r.netPay.toFixed(2),
+      Number(r.netPay).toFixed(2),
       cycle.currency || 'KES',
       `"${cycle.name}"`,
     ].join(',');
-  }));
+  });
 
   const header = 'StaffNo,Name,PaymentMethod,BankName,AccountNumber,NetAmount,Currency,PayrollPeriod';
   const csv = [header, ...rows].join('\n');
 
   res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="bank-file-${cycle.period.year}-${cycle.period.month}.csv"`);
+  res.setHeader('Content-Disposition', `attachment; filename="bank-file-${cycle.periodYear}-${cycle.periodMonth}.csv"`);
   return res.send(csv);
 };
 
 // ── Get Single Result ─────────────────────────────────────────────────────────
 
 const getEmployeeResult = async (req, res) => {
-  const result = await findOne('payroll_results', {
-    cycleId:    new ObjectId(req.params.cycleId),
-    employeeId: new ObjectId(req.params.employeeId),
-  });
+  const result = await findOne('payroll_results', { cycleId: req.params.cycleId, employeeId: req.params.employeeId });
   if (!result) return returnFunction(res, 404, false, req.locale.notFound);
-  const emp = await findOne('employees', { _id: result.employeeId });
-  return returnFunction(res, 200, true, req.locale.success, { ...result, employee: emp ?? null });
+  const emp = await findOne('employees', { id: result.employeeId });
+  const fullResult = await attachLineItems(result);
+  return returnFunction(res, 200, true, req.locale.success, { ...fullResult, employee: emp ?? null });
 };
 
 // ── Email Payslips ────────────────────────────────────────────────────────────
@@ -915,36 +961,35 @@ const getEmployeeResult = async (req, res) => {
 // Emails each employee their payslip PDF for this closed cycle.
 
 const emailPayslips = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.id });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
   if (cycle.status !== 'closed') {
     return returnFunction(res, 400, false, 'Cycle must be closed before emailing payslips.');
   }
 
-  const results = await findMany('payroll_results', { cycleId: cycle._id, status: 'paid' }, {});
+  const results = await findMany('payroll_results', { cycleId: cycle.id, status: 'paid' });
   if (!results.length) {
     return returnFunction(res, 400, false, 'No paid payroll results found in this cycle.');
   }
 
   let sent = 0, skipped = 0, failed = 0;
-  const period = `${MONTHS[cycle.period.month - 1]} ${cycle.period.year}`;
-  const companySettings = await findOne('company_settings', {});
+  const period = `${MONTHS[cycle.periodMonth - 1]} ${cycle.periodYear}`;
+  const companySettings = await global.dbo.collection('company_settings').findOne({});
   const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   for (const result of results) {
     try {
       const [emp, user] = await Promise.all([
-        findOne('employees', { _id: result.employeeId }, {
-          projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccountNumber: 1 },
-        }),
-        findOne('users', { employeeId: result.employeeId }, { projection: { email: 1 } }),
+        knex('employees').where({ id: result.employeeId }).first(),
+        knex('users').where({ employeeId: result.employeeId }).first(),
       ]);
 
       if (!user?.email) { skipped++; continue; }
 
-      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle, branding);
+      const fullResult = await attachLineItems(result);
+      const pdfBuffer = await generatePayslipFromResult(emp, fullResult, { period: { month: cycle.periodMonth, year: cycle.periodYear }, currency: cycle.currency, name: cycle.name }, branding);
       const cur       = cycle.currency || 'KES';
-      const netFmt    = `${cur} ${(result.netPay || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`;
+      const netFmt    = `${cur} ${(Number(result.netPay) || 0).toLocaleString('en-KE', { minimumFractionDigits: 2 })}`;
 
       await sendEmail({
         to: user.email,
@@ -964,15 +1009,13 @@ const emailPayslips = async (req, res) => {
           </div>
         `,
         attachments: [{
-          filename: `payslip-${emp?.staffNumber ?? 'emp'}-${cycle.period.year}-${String(cycle.period.month).padStart(2, '0')}.pdf`,
+          filename: `payslip-${emp?.staffNumber ?? 'emp'}-${cycle.periodYear}-${String(cycle.periodMonth).padStart(2, '0')}.pdf`,
           content:     pdfBuffer,
           contentType: 'application/pdf',
         }],
       });
 
-      await updateOne('payroll_results', { _id: result._id }, {
-        $set: { payslipSentAt: new Date(), updatedAt: new Date() },
-      });
+      await updateOne('payroll_results', { id: result.id }, { payslipSentAt: new Date(), updatedAt: new Date() });
       sent++;
     } catch (err) {
       console.error(`Payslip email failed for employee ${result.employeeId}:`, err.message);
@@ -991,16 +1034,16 @@ const emailPayslips = async (req, res) => {
 // Streams every payslip PDF for this cycle bundled into a single ZIP.
 
 const downloadPayslipsZip = async (req, res) => {
-  const cycle = await findOne('payroll_cycles', { _id: new ObjectId(req.params.cycleId) });
+  const cycle = await findOne('payroll_cycles', { id: req.params.cycleId });
   if (!cycle) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const results = await findMany('payroll_results', { cycleId: cycle._id }, {});
+  const results = await findMany('payroll_results', { cycleId: cycle.id });
   if (!results.length) return returnFunction(res, 400, false, 'No payroll results found for this cycle.');
-  const companySettings = await findOne('company_settings', {});
+  const companySettings = await global.dbo.collection('company_settings').findOne({});
   const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="payslips-${cycle._id}.zip"`);
+  res.setHeader('Content-Disposition', `attachment; filename="payslips-${cycle.id}.zip"`);
 
   const archive = archiver('zip', { zlib: { level: 9 } });
   // archiver's 'error' event fires asynchronously — throwing here would be an uncaught
@@ -1016,9 +1059,10 @@ const downloadPayslipsZip = async (req, res) => {
 
   for (const result of results) {
     try {
-      const emp = await findOne('employees', { _id: result.employeeId }, { projection: { fullName: 1, staffNumber: 1, designation: 1, department: 1, bankAccountNumber: 1 } });
-      const pdfBuffer = await generatePayslipFromResult(emp, result, cycle, branding);
-      const filename = `payslip-${emp?.staffNumber ?? result.employeeId}-${cycle.period.year}-${String(cycle.period.month).padStart(2, '0')}.pdf`;
+      const emp = await knex('employees').where({ id: result.employeeId }).first();
+      const fullResult = await attachLineItems(result);
+      const pdfBuffer = await generatePayslipFromResult(emp, fullResult, { period: { month: cycle.periodMonth, year: cycle.periodYear }, currency: cycle.currency, name: cycle.name }, branding);
+      const filename = `payslip-${emp?.staffNumber ?? result.employeeId}-${cycle.periodYear}-${String(cycle.periodMonth).padStart(2, '0')}.pdf`;
       archive.append(pdfBuffer, { name: filename });
     } catch (err) {
       // Same philosophy as closeCycleInternal — one bad payslip doesn't sink the whole ZIP.
@@ -1035,26 +1079,23 @@ const downloadP9Form = async (req, res) => {
   const { employeeId } = req.params;
   const year = parseInt(req.query.year) || new Date().getFullYear() - 1;
 
-  const employee = await findOne('employees', { _id: new ObjectId(employeeId) });
+  const employee = await findOne('employees', { id: employeeId });
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
-  const results  = await findMany('payroll_results', { employeeId: new ObjectId(employeeId) }, {});
-  const cycleIds = [...new Set(results.map(r => String(r.cycleId)))];
-  const cycles   = cycleIds.length
-    ? await findMany('payroll_cycles', { _id: { $in: cycleIds.map(id => new ObjectId(id)) } })
-    : [];
-  const cycleMap = Object.fromEntries(cycles.map(c => [String(c._id), c]));
+  const results  = await findMany('payroll_results', { employeeId });
+  const cycleIds = [...new Set(results.map(r => r.cycleId))];
+  const cycles   = cycleIds.length ? await knex('payroll_cycles').whereIn('id', cycleIds) : [];
+  const cycleMap = Object.fromEntries(cycles.map(c => [c.id, c]));
 
   const monthMap = {};
   for (const r of results) {
-    const cycle = cycleMap[String(r.cycleId)];
-    if (!cycle || cycle.period?.year !== year) continue;
-    const m  = cycle.period.month;
-    const sd = r.statutoryDeductions || {};
+    const cycle = cycleMap[r.cycleId];
+    if (!cycle || cycle.periodYear !== year) continue;
+    const m = cycle.periodMonth;
     monthMap[m] = {
-      month: m, grossPay: r.grossPay || 0,
-      paye: sd.paye || 0, nssf: sd.nssf || 0, sha: sd.sha || 0, ahl: sd.ahl || 0,
-      netPay: r.netPay || 0,
+      month: m, grossPay: Number(r.grossPay) || 0,
+      paye: Number(r.statutoryPaye) || 0, nssf: Number(r.statutoryNssf) || 0, sha: Number(r.statutorySha) || 0, ahl: Number(r.statutoryAhl) || 0,
+      netPay: Number(r.netPay) || 0,
     };
   }
 

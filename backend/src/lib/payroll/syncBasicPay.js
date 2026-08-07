@@ -1,9 +1,8 @@
-const { ObjectId } = require('mongodb');
-const { findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// compensation_audit_logs now lives in Postgres; payroll_concepts/employee_compensations
-// are unmigrated (Phase 2), so they stay on the Mongo helpers above.
-const pgDB = require('../../functions/Database/pgDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// payroll_concepts, employee_compensations, and compensation_audit_logs all now live in
+// Postgres (compensation_audit_logs since Phase 1, payroll_concepts/employee_compensations
+// since Phase 2).
+const { findOne, insertOne, updateOne } = require('../../functions/Database/pgDBFunctions');
 
 const BASIC_PAY_CODE = 'BASIC';
 
@@ -15,8 +14,7 @@ async function ensureBasicPayConcept(actorUserId) {
     type: 'fixed', currency: 'KES', isActive: true,
     createdBy: actorUserId ?? null, createdAt: new Date(), updatedAt: new Date(),
   };
-  const result = await insertOne('payroll_concepts', doc);
-  return { _id: result.insertedId, ...doc };
+  return insertOne('payroll_concepts', doc);
 }
 
 // Keeps the employee record's `grossPay` field (set on the Add/Edit Employee form) in
@@ -26,18 +24,18 @@ async function ensureBasicPayConcept(actorUserId) {
 // and added a matching item by hand. Silent divergence meant a new hire's real payroll
 // gross pay was whatever job-group allowances happened to apply, often near-zero.
 async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effectiveFrom) {
-  const empObjectId = typeof employeeId === 'string' ? new ObjectId(employeeId) : employeeId;
+  const empId = String(employeeId);
   const existing = await findOne('employee_compensations', {
-    employeeId: empObjectId, conceptCode: BASIC_PAY_CODE, isActive: true,
+    employeeId: empId, conceptCode: BASIC_PAY_CODE, isActive: true,
   });
 
   // grossPay cleared/zeroed — deactivate any existing auto-synced Basic Pay line rather
   // than leaving a stale amount that no longer reflects the employee record.
   if (!grossPay || grossPay <= 0) {
     if (existing) {
-      await updateOne('employee_compensations', { _id: existing._id }, { $set: { isActive: false, updatedAt: new Date() } });
-      await pgDB.insertOne('compensation_audit_logs', {
-        employeeId: String(empObjectId), compensationId: String(existing._id), conceptName: existing.conceptName, action: 'removed',
+      await updateOne('employee_compensations', { id: existing.id }, { isActive: false, updatedAt: new Date() });
+      await insertOne('compensation_audit_logs', {
+        employeeId: empId, compensationId: existing.id, conceptName: existing.conceptName, action: 'removed',
         changes: JSON.stringify([{ field: 'isActive', oldValue: true, newValue: false }]),
         performedBy: actorUserId ? String(actorUserId) : null, performedAt: new Date(),
       }).catch(() => {});
@@ -46,10 +44,10 @@ async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effec
   }
 
   if (existing) {
-    if (existing.amount === grossPay) return;
-    await updateOne('employee_compensations', { _id: existing._id }, { $set: { amount: grossPay, updatedAt: new Date() } });
-    await pgDB.insertOne('compensation_audit_logs', {
-      employeeId: String(empObjectId), compensationId: String(existing._id), conceptName: existing.conceptName, action: 'updated',
+    if (Number(existing.amount) === Number(grossPay)) return;
+    await updateOne('employee_compensations', { id: existing.id }, { amount: grossPay, updatedAt: new Date() });
+    await insertOne('compensation_audit_logs', {
+      employeeId: empId, compensationId: existing.id, conceptName: existing.conceptName, action: 'updated',
       changes: JSON.stringify([{ field: 'amount', oldValue: existing.amount, newValue: grossPay }]),
       performedBy: actorUserId ? String(actorUserId) : null, performedAt: new Date(),
     }).catch(() => {});
@@ -58,8 +56,8 @@ async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effec
 
   const concept = await ensureBasicPayConcept(actorUserId);
   const doc = {
-    employeeId: empObjectId,
-    conceptId: concept._id, conceptName: concept.name, conceptCode: concept.code,
+    employeeId: empId,
+    conceptId: concept.id, conceptName: concept.name, conceptCode: concept.code,
     category: concept.category, subCategory: concept.subCategory,
     amount: grossPay, currency: concept.currency || 'KES',
     effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : new Date(),
@@ -68,8 +66,8 @@ async function syncBasicPayCompensation(employeeId, grossPay, actorUserId, effec
     createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('employee_compensations', doc);
-  await pgDB.insertOne('compensation_audit_logs', {
-    employeeId: String(empObjectId), compensationId: String(result.insertedId), conceptName: doc.conceptName, action: 'added',
+  await insertOne('compensation_audit_logs', {
+    employeeId: empId, compensationId: result.id, conceptName: doc.conceptName, action: 'added',
     changes: JSON.stringify([{ field: 'amount', oldValue: null, newValue: grossPay }]),
     performedBy: actorUserId ? String(actorUserId) : null, performedAt: new Date(),
   }).catch(() => {});

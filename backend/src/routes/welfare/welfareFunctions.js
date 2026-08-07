@@ -1,8 +1,10 @@
-const { ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 2) —
+// welfare_schemes, payroll_concepts, employee_compensations, employees, users all now
+// live in Postgres.
+const { findOne, findMany, insertOne, updateOne, countDocuments, knex } = require('../../functions/Database/pgDBFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { logCompensationChange } = require('../payroll/payrollCompensationsFunctions');
@@ -27,7 +29,7 @@ const createScheme = async (req, res) => {
   if (!(amount > 0)) return returnFunction(res, 400, false, 'contributionAmount must be greater than 0.');
 
   // Auto-generated code — HR names the scheme, not the underlying concept, so there's
-  // no user-facing code field to collide on. `payroll_concepts.code` has no DB-level
+  // no user-facing code field to collide on. payroll_concepts.code has no DB-level
   // unique index (only createConcept's own app-level findOne check, which this direct
   // insert bypasses), so explicitly check-and-retry here rather than trusting a
   // single random value to never collide.
@@ -50,7 +52,7 @@ const createScheme = async (req, res) => {
     formula: null, brackets: null, loanType: null,
     cap: null, flatCredit: null, deductConceptCodesFromBase: [], statutoryKey: null,
     isActive: true, isTaxable: false, isRecurring: true, appearsOnPayslip: true, alertIfUndefined: false,
-    createdBy: req.user?._id ?? null,
+    createdBy: req.user?.id ?? null,
     createdAt: new Date(), updatedAt: new Date(),
   };
   const conceptResult = await insertOne('payroll_concepts', conceptDoc);
@@ -58,21 +60,21 @@ const createScheme = async (req, res) => {
   const schemeDoc = {
     name: name.trim(),
     description: description || '',
-    conceptId: conceptResult.insertedId,
+    conceptId: conceptResult.id,
     contributionAmount: amount,
     contributionType,
     percentageOf: conceptDoc.percentageOf,
     isActive: true,
-    createdBy: req.user?._id ?? null,
+    createdBy: req.user?.id ?? null,
     createdAt: new Date(), updatedAt: new Date(),
   };
   const result = await insertOne('welfare_schemes', schemeDoc);
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, conceptId: conceptResult.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, conceptId: conceptResult.id });
 };
 
 const listSchemes = async (req, res) => {
-  const schemes = await findMany('welfare_schemes', {}, { sort: { createdAt: -1 } });
+  const schemes = await findMany('welfare_schemes', {}, { orderBy: { column: 'createdAt', order: 'desc' } });
   const enriched = await Promise.all(schemes.map(async (s) => {
     const memberCount = await countDocuments('employee_compensations', { conceptId: s.conceptId, isActive: true });
     return { ...s, memberCount };
@@ -81,20 +83,20 @@ const listSchemes = async (req, res) => {
 };
 
 const getScheme = async (req, res) => {
-  const scheme = await findOne('welfare_schemes', { _id: new ObjectId(req.params.id) });
+  const scheme = await findOne('welfare_schemes', { id: req.params.id });
   if (!scheme) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const memberComps = await findMany('employee_compensations', { conceptId: scheme.conceptId, isActive: true }, {});
+  const memberComps = await findMany('employee_compensations', { conceptId: scheme.conceptId, isActive: true });
   const employeeIds = memberComps.map((c) => c.employeeId);
   const employees = employeeIds.length
-    ? await findMany('employees', { _id: { $in: employeeIds } }, { projection: { fullName: 1, staffNumber: 1, department: 1 } })
+    ? await knex('employees').whereIn('id', employeeIds).select('id', 'fullName', 'staffNumber', 'department')
     : [];
-  const empById = Object.fromEntries(employees.map((e) => [String(e._id), e]));
+  const empById = Object.fromEntries(employees.map((e) => [e.id, e]));
 
   const members = memberComps.map((c) => ({
-    compensationId: c._id,
+    compensationId: c.id,
     employeeId: c.employeeId,
-    employee: empById[String(c.employeeId)] || null,
+    employee: empById[c.employeeId] || null,
     amount: c.amount,
     effectiveFrom: c.effectiveFrom,
   }));
@@ -103,7 +105,7 @@ const getScheme = async (req, res) => {
 };
 
 const updateScheme = async (req, res) => {
-  const scheme = await findOne('welfare_schemes', { _id: new ObjectId(req.params.id) });
+  const scheme = await findOne('welfare_schemes', { id: req.params.id });
   if (!scheme) return returnFunction(res, 404, false, req.locale.notFound);
 
   const update = { updatedAt: new Date() };
@@ -111,15 +113,15 @@ const updateScheme = async (req, res) => {
   if (req.body.description !== undefined) update.description = req.body.description;
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
 
-  await updateOne('welfare_schemes', { _id: scheme._id }, { $set: update });
+  await updateOne('welfare_schemes', { id: scheme.id }, update);
 
   // Deactivating the scheme deactivates its underlying concept too, so it stops being
   // evaluated in payroll (existing members degrade to a harmless "concept not found"
   // warning rather than continuing to be silently deducted for a scheme HR closed).
   if (update.isActive === false) {
-    await updateOne('payroll_concepts', { _id: scheme.conceptId }, { $set: { isActive: false, updatedAt: new Date() } });
+    await updateOne('payroll_concepts', { id: scheme.conceptId }, { isActive: false, updatedAt: new Date() });
   } else if (update.isActive === true) {
-    await updateOne('payroll_concepts', { _id: scheme.conceptId }, { $set: { isActive: true, updatedAt: new Date() } });
+    await updateOne('payroll_concepts', { id: scheme.conceptId }, { isActive: true, updatedAt: new Date() });
   }
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
@@ -127,22 +129,22 @@ const updateScheme = async (req, res) => {
 
 const addMember = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId'])) return;
-  const scheme = await findOne('welfare_schemes', { _id: new ObjectId(req.params.id) });
+  const scheme = await findOne('welfare_schemes', { id: req.params.id });
   if (!scheme) return returnFunction(res, 404, false, req.locale.notFound);
   if (!scheme.isActive) return returnFunction(res, 400, false, 'This scheme is no longer active.');
 
-  const employee = await findOne('employees', { _id: new ObjectId(req.body.employeeId) }, { projection: { fullName: 1 } });
+  const employee = await findOne('employees', { id: req.body.employeeId });
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
   const existing = await findOne('employee_compensations', {
-    employeeId: employee._id, conceptId: scheme.conceptId, isActive: true,
+    employeeId: employee.id, conceptId: scheme.conceptId, isActive: true,
   });
   if (existing) return returnFunction(res, 409, false, `${employee.fullName} is already a member of this scheme.`);
 
-  const concept = await findOne('payroll_concepts', { _id: scheme.conceptId }, { projection: { name: 1, code: 1, category: 1, subCategory: 1 } });
+  const concept = await findOne('payroll_concepts', { id: scheme.conceptId });
   const now = new Date();
   const doc = {
-    employeeId: employee._id,
+    employeeId: employee.id,
     conceptId: scheme.conceptId,
     conceptName: concept.name,
     conceptCode: concept.code,
@@ -153,21 +155,21 @@ const addMember = async (req, res) => {
     amount: scheme.contributionType === 'fixed' ? Number(req.body.amount ?? scheme.contributionAmount) : 0,
     currency: 'KES',
     effectiveFrom: now, effectiveTo: null, cycleId: null, isActive: true,
-    addedBy: req.user?._id ?? null, notes: null,
+    addedBy: req.user?.id ?? null, notes: null,
     createdAt: now, updatedAt: now,
   };
   const result = await insertOne('employee_compensations', doc);
-  logCompensationChange(doc.employeeId, result.insertedId, doc.conceptName, 'added',
-    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
+  logCompensationChange(doc.employeeId, result.id, doc.conceptName, 'added',
+    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?.id);
 
-  notifyEmployee(employee._id, {
+  notifyEmployee(employee.id, {
     title: 'Welfare Scheme Enrollment',
     body: `You have been enrolled in the "${scheme.name}" welfare scheme.`,
     type: 'general',
   }).catch(() => {});
 
   {
-    const empUser = await findOne('users', { employeeId: employee._id }, { projection: { email: 1 } });
+    const empUser = await findOne('users', { employeeId: employee.id });
     if (empUser?.email) {
       const tokens = { employeeName: employee.fullName, schemeName: scheme.name, action: 'enrolled in' };
       sendTemplatedEmail({
@@ -178,21 +180,21 @@ const addMember = async (req, res) => {
     }
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const removeMember = async (req, res) => {
-  const scheme = await findOne('welfare_schemes', { _id: new ObjectId(req.params.id) });
+  const scheme = await findOne('welfare_schemes', { id: req.params.id });
   if (!scheme) return returnFunction(res, 404, false, req.locale.notFound);
 
   const compensation = await findOne('employee_compensations', {
-    employeeId: new ObjectId(req.params.employeeId), conceptId: scheme.conceptId, isActive: true,
+    employeeId: req.params.employeeId, conceptId: scheme.conceptId, isActive: true,
   });
   if (!compensation) return returnFunction(res, 404, false, 'This employee is not an active member of this scheme.');
 
-  await updateOne('employee_compensations', { _id: compensation._id }, { $set: { isActive: false, updatedAt: new Date() } });
-  logCompensationChange(compensation.employeeId, compensation._id, compensation.conceptName, 'removed',
-    [{ field: 'isActive', oldValue: true, newValue: false }], req.user?._id);
+  await updateOne('employee_compensations', { id: compensation.id }, { isActive: false, updatedAt: new Date() });
+  logCompensationChange(compensation.employeeId, compensation.id, compensation.conceptName, 'removed',
+    [{ field: 'isActive', oldValue: true, newValue: false }], req.user?.id);
 
   notifyEmployee(compensation.employeeId, {
     title: 'Welfare Scheme Membership Ended',
@@ -202,8 +204,8 @@ const removeMember = async (req, res) => {
 
   {
     const [empUser, emp] = await Promise.all([
-      findOne('users', { employeeId: compensation.employeeId }, { projection: { email: 1 } }),
-      findOne('employees', { _id: compensation.employeeId }, { projection: { fullName: 1 } }),
+      findOne('users', { employeeId: compensation.employeeId }),
+      findOne('employees', { id: compensation.employeeId }),
     ]);
     if (empUser?.email) {
       const tokens = { employeeName: emp?.fullName || 'there', schemeName: scheme.name, action: 'removed from' };
@@ -222,18 +224,18 @@ const removeMember = async (req, res) => {
 const getMyWelfare = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, []);
   const comps = await findMany('employee_compensations', {
-    employeeId: new ObjectId(req.user.employeeId), category: 'deductions', subCategory: 'welfare', isActive: true,
-  }, {});
+    employeeId: String(req.user.employeeId), category: 'deductions', subCategory: 'welfare', isActive: true,
+  });
   if (!comps.length) return returnFunction(res, 200, true, req.locale.success, []);
 
   const conceptIds = comps.map((c) => c.conceptId);
-  const schemes = await findMany('welfare_schemes', { conceptId: { $in: conceptIds } }, {});
-  const schemeByConceptId = Object.fromEntries(schemes.map((s) => [String(s.conceptId), s]));
+  const schemes = await knex('welfare_schemes').whereIn('conceptId', conceptIds);
+  const schemeByConceptId = Object.fromEntries(schemes.map((s) => [s.conceptId, s]));
 
   const enriched = comps.map((c) => {
-    const scheme = schemeByConceptId[String(c.conceptId)];
+    const scheme = schemeByConceptId[c.conceptId];
     return {
-      schemeId: scheme?._id || null,
+      schemeId: scheme?.id || null,
       schemeName: scheme?.name || c.conceptName,
       description: scheme?.description || '',
       contributionType: scheme?.contributionType || null,

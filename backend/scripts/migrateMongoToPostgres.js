@@ -17,6 +17,8 @@
 //   node scripts/migrateMongoToPostgres.js --dry-run   # counts only, writes nothing
 
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const { MongoClient, ObjectId } = require('mongodb');
 const knex = require('../src/functions/Database/pgClient');
 
@@ -235,6 +237,150 @@ async function main() {
       .find({ _id: { $regex: /^staff_number_/ } }).toArray();
     counts.counters = await upsertBatched('counters', staffNumberCounters.map((c) => ({
       id: idStr(c._id), seq: c.seq ?? 0,
+    })));
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Phase 2 — payroll: concepts, compensations, cycles, results (+ its five
+    // line-item child tables + exceptions), payslips, welfare schemes.
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── payroll_concepts ──────────────────────────────────────────────────
+    const concepts = await dbo.collection('payroll_concepts').find({}).toArray();
+    counts.payroll_concepts = await upsertBatched('payroll_concepts', concepts.map((c) => ({
+      id: idStr(c._id), name: c.name, code: c.code ?? null, category: c.category, subCategory: c.subCategory,
+      type: c.type, defaultAmount: c.defaultAmount ?? null, currency: c.currency ?? 'KES',
+      percentageOf: c.percentageOf ?? null, percentageValue: c.percentageValue ?? null, formula: c.formula ?? null,
+      brackets: c.brackets ? JSON.stringify(c.brackets) : null, loanType: c.loanType ?? null,
+      cap: c.cap ?? null, flatCredit: c.flatCredit ?? null,
+      deductConceptCodesFromBase: c.deductConceptCodesFromBase || [],
+      // isTaxable: `!== false`, not `?? false` — matches resolveConceptPayItems.js's own
+      // read semantics, where an absent field (real data: the BASIC concept has none)
+      // means taxable. See the migration file's matching comment on the column default.
+      statutoryKey: c.statutoryKey ?? null, isActive: c.isActive ?? true, isTaxable: c.isTaxable !== false,
+      isRecurring: c.isRecurring ?? false, appearsOnPayslip: c.appearsOnPayslip ?? true, alertIfUndefined: c.alertIfUndefined ?? false,
+      createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    // ── payroll_cycles ─────────────────────────────────────────────────────
+    const cycles = await dbo.collection('payroll_cycles').find({}).toArray();
+    counts.payroll_cycles = await upsertBatched('payroll_cycles', cycles.map((c) => ({
+      id: idStr(c._id), name: c.name,
+      periodMonth: c.period?.month ?? null, periodYear: c.period?.year ?? null,
+      periodStartDate: toDate(c.period?.startDate), periodEndDate: toDate(c.period?.endDate),
+      payDate: toDate(c.payDate), status: c.status, payGroup: c.payGroup ?? 'all', payFrequency: c.payFrequency ?? null,
+      runType: c.runType ?? 'regular', offCycleReason: c.offCycleReason ?? null,
+      targetEmployeeIds: c.targetEmployeeIds?.length ? c.targetEmployeeIds.map((id) => idStr(id)) : null,
+      departmentId: idStr(c.departmentId), jobGroupId: idStr(c.jobGroupId), employmentType: c.employmentType ?? null,
+      currency: c.currency ?? 'KES', totalGross: c.totalGross ?? 0, totalDeductions: c.totalDeductions ?? 0,
+      totalNet: c.totalNet ?? 0, totalEmployerCost: c.totalEmployerCost ?? 0, employeeCount: c.employeeCount ?? 0,
+      hasExceptions: c.hasExceptions ?? false, exceptionCount: c.exceptionCount ?? 0,
+      excludedEmployees: c.excludedEmployees ? JSON.stringify(c.excludedEmployees) : null,
+      isLocking: false, isClosing: false, // in-flight claim flags never survive into a copy
+      lockedAt: toDate(c.lockedAt), lockedBy: idStr(c.lockedBy), closedAt: toDate(c.closedAt), closedBy: idStr(c.closedBy),
+      createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    // ── employee_compensations ────────────────────────────────────────────
+    const compensations = await dbo.collection('employee_compensations').find({}).toArray();
+    counts.employee_compensations = await upsertBatched('employee_compensations', compensations.map((c) => ({
+      id: idStr(c._id), employeeId: idStr(c.employeeId), conceptId: idStr(c.conceptId),
+      conceptName: c.conceptName ?? null, conceptCode: c.conceptCode ?? null, category: c.category ?? null, subCategory: c.subCategory ?? null,
+      amount: c.amount ?? 0, currency: c.currency ?? 'KES', effectiveFrom: toDate(c.effectiveFrom), effectiveTo: toDate(c.effectiveTo),
+      cycleId: idStr(c.cycleId), scope: c.scope ?? 'individual', appliesTo: c.appliesTo ? JSON.stringify(c.appliesTo) : null,
+      isActive: c.isActive ?? true, addedBy: idStr(c.addedBy), notes: c.notes ?? null,
+      principal: c.principal ?? null, openingBalance: c.openingBalance ?? null, balanceRemaining: c.balanceRemaining ?? null,
+      totalRepaid: c.totalRepaid ?? null, loanStatus: c.loanStatus ?? null,
+      createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    // ── payroll_results (+ its five line-item child tables + exceptions) ──
+    const results = await dbo.collection('payroll_results').find({}).toArray();
+    counts.payroll_results = await upsertBatched('payroll_results', results.map((r) => ({
+      id: idStr(r._id), cycleId: idStr(r.cycleId), employeeId: idStr(r.employeeId),
+      grossPay: r.grossPay ?? null, totalDeductions: r.totalDeductions ?? null, netPay: r.netPay ?? null,
+      totalEmployerCost: r.totalEmployerCost ?? null, isProRata: r.isProRata ?? null, proRataReason: r.proRataReason ?? null,
+      proRataDays: r.proRataDays ?? null, workingDaysInCycle: r.workingDaysInCycle ?? null,
+      overtimeHours: r.overtimeHours ?? null, overtimeAmount: r.overtimeAmount ?? null,
+      expenseReimbursements: r.expenseReimbursements ?? null, leaveDeductionTotal: r.leaveDeductionTotal ?? null,
+      statutoryPaye: r.statutoryDeductions?.paye ?? null, statutoryNssf: r.statutoryDeductions?.nssf ?? null,
+      statutorySha: r.statutoryDeductions?.sha ?? null, statutoryAhl: r.statutoryDeductions?.ahl ?? null,
+      statutoryTotal: r.statutoryDeductions?.total ?? null,
+      statutoryLabels: r.statutoryDeductions?.labels ? JSON.stringify(r.statutoryDeductions.labels) : null,
+      hasException: r.hasException ?? false, engine: r.engine ?? 'concepts', status: r.status ?? 'pending',
+      approvedBy: idStr(r.approvedBy), approvedAt: toDate(r.approvedAt),
+      payslipUrl: r.payslipUrl ?? null, payslipSentAt: toDate(r.payslipSentAt),
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // Child line-item tables use an auto-increment id (plain array elements in Mongo) —
+    // delete-then-insert per result, same convention as Phase 1's employee_skills.
+    const lineItemRows = (field) => results.flatMap((r) => (r[field] || []).map((item, position) => ({ resultId: idStr(r._id), position, ...item })));
+
+    if (!DRY_RUN) {
+      for (const r of results) {
+        await knex('payroll_result_earnings').where({ resultId: idStr(r._id) }).del();
+        await knex('payroll_result_deductions').where({ resultId: idStr(r._id) }).del();
+        await knex('payroll_result_benefits').where({ resultId: idStr(r._id) }).del();
+        await knex('payroll_result_employer_contributions').where({ resultId: idStr(r._id) }).del();
+        await knex('payroll_result_leave').where({ resultId: idStr(r._id) }).del();
+        await knex('payroll_result_exceptions').where({ resultId: idStr(r._id) }).del();
+      }
+    }
+
+    counts.payroll_result_earnings = await upsertBatched('payroll_result_earnings', lineItemRows('earnings').map((e) => ({
+      resultId: e.resultId, position: e.position, conceptId: idStr(e.conceptId), conceptName: e.conceptName ?? null,
+      conceptCode: e.conceptCode ?? null, subCategory: e.subCategory ?? null, amount: e.amount ?? 0,
+      source: e.source ?? null, isTaxable: e.isTaxable ?? null,
+    })), null);
+
+    counts.payroll_result_deductions = await upsertBatched('payroll_result_deductions', lineItemRows('deductions').map((d) => ({
+      resultId: d.resultId, position: d.position, conceptId: idStr(d.conceptId), conceptName: d.conceptName ?? null,
+      conceptCode: d.conceptCode ?? null, subCategory: d.subCategory ?? null, amount: d.amount ?? 0, source: d.source ?? null,
+      loanAssignmentId: idStr(d.loanAssignmentId), balanceAfter: d.balanceAfter ?? null,
+    })), null);
+
+    counts.payroll_result_benefits = await upsertBatched('payroll_result_benefits', lineItemRows('benefits').map((b) => ({
+      resultId: b.resultId, position: b.position, conceptId: idStr(b.conceptId), conceptName: b.conceptName ?? null, amount: b.amount ?? 0,
+    })), null);
+
+    counts.payroll_result_employer_contributions = await upsertBatched('payroll_result_employer_contributions', lineItemRows('employerContributions').map((e) => ({
+      resultId: e.resultId, position: e.position, conceptId: idStr(e.conceptId), conceptName: e.conceptName ?? null, amount: e.amount ?? 0,
+    })), null);
+
+    counts.payroll_result_leave = await upsertBatched('payroll_result_leave', lineItemRows('leave').map((l) => ({
+      resultId: l.resultId, position: l.position, leaveType: l.leaveType ?? null,
+      startDate: l.startDate ?? null, endDate: l.endDate ?? null, days: l.days ?? null, amount: l.amount ?? 0,
+    })), null);
+
+    counts.payroll_result_exceptions = await upsertBatched('payroll_result_exceptions', lineItemRows('exceptions').map((e) => ({
+      resultId: e.resultId, position: e.position, type: e.type ?? null, message: e.message ?? null, severity: e.severity ?? null,
+    })), null);
+
+    // ── payslips (base64 pdfData → a real file on disk + pdfPath, per the plan) ──
+    const payslips = await dbo.collection('payslips').find({}).toArray();
+    const uploadDir = process.env.UPLOAD_DIR || 'uploads';
+    if (!DRY_RUN && payslips.some((p) => p.pdfData) && !fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+    counts.payslips = await upsertBatched('payslips', payslips.map((p) => {
+      let pdfPath = null;
+      if (p.pdfData) {
+        pdfPath = path.join(uploadDir, `payslip-${idStr(p._id)}.pdf`);
+        if (!DRY_RUN && !fs.existsSync(pdfPath)) fs.writeFileSync(pdfPath, Buffer.from(p.pdfData, 'base64'));
+      }
+      return {
+        id: idStr(p._id), employeeId: idStr(p.employeeId), cycleId: idStr(p.cycleId), resultId: idStr(p.resultId),
+        periodMonth: p.period?.month ?? null, periodYear: p.period?.year ?? null,
+        grossPay: p.grossPay ?? null, netPay: p.netPay ?? null, status: p.status ?? 'paid', pdfPath,
+        generatedAt: toDate(p.generatedAt), createdAt: toDate(p.createdAt),
+      };
+    }));
+
+    // ── welfare_schemes ────────────────────────────────────────────────────
+    const welfareSchemes = await dbo.collection('welfare_schemes').find({}).toArray();
+    counts.welfare_schemes = await upsertBatched('welfare_schemes', welfareSchemes.map((s) => ({
+      id: idStr(s._id), name: s.name, description: s.description ?? null, conceptId: idStr(s.conceptId),
+      contributionAmount: s.contributionAmount ?? null, contributionType: s.contributionType ?? null,
+      percentageOf: s.percentageOf ?? null, isActive: s.isActive ?? true,
+      createdBy: idStr(s.createdBy), createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
     })));
 
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');

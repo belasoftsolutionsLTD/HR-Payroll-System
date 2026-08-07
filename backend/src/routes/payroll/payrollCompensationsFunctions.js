@@ -1,14 +1,16 @@
-const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 2) —
+// employee_compensations, payroll_concepts, employees, users, compensation_audit_logs all
+// now live in Postgres.
+const { findOne, findMany, insertOne, updateOne, countDocuments, knex } = require('../../functions/Database/pgDBFunctions');
 const { VALID_EMPLOYMENT_TYPES } = require('../../lib/payroll/conceptTargeting');
 
 // Immutable log of every change to an employee's compensation — amount, effective dates,
 // active/inactive (added/removed), viewable by HR on the employee's payroll profile.
 const logCompensationChange = (employeeId, compensationId, conceptName, action, changes, userId) =>
   insertOne('compensation_audit_logs', {
-    employeeId, compensationId, conceptName, action, changes,
+    employeeId, compensationId, conceptName, action, changes: JSON.stringify(changes),
     performedBy: userId ?? null,
     performedAt: new Date(),
   }).catch(() => {});
@@ -16,23 +18,25 @@ const logCompensationChange = (employeeId, compensationId, conceptName, action, 
 // List compensations for one employee
 const getEmployeeCompensations = async (req, res) => {
   const { employeeId } = req.params;
-  const filter = { employeeId: new ObjectId(employeeId), isActive: true };
-  const data = await findMany('employee_compensations', filter, { sort: { category: 1, createdAt: 1 } });
+  const data = await findMany('employee_compensations', { employeeId, isActive: true },
+    { orderBy: [{ column: 'category' }, { column: 'createdAt' }] });
   // Enrich with concept details
   const enriched = await Promise.all(data.map(async comp => {
-    const concept = await findOne('payroll_concepts', { _id: comp.conceptId }, { projection: { name: 1, code: 1, category: 1, subCategory: 1, type: 1, currency: 1 } });
-    return { ...comp, concept: concept ?? null };
+    const concept = await findOne('payroll_concepts', { id: comp.conceptId });
+    const conceptSlim = concept ? { name: concept.name, code: concept.code, category: concept.category, subCategory: concept.subCategory, type: concept.type, currency: concept.currency } : null;
+    return { ...comp, concept: conceptSlim };
   }));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
 // All employees with compensation summary (for the employees tab)
 const listEmployeeCompensationSummaries = async (req, res) => {
-  const employees = await findMany('employees', { status: 'active' }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 }, sort: { fullName: 1 } });
+  const employees = await knex('employees').where({ status: 'active' })
+    .select('id', 'fullName', 'staffNumber', 'department', 'designation').orderBy('fullName', 'asc');
   const summaries = await Promise.all(employees.map(async emp => {
-    const comps = await findMany('employee_compensations', { employeeId: emp._id, isActive: true }, {});
-    const totalEarnings     = comps.filter(c => c.category === 'earnings').reduce((s, c) => s + (c.amount || 0), 0);
-    const totalDeductions   = comps.filter(c => c.category === 'deductions').reduce((s, c) => s + (c.amount || 0), 0);
+    const comps = await findMany('employee_compensations', { employeeId: emp.id, isActive: true });
+    const totalEarnings     = comps.filter(c => c.category === 'earnings').reduce((s, c) => s + Number(c.amount || 0), 0);
+    const totalDeductions   = comps.filter(c => c.category === 'deductions').reduce((s, c) => s + Number(c.amount || 0), 0);
     const basicComp         = comps.find(c => c.conceptCode === 'BASIC' || c.subCategory === 'fixed_pay');
     return {
       ...emp,
@@ -53,15 +57,15 @@ const addCompensation = async (req, res) => {
   const { employeeId, conceptId, amount, currency, effectiveFrom, effectiveTo, cycleId, notes } = req.body;
 
   const [emp, concept] = await Promise.all([
-    findOne('employees',         { _id: new ObjectId(employeeId) }, { projection: { fullName: 1 } }),
-    findOne('payroll_concepts',  { _id: new ObjectId(conceptId)  }, { projection: { name: 1, code: 1, category: 1, subCategory: 1 } }),
+    findOne('employees', { id: employeeId }),
+    findOne('payroll_concepts', { id: conceptId }),
   ]);
   if (!emp)     return returnFunction(res, 404, false, 'Employee not found.');
   if (!concept) return returnFunction(res, 404, false, 'Concept not found.');
 
   const doc = {
-    employeeId:   new ObjectId(employeeId),
-    conceptId:    new ObjectId(conceptId),
+    employeeId,
+    conceptId,
     conceptName:  concept.name,
     conceptCode:  concept.code,
     category:     concept.category,
@@ -70,17 +74,17 @@ const addCompensation = async (req, res) => {
     currency:     currency || 'KES',
     effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : new Date(),
     effectiveTo:   effectiveTo   ? new Date(effectiveTo)   : null,
-    cycleId:       cycleId       ? new ObjectId(cycleId)   : null,
+    cycleId:       cycleId       || null,
     isActive:      true,
-    addedBy:       req.user?._id ?? null,
+    addedBy:       req.user?.id ?? null,
     notes:         notes || null,
     createdAt:     new Date(),
     updatedAt:     new Date(),
   };
   const result = await insertOne('employee_compensations', doc);
-  logCompensationChange(doc.employeeId, result.insertedId, doc.conceptName, 'added',
-    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  logCompensationChange(doc.employeeId, result.id, doc.conceptName, 'added',
+    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?.id);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 // Assign a concept to one employee, several employees, or a whole department/job-group/
@@ -93,7 +97,7 @@ const assignConcept = async (req, res) => {
   if (!validateRequiredFields(req, res, ['conceptId', 'target'])) return;
   const { conceptId, target, amount, currency, effectiveFrom, effectiveTo, notes, principal, openingBalance } = req.body;
 
-  const concept = await findOne('payroll_concepts', { _id: new ObjectId(conceptId) }, { projection: { name: 1, code: 1, category: 1, subCategory: 1 } });
+  const concept = await findOne('payroll_concepts', { id: conceptId });
   if (!concept) return returnFunction(res, 404, false, 'Concept not found.');
 
   const targetType = target?.type;
@@ -110,13 +114,13 @@ const assignConcept = async (req, res) => {
 
   const now = new Date();
   const baseFields = {
-    conceptId: concept._id, conceptName: concept.name, conceptCode: concept.code,
+    conceptId: concept.id, conceptName: concept.name, conceptCode: concept.code,
     category: concept.category, subCategory: concept.subCategory,
     currency: currency || 'KES',
     effectiveFrom: effectiveFrom ? new Date(effectiveFrom) : now,
     effectiveTo: effectiveTo ? new Date(effectiveTo) : null,
     cycleId: null, isActive: true,
-    addedBy: req.user?._id ?? null,
+    addedBy: req.user?.id ?? null,
     notes: notes || null,
     createdAt: now, updatedAt: now,
   };
@@ -129,7 +133,7 @@ const assignConcept = async (req, res) => {
       return returnFunction(res, 400, false, 'Select at least one employee.');
     }
 
-    const employees = await findMany('employees', { _id: { $in: employeeIds.map((id) => new ObjectId(id)) } }, { projection: { fullName: 1 } });
+    const employees = await knex('employees').whereIn('id', employeeIds).select('id');
     if (employees.length !== employeeIds.length) {
       return returnFunction(res, 404, false, 'One or more employees were not found.');
     }
@@ -139,7 +143,7 @@ const assignConcept = async (req, res) => {
       const doc = {
         ...baseFields,
         scope: 'individual',
-        employeeId: new ObjectId(empId),
+        employeeId: empId,
         amount: Number(amount) || 0,
       };
       if (hasPrincipal) {
@@ -153,9 +157,9 @@ const assignConcept = async (req, res) => {
         doc.loanStatus = 'active';
       }
       const result = await insertOne('employee_compensations', doc);
-      insertedIds.push(result.insertedId);
-      logCompensationChange(doc.employeeId, result.insertedId, doc.conceptName, 'added',
-        [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
+      insertedIds.push(result.id);
+      logCompensationChange(doc.employeeId, result.id, doc.conceptName, 'added',
+        [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?.id);
     }
     return returnFunction(res, 201, true, req.locale.createdSuccessfully, { insertedIds });
   }
@@ -182,7 +186,7 @@ const assignConcept = async (req, res) => {
     if (!Array.isArray(target.jobGroupIds) || target.jobGroupIds.length === 0) {
       return returnFunction(res, 400, false, 'Select at least one job group.');
     }
-    appliesTo = { type: 'jobGroup', jobGroupIds: target.jobGroupIds.map((id) => new ObjectId(id)) };
+    appliesTo = { type: 'jobGroup', jobGroupIds: target.jobGroupIds };
   } else {
     const employmentTypes = Array.isArray(target.employmentTypes)
       ? target.employmentTypes.filter((t) => VALID_EMPLOYMENT_TYPES.includes(t))
@@ -198,19 +202,19 @@ const assignConcept = async (req, res) => {
     ...baseFields,
     scope: 'group',
     employeeId: null,
-    appliesTo,
+    appliesTo: JSON.stringify(appliesTo),
     amount: Number(amount) || 0,
   };
   const result = await insertOne('employee_compensations', doc);
-  logCompensationChange(null, result.insertedId, doc.conceptName, 'added',
-    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?._id);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  logCompensationChange(null, result.id, doc.conceptName, 'added',
+    [{ field: 'amount', oldValue: null, newValue: doc.amount }], req.user?.id);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 // Update compensation item
 const updateCompensation = async (req, res) => {
   const { id } = req.params;
-  const existing = await findOne('employee_compensations', { _id: new ObjectId(id) });
+  const existing = await findOne('employee_compensations', { id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   const { amount, currency, effectiveFrom, effectiveTo, notes, isActive } = req.body;
   const update = { updatedAt: new Date() };
@@ -226,30 +230,30 @@ const updateCompensation = async (req, res) => {
     .map((field) => ({ field, oldValue: existing[field] ?? null, newValue: update[field] }))
     .filter((c) => String(c.oldValue) !== String(c.newValue));
 
-  await updateOne('employee_compensations', { _id: new ObjectId(id) }, { $set: update });
+  await updateOne('employee_compensations', { id }, update);
   if (changes.length) {
-    logCompensationChange(existing.employeeId, existing._id, existing.conceptName, 'updated', changes, req.user?._id);
+    logCompensationChange(existing.employeeId, existing.id, existing.conceptName, 'updated', changes, req.user?.id);
   }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 // Remove compensation item
 const removeCompensation = async (req, res) => {
-  const existing = await findOne('employee_compensations', { _id: new ObjectId(req.params.id) });
+  const existing = await findOne('employee_compensations', { id: req.params.id });
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
-  await updateOne('employee_compensations', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
-  logCompensationChange(existing.employeeId, existing._id, existing.conceptName, 'removed',
-    [{ field: 'isActive', oldValue: true, newValue: false }], req.user?._id);
+  await updateOne('employee_compensations', { id: req.params.id }, { isActive: false, updatedAt: new Date() });
+  logCompensationChange(existing.employeeId, existing.id, existing.conceptName, 'removed',
+    [{ field: 'isActive', oldValue: true, newValue: false }], req.user?.id);
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 // Audit log for one employee's compensation history — viewable by HR on the employee's payroll profile
 const getCompensationAuditLog = async (req, res) => {
-  const logs = await findMany('compensation_audit_logs', { employeeId: new ObjectId(req.params.employeeId) }, { sort: { performedAt: -1 } });
-  const userIds = [...new Set(logs.filter((l) => l.performedBy).map((l) => String(l.performedBy)))].map((id) => new ObjectId(id));
-  const users = userIds.length ? await findMany('users', { _id: { $in: userIds } }, { projection: { name: 1 } }) : [];
-  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u.name]));
-  const enriched = logs.map((l) => ({ ...l, performedByName: l.performedBy ? (userMap[String(l.performedBy)] || 'Unknown') : 'System' }));
+  const logs = await findMany('compensation_audit_logs', { employeeId: req.params.employeeId }, { orderBy: { column: 'performedAt', order: 'desc' } });
+  const userIds = [...new Set(logs.filter((l) => l.performedBy).map((l) => l.performedBy))];
+  const users = userIds.length ? await knex('users').whereIn('id', userIds).select('id', 'name') : [];
+  const userMap = Object.fromEntries(users.map((u) => [u.id, u.name]));
+  const enriched = logs.map((l) => ({ ...l, performedByName: l.performedBy ? (userMap[l.performedBy] || 'Unknown') : 'System' }));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
