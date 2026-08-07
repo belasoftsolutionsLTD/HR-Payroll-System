@@ -4,12 +4,12 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
-// employees/users/job_history/staff_notes (Phase 1) and attendance_records (Phase 3b)
-// now live in Postgres; everything else this file touches (appraisal_records/goals/
-// reviews, employee_awards, scheduled_events, project_members/projects/
-// project_time_entries, tasks, jobRequisitions/candidates/applications) is unmigrated
-// and stays on the Mongo helpers via commonDBFunctions/global.dbo, imported separately
-// below.
+// employees/users/job_history/staff_notes (Phase 1), attendance_records (Phase 3b),
+// and job_requisitions/candidates/applications (Phase 4) now live in Postgres;
+// everything else this file touches (appraisal_records/goals/reviews, employee_awards,
+// scheduled_events, project_members/projects/project_time_entries, tasks) is
+// unmigrated and stays on the Mongo helpers via commonDBFunctions/global.dbo,
+// imported separately below.
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -440,19 +440,17 @@ const getMyTasks = async (req, res) => {
 };
 
 // ── Internal job board ─────────────────────────────────────────────────────────
-// Backed by the recruitment module's jobRequisitions/candidates/applications collections
-// (see backend/src/routes/recruitment/recruitmentFunctions.js) rather than the legacy
-// job_positions/applicants collections. Unmigrated (Phase 3) — stays Mongo; only the
-// employee lookup itself is Postgres.
-// A requisition with a past applicationDeadline is closed immediately, even before the
-// daily closeExpiredRequisitions cron has flipped its status field — same real-time
-// guarantee as the public careers-site routes (publicRoutes.js). Must be a function, not
-// a static object — a plain object literal would capture `new Date()` once at server
-// startup and never advance.
-const notExpired = () => ({ $or: [{ applicationDeadline: null }, { applicationDeadline: { $gte: new Date() } }] });
+// Backed by the recruitment module's job_requisitions/candidates/applications tables
+// (see backend/src/routes/recruitment/recruitmentFunctions.js) — all Postgres since
+// Phase 4. A requisition with a past applicationDeadline is closed immediately, even
+// before the daily closeExpiredRequisitions cron has flipped its status field — same
+// real-time guarantee as the public careers-site routes (publicRoutes.js). Applied
+// inline per-query (a knex query builder only evaluates `new Date()` when the query
+// actually runs, unlike a plain object literal captured once).
+const notExpired = (query) => query.andWhere((qb) => qb.whereNull('applicationDeadline').orWhere('applicationDeadline', '>=', new Date()));
 
 const getOpenPositions = async (req, res) => {
-  const positions = await findMany('jobRequisitions', { status: 'open', ...notExpired() }, { sort: { createdAt: -1 } });
+  const positions = await notExpired(pgDB.knex('job_requisitions').where({ status: 'open' })).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, 'OK', positions);
 };
 
@@ -462,15 +460,16 @@ const applyInternal = async (req, res) => {
   const employee = await pgDB.findOne('employees', { id: empId });
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.positionId), status: 'open', ...notExpired() });
+  const requisition = await notExpired(pgDB.knex('job_requisitions').where({ id: req.params.positionId, status: 'open' })).first();
   if (!requisition) return returnFunction(res, 404, false, 'Position not found or no longer open.');
   if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'This position is not currently accepting applications.');
 
   const email = employee.email.toLowerCase().trim();
-  let candidate = await findOne('candidates', { email });
+  let candidate = await pgDB.findOne('candidates', { email });
   if (!candidate) {
     const [firstName, ...rest] = (employee.fullName || '').split(' ');
     const candDoc = {
+      id: pgDB.newId(),
       firstName: firstName || employee.fullName || 'Employee',
       lastName: rest.join(' '),
       email,
@@ -488,28 +487,27 @@ const applyInternal = async (req, res) => {
       createdAt: new Date(),
       updatedAt: new Date(),
     };
-    const candResult = await insertOne('candidates', candDoc);
-    candidate = { _id: candResult.insertedId, ...candDoc };
+    candidate = await pgDB.insertOne('candidates', candDoc);
   }
 
-  const priorApplicationCount = await countDocuments('applications', { candidateId: candidate._id, requisitionId: requisition._id });
-  if (priorApplicationCount >= MAX_APPLICATIONS_PER_REQUISITION) {
+  const [{ count: priorApplicationCount }] = await pgDB.knex('applications').where({ candidateId: candidate.id, requisitionId: requisition.id }).count('* as count');
+  if (Number(priorApplicationCount) >= MAX_APPLICATIONS_PER_REQUISITION) {
     return returnFunction(res, 409, false, `You have already applied for this position the maximum number of times (${MAX_APPLICATIONS_PER_REQUISITION}).`);
   }
 
   const firstStage = requisition.pipelineStages[0];
   const now = new Date();
-  const result = await insertOne('applications', {
-    candidateId: candidate._id,
-    requisitionId: requisition._id,
+  const result = await pgDB.insertOne('applications', {
+    id: pgDB.newId(),
+    candidateId: candidate.id,
+    requisitionId: requisition.id,
     currentStageId: firstStage.id,
-    stageHistory: [{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: new ObjectId(req.user.id) }],
+    stageHistory: JSON.stringify([{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: req.user.id }]),
     status: 'active',
     rejectionReason: null,
     offerDetails: null,
     coverLetter: null,
-    answers: [],
-    scorecards: [],
+    answers: JSON.stringify([]),
     overallScore: null,
     createdAt: now,
     updatedAt: now,
@@ -533,7 +531,7 @@ const applyInternal = async (req, res) => {
     type: 'recruitment', subType: 'new_application',
     title: 'New Internal Application Received',
     subtitle: `${employee.fullName} applied for ${requisition.title}.`,
-    referenceId: result.insertedId, referenceModel: 'applications',
+    referenceId: new ObjectId(result.id), referenceModel: 'applications',
     requiresAction: true, triggeredBy: req.user._id,
   }).catch(() => {});
   {
@@ -560,18 +558,18 @@ const getMyApplications = async (req, res) => {
   const employee = await pgDB.findOne('employees', { id: empId });
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
-  const candidate = await findOne('candidates', { email: employee.email.toLowerCase().trim() });
+  const candidate = await pgDB.findOne('candidates', { email: employee.email.toLowerCase().trim() });
   if (!candidate) return returnFunction(res, 200, true, 'OK', []);
 
-  const applications = await findMany('applications', { candidateId: candidate._id }, { sort: { createdAt: -1 } });
-  const requisitionIds = [...new Set(applications.map((a) => String(a.requisitionId)))].map((id) => new ObjectId(id));
+  const applications = await pgDB.knex('applications').where({ candidateId: candidate.id }).orderBy('createdAt', 'desc');
+  const requisitionIds = [...new Set(applications.map((a) => a.requisitionId))];
   const requisitions = requisitionIds.length
-    ? await findMany('jobRequisitions', { _id: { $in: requisitionIds } }, { projection: { title: 1, department: 1, pipelineStages: 1 } })
+    ? await pgDB.knex('job_requisitions').whereIn('id', requisitionIds).select('id', 'title', 'department', 'pipelineStages')
     : [];
-  const reqMap = Object.fromEntries(requisitions.map((r) => [String(r._id), r]));
+  const reqMap = Object.fromEntries(requisitions.map((r) => [r.id, r]));
 
   const enriched = applications.map((a) => {
-    const requisition = reqMap[String(a.requisitionId)];
+    const requisition = reqMap[a.requisitionId];
     const stage = requisition?.pipelineStages?.find((s) => s.id === a.currentStageId);
     return {
       ...a,

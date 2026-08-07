@@ -8,9 +8,10 @@ const { runDueScheduledReports } = require('../../routes/reports/reportFunctions
 const { getLowStockLevels } = require('../../routes/inventory/inventoryLocationsFunctions');
 const { updateOne, findOne, findMany } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
-// employees/users (Phase 1) and leave_requests/leave_types (Phase 3a) now live in
-// Postgres; attendance_records/shifts/work_schedules/offboarding_records stay on the
-// Mongo helpers above until their own phase.
+// employees/users (Phase 1), leave_requests/leave_types (Phase 3a),
+// attendance_records/shifts/work_schedules (Phase 3b), and job_requisitions/
+// offboarding_records (Phase 4) now live in Postgres; everything else this file
+// touches stays on the Mongo helpers above until its own phase.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -229,14 +230,13 @@ async function resetOnLeaveStatus() {
 // flipping early would silently drop someone still working out their notice
 // period from payroll/attendance. "In offboarding" during the notice period is
 // tracked purely via the offboardingRecord's own status, not employees.status.
+// offboarding_records now lives in Postgres (Phase 4).
 async function flipOffboardingEmployeeStatus() {
-  if (!global.dbo) return;
   const now = new Date();
 
-  const dueRecords = await global.dbo.collection('offboarding_records').find({
-    status: { $ne: 'completed' },
-    lastWorkingDay: { $lte: now },
-  }, { projection: { employeeId: 1 } }).toArray();
+  const dueRecords = await pgDB.knex('offboarding_records')
+    .whereNot({ status: 'completed' }).where('lastWorkingDay', '<=', now)
+    .select('employeeId');
 
   if (!dueRecords.length) return;
   const empIds = dueRecords.map(r => String(r.employeeId));
@@ -488,14 +488,13 @@ async function checkOverdueTraining() {
 // internal application routes already reject expired-but-still-open requisitions
 // in real time (see the notExpired() filter in publicRoutes.js / meFunctions.js) —
 // this is what makes that reflected in HR's own requisition list/status field too.
+// job_requisitions now lives in Postgres (Phase 4).
 async function closeExpiredRequisitions() {
-  if (!global.dbo) return;
-  const result = await global.dbo.collection('jobRequisitions').updateMany(
-    { status: 'open', applicationDeadline: { $ne: null, $lt: new Date() } },
-    { $set: { status: 'closed', updatedAt: new Date() } }
-  );
-  if (result.modifiedCount > 0) {
-    console.log(`[CRON] Auto-closed ${result.modifiedCount} requisition(s) past their application deadline`);
+  const modifiedCount = await pgDB.knex('job_requisitions')
+    .where({ status: 'open' }).whereNotNull('applicationDeadline').where('applicationDeadline', '<', new Date())
+    .update({ status: 'closed', updatedAt: new Date() });
+  if (modifiedCount > 0) {
+    console.log(`[CRON] Auto-closed ${modifiedCount} requisition(s) past their application deadline`);
   }
 }
 

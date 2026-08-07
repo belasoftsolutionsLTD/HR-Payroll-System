@@ -1,5 +1,10 @@
-const { ObjectId } = require('mongodb');
-const { findOne, findMany, insertOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — offboarding_templates, offboarding_records (+ its child tables),
+// employees, users all now live in Postgres. This file was still on the Mongo
+// helpers for employees/users even after Phase 1 migrated them — a gap that went
+// unnoticed until now (see the migration progress memory's "check shared low-level
+// utilities every phase" lesson) since offboarding itself wasn't touched until now.
+const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyUser, notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyManager } = require('../../routes/inbox/inboxFunctions');
 const { sendEmail } = require('../../services/emailService');
@@ -29,81 +34,86 @@ const notifyStakeholder = async (assignedTo, employeeId, payload) => {
   }
   const department = STAKEHOLDER_DEPARTMENTS[assignedTo];
   if (!department) return;
-  const deptEmployees = await findMany('employees', { department }, { projection: { _id: 1 } });
+  const deptEmployees = await pgDB.knex('employees').where({ department }).select('id');
   if (!deptEmployees.length) return;
-  const deptUsers = await findMany('users', { employeeId: { $in: deptEmployees.map(e => e._id) } }, { projection: { _id: 1 } });
-  await Promise.all(deptUsers.map(u => notifyUser(u._id, payload)));
+  const deptUsers = await pgDB.knex('users').whereIn('employeeId', deptEmployees.map(e => e.id)).select('id');
+  await Promise.all(deptUsers.map(u => notifyUser(u.id, payload)));
 };
 
 const initiateOffboarding = async (employeeId, templateId, lastWorkingDay, exitType, exitReason, createdBy) => {
-  const template = await findOne('offboarding_templates', { _id: new ObjectId(templateId) });
+  const template = await pgDB.findOne('offboarding_templates', { id: String(templateId) });
   if (!template) throw new Error('Offboarding template not found.');
 
-  const employee = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { fullName: 1, email: 1 } });
+  const employee = await pgDB.findOne('employees', { id: String(employeeId) });
   if (!employee) throw new Error('Employee not found.');
 
   const lastDay = new Date(lastWorkingDay);
   const now = new Date();
 
-  const taskLists = (template.taskLists || []).map(list => ({
-    id: list.id,
-    name: list.name,
-    assignedTo: list.assignedTo,
-    tasks: (list.tasks || []).map(t => {
-      const due = new Date(lastDay);
-      due.setDate(due.getDate() + (Number(t.dueOffsetDays) || 0));
-      return {
-        id: t.id,
-        title: t.title,
-        description: t.description || '',
-        dueDate: due,
-        isRequired: t.isRequired !== false,
-        status: 'pending',
-        completedBy: null,
-        completedAt: null,
-        requiresDocument: !!t.requiresDocument,
-        documentId: null,
-        notes: null,
-        category: t.category || 'general',
-        taskType: t.taskType || null,
-      };
-    }),
-  }));
+  // template.taskLists/assetChecklist/accessRevocationList are JSONB — already
+  // parsed JS values off the row.
+  const templateTaskLists = template.taskLists || [];
+  const templateAssetChecklist = template.assetChecklist || [];
+  const templateAccessRevocationList = template.accessRevocationList || [];
 
-  const assetChecklist = (template.assetChecklist || []).map(a => ({
-    id: a.id, item: a.item, category: a.category,
-    returned: false, returnedAt: null, returnedTo: null, condition: null, notes: null,
-  }));
-
-  const accessRevocationList = (template.accessRevocationList || []).map(a => ({
-    id: a.id, system: a.system, category: a.category,
-    revoked: false, revokedAt: null, revokedBy: null,
-  }));
-
+  const recordId = pgDB.newId();
   const doc = {
-    employeeId: new ObjectId(employeeId),
-    templateId: template._id,
+    id: recordId,
+    employeeId: String(employeeId),
+    templateId: template.id,
     exitType,
     exitReason: exitReason || '',
     lastWorkingDay: lastDay,
     noticePeriodStartDate: now,
     status: 'initiated',
     eligibleForRehire: true,
-    taskLists,
-    assetChecklist,
-    accessRevocationList,
-    exitInterview: {},
-    generatedDocuments: [],
+    exitInterview: JSON.stringify({}),
     finalPayTriggered: false,
     finalPayTriggeredAt: null,
     completedAt: null,
-    initiatedBy: createdBy ? new ObjectId(createdBy) : null,
+    initiatedBy: createdBy ? String(createdBy) : null,
     createdAt: now,
     updatedAt: now,
   };
+  await pgDB.insertOne('offboarding_records', doc);
 
-  const result = await insertOne('offboarding_records', doc);
-  const record = { ...doc, _id: result.insertedId };
+  // taskLists[].tasks[] — real child tables, same template-copied-id collision
+  // reasoning as onboarding (see the migration file's own comment). Insert lists
+  // first to get their real internal ids, then their tasks.
+  const taskListsForNotify = [];
+  for (const list of templateTaskLists) {
+    const [insertedList] = await pgDB.knex('offboarding_task_lists').insert({
+      recordId, listKey: list.id, name: list.name, assignedTo: list.assignedTo,
+    }).returning('id');
+    const newListId = insertedList.id ?? insertedList;
+    const tasks = (list.tasks || []).map(t => {
+      const due = new Date(lastDay);
+      due.setDate(due.getDate() + (Number(t.dueOffsetDays) || 0));
+      return {
+        taskListId: newListId, taskKey: t.id, title: t.title, description: t.description || '',
+        dueDate: due, isRequired: t.isRequired !== false, status: 'pending',
+        completedBy: null, completedAt: null, requiresDocument: !!t.requiresDocument, documentId: null, notes: null,
+        category: t.category || 'general', taskType: t.taskType || null,
+      };
+    });
+    if (tasks.length) await pgDB.knex('offboarding_tasks').insert(tasks);
+    taskListsForNotify.push({ assignedTo: list.assignedTo, name: list.name, taskCount: tasks.length });
+  }
+
+  if (templateAssetChecklist.length) {
+    await pgDB.knex('offboarding_asset_checklist').insert(templateAssetChecklist.map(a => ({
+      recordId, itemKey: a.id, item: a.item, category: a.category,
+      returned: false, returnedAt: null, returnedTo: null, condition: null, notes: null,
+    })));
+  }
+  if (templateAccessRevocationList.length) {
+    await pgDB.knex('offboarding_access_revocation').insert(templateAccessRevocationList.map(a => ({
+      recordId, itemKey: a.id, system: a.system, category: a.category,
+      revoked: false, revokedAt: null, revokedBy: null,
+    })));
+  }
+
+  const record = { ...doc, exitInterview: {}, taskLists: templateTaskLists, assetChecklist: templateAssetChecklist, accessRevocationList: templateAccessRevocationList };
 
   if (employee.email) {
     sendEmail({
@@ -113,10 +123,10 @@ const initiateOffboarding = async (employeeId, templateId, lastWorkingDay, exitT
     }).catch(() => {});
   }
 
-  await Promise.all(taskLists.filter(l => l.tasks.length).map(list =>
+  await Promise.all(taskListsForNotify.filter(l => l.taskCount).map(list =>
     notifyStakeholder(list.assignedTo, employeeId, {
       title: `Offboarding: ${employee.fullName}`,
-      body: `${list.tasks.length} "${list.name}" task${list.tasks.length !== 1 ? 's' : ''} assigned for ${employee.fullName}'s exit (last day ${lastDay.toDateString()}).`,
+      body: `${list.taskCount} "${list.name}" task${list.taskCount !== 1 ? 's' : ''} assigned for ${employee.fullName}'s exit (last day ${lastDay.toDateString()}).`,
       type: 'offboarding',
     }).catch(() => {})
   ));

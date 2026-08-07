@@ -573,6 +573,263 @@ async function main() {
       createdAt: toDate(attendanceSettingsDoc.createdAt), updatedAt: toDate(attendanceSettingsDoc.updatedAt),
     }] : []);
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  PHASE 4 — Recruitment, Onboarding, Offboarding, email_templates
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── Recruitment ──────────────────────────────────────────────────────
+    const jobRequisitions = await dbo.collection('jobRequisitions').find({}).toArray();
+    counts.job_requisitions = await upsertBatched('job_requisitions', jobRequisitions.map((r) => ({
+      id: idStr(r._id), title: r.title ?? null, department: r.department ?? null, location: r.location ?? null,
+      employmentType: r.employmentType ?? null, headcount: r.headcount ?? null,
+      salaryRange: r.salaryRange ? JSON.stringify(r.salaryRange) : null, description: r.description ?? null,
+      applicationDeadline: toDate(r.applicationDeadline), branchId: idStr(r.branchId),
+      competencies: r.competencies ? JSON.stringify(r.competencies) : null,
+      pipelineStages: r.pipelineStages ? JSON.stringify(r.pipelineStages) : null,
+      screeningQuestions: r.screeningQuestions ? JSON.stringify(r.screeningQuestions) : null,
+      approvalChain: r.approvalChain ? JSON.stringify(r.approvalChain) : null,
+      status: r.status ?? null, hiringManagerId: idStr(r.hiringManagerId), createdBy: idStr(r.createdBy),
+      isDemoData: r.isDemoData ?? false,
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    const candidates = await dbo.collection('candidates').find({}).toArray();
+    counts.candidates = await upsertBatched('candidates', candidates.map((c) => ({
+      id: idStr(c._id), firstName: c.firstName ?? null, lastName: c.lastName ?? null, email: c.email ?? null,
+      source: c.source ?? null, tags: c.tags || [], isPassiveTalent: c.isPassiveTalent ?? false,
+      phone: c.phone ?? null, location: c.location ?? null, resumeUrl: c.resumeUrl ?? null,
+      linkedInUrl: c.linkedInUrl ?? null, referredBy: idStr(c.referredBy),
+      consentGivenAt: toDate(c.consentGivenAt), consentVersion: c.consentVersion ?? null, notes: c.notes ?? null,
+      isDemoData: c.isDemoData ?? false,
+      createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    // candidates/job_requisitions must exist before applications (FK) — already
+    // written above in this same run.
+    const applications = await dbo.collection('applications').find({}).toArray();
+    counts.applications = await upsertBatched('applications', applications.map((a) => ({
+      id: idStr(a._id), candidateId: idStr(a.candidateId), requisitionId: idStr(a.requisitionId),
+      currentStageId: a.currentStageId ?? null, stageHistory: a.stageHistory ? JSON.stringify(a.stageHistory) : null,
+      status: a.status ?? null, rejectionReason: a.rejectionReason ?? null,
+      offerDetails: a.offerDetails ? JSON.stringify(a.offerDetails) : null, coverLetter: a.coverLetter ?? null,
+      answers: a.answers ? JSON.stringify(a.answers) : null, overallScore: a.overallScore ?? null,
+      isDemoData: a.isDemoData ?? false,
+      createdAt: toDate(a.createdAt), updatedAt: toDate(a.updatedAt),
+      // NOTE: a.scorecards (embedded ObjectId array) deliberately dropped — see the
+      // migration file's own comment on why (write-only, never read anywhere).
+    })));
+
+    // application_interview_assignments — auto-increment id, no natural conflict key,
+    // so delete-then-insert per application (same idiom as employee_skills/
+    // attendance_breaks in earlier phases).
+    if (!DRY_RUN) await knex('application_interview_assignments').del();
+    const interviewAssignmentRows = applications.flatMap((a) =>
+      (a.interviewAssignments || []).map((ia) => ({
+        applicationId: idStr(a._id), stageId: ia.stageId ?? null, interviewerId: idStr(ia.interviewerId),
+        interviewerName: ia.interviewerName ?? null, scheduledAt: toDate(ia.scheduledAt),
+        meetingLink: ia.meetingLink ?? null, location: ia.location ?? null,
+        requiredDocuments: ia.requiredDocuments ?? null, assignedAt: toDate(ia.assignedAt),
+      }))
+    );
+    counts.application_interview_assignments = await upsertBatched('application_interview_assignments', interviewAssignmentRows, null);
+
+    const scorecards = await dbo.collection('scorecards').find({}).toArray();
+    counts.scorecards = await upsertBatched('scorecards', scorecards.map((s) => ({
+      id: idStr(s._id), applicationId: idStr(s.applicationId), requisitionId: idStr(s.requisitionId),
+      stageId: s.stageId ?? null, interviewerId: idStr(s.interviewerId), interviewerName: s.interviewerName ?? null,
+      competencyRatings: s.competencyRatings ? JSON.stringify(s.competencyRatings) : null,
+      overallRecommendation: s.overallRecommendation ?? null, strengths: s.strengths ?? null, concerns: s.concerns ?? null,
+      submittedAt: toDate(s.submittedAt),
+    })));
+
+    const interviewKits = await dbo.collection('interviewKits').find({}).toArray();
+    counts.interview_kits = await upsertBatched('interview_kits', interviewKits.map((k) => ({
+      id: idStr(k._id), name: k.name ?? null, competencies: k.competencies ? JSON.stringify(k.competencies) : null,
+      createdBy: idStr(k.createdBy), createdAt: toDate(k.createdAt), updatedAt: toDate(k.updatedAt),
+    })));
+
+    const nurtureCampaigns = await dbo.collection('nurtureCampaigns').find({}).toArray();
+    counts.nurture_campaigns = await upsertBatched('nurture_campaigns', nurtureCampaigns.map((c) => ({
+      id: idStr(c._id), name: c.name ?? null, description: c.description ?? null, targetTags: c.targetTags || [],
+      status: c.status ?? null, createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt),
+    })));
+
+    if (!DRY_RUN) await knex('nurture_campaign_touchpoints').del();
+    const touchpointRows = nurtureCampaigns.flatMap((c) =>
+      (c.touchpoints || []).map((tp) => ({
+        campaignId: idStr(c._id), candidateId: idStr(tp.candidateId), channel: tp.channel ?? null,
+        note: tp.note ?? null, sentAt: toDate(tp.sentAt), byUserId: idStr(tp.byUserId), response: tp.response ?? null,
+      }))
+    );
+    counts.nurture_campaign_touchpoints = await upsertBatched('nurture_campaign_touchpoints', touchpointRows, null);
+
+    const emailTemplates = await dbo.collection('emailTemplates').find({}).toArray();
+    counts.email_templates = await upsertBatched('email_templates', emailTemplates.map((e) => ({
+      id: idStr(e._id), name: e.name ?? null, trigger: e.trigger ?? null, subject: e.subject ?? null,
+      body: e.body ?? null, createdBy: idStr(e.createdBy), updatedBy: idStr(e.updatedBy),
+      createdAt: toDate(e.createdAt), updatedAt: toDate(e.updatedAt),
+    })));
+
+    // ── Onboarding ───────────────────────────────────────────────────────
+    const onboardingTemplates = await dbo.collection('onboarding_templates').find({}).toArray();
+    counts.onboarding_templates = await upsertBatched('onboarding_templates', onboardingTemplates.map((t) => ({
+      id: idStr(t._id), name: t.name ?? null, description: t.description ?? null,
+      targetRoles: t.targetRoles || [], targetDepartments: t.targetDepartments || [],
+      welcomeMessage: t.welcomeMessage ?? null, firstDayDetails: t.firstDayDetails ? JSON.stringify(t.firstDayDetails) : null,
+      taskLists: t.taskLists ? JSON.stringify(t.taskLists) : null, meetTheTeam: t.meetTheTeam ? JSON.stringify(t.meetTheTeam) : null,
+      createdBy: idStr(t.createdBy), createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    const onboardingRecords = await dbo.collection('onboarding_records').find({}).toArray();
+    counts.onboarding_records = await upsertBatched('onboarding_records', onboardingRecords.map((r) => ({
+      id: idStr(r._id), employeeId: idStr(r.employeeId), templateId: idStr(r.templateId), status: r.status ?? null,
+      startDate: toDate(r.startDate), completedAt: toDate(r.completedAt), welcomeMessage: r.welcomeMessage ?? null,
+      firstDayDetails: r.firstDayDetails ? JSON.stringify(r.firstDayDetails) : null,
+      meetTheTeam: r.meetTheTeam ? JSON.stringify(r.meetTheTeam) : null,
+      compensationSetup: r.compensationSetup ? JSON.stringify(r.compensationSetup) : null,
+      createdBy: idStr(r.createdBy), createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+      // NOTE: r.progressPercentage deliberately dropped — see the migration file's
+      // own comment (never written by the app, always recomputed on read).
+    })));
+
+    // onboarding_task_lists/onboarding_tasks — double-nested, auto-increment ids (see
+    // the migration file's comment on why list.id/task.id can't be the real PK), so
+    // delete-then-insert per record, two passes (lists first to get their new ids
+    // back, then tasks referencing those ids). Real data is small (9 records) — a
+    // per-record loop here is clearer than trying to batch the two-level flatten.
+    if (!DRY_RUN) {
+      const recordIds = onboardingRecords.map((r) => idStr(r._id));
+      if (recordIds.length) {
+        await knex('onboarding_tasks').whereIn('taskListId', knex('onboarding_task_lists').select('id').whereIn('recordId', recordIds)).del();
+        await knex('onboarding_task_lists').whereIn('recordId', recordIds).del();
+      }
+    }
+    let onboardingTaskListCount = 0;
+    let onboardingTaskCount = 0;
+    if (!DRY_RUN) {
+      for (const r of onboardingRecords) {
+        for (const list of (r.taskLists || [])) {
+          const [inserted] = await knex('onboarding_task_lists').insert({
+            recordId: idStr(r._id), listKey: list.id ?? null, name: list.name ?? null, assignedTo: list.assignedTo ?? null,
+          }).returning('id');
+          onboardingTaskListCount += 1;
+          const newListId = inserted.id ?? inserted;
+          const taskRows = (list.tasks || []).map((t) => ({
+            taskListId: newListId, taskKey: t.id ?? null, title: t.title ?? null, description: t.description ?? null,
+            dueDate: toDate(t.dueDate), isRequired: t.isRequired !== false, status: t.status ?? 'pending',
+            completedBy: idStr(t.completedBy), completedAt: toDate(t.completedAt),
+            requiresDocument: !!t.requiresDocument, documentId: idStr(t.documentId), notes: t.notes ?? null,
+            resourceUrl: t.resourceUrl ?? null,
+          }));
+          if (taskRows.length) {
+            await knex('onboarding_tasks').insert(taskRows);
+            onboardingTaskCount += taskRows.length;
+          }
+        }
+      }
+    } else {
+      onboardingTaskListCount = onboardingRecords.reduce((s, r) => s + (r.taskLists || []).length, 0);
+      onboardingTaskCount = onboardingRecords.reduce((s, r) => s + (r.taskLists || []).reduce((s2, l) => s2 + (l.tasks || []).length, 0), 0);
+    }
+    counts.onboarding_task_lists = onboardingTaskListCount;
+    counts.onboarding_tasks = onboardingTaskCount;
+
+    // Shared between onboarding and offboarding (recordType discriminates) — read once.
+    const onboardingDocuments = await dbo.collection('onboarding_documents').find({}).toArray();
+    counts.onboarding_documents = await upsertBatched('onboarding_documents', onboardingDocuments.map((d) => ({
+      id: idStr(d._id), employeeId: idStr(d.employeeId), recordId: idStr(d.recordId), recordType: d.recordType ?? null,
+      taskId: d.taskId ?? null, name: d.name ?? null, type: d.type ?? null, fileUrl: d.fileUrl ?? null,
+      signedAt: toDate(d.signedAt), signedBy: idStr(d.signedBy), status: d.status ?? null,
+      uploadedAt: toDate(d.uploadedAt), createdAt: toDate(d.createdAt),
+    })));
+
+    // ── Offboarding ──────────────────────────────────────────────────────
+    const offboardingTemplates = await dbo.collection('offboarding_templates').find({}).toArray();
+    counts.offboarding_templates = await upsertBatched('offboarding_templates', offboardingTemplates.map((t) => ({
+      id: idStr(t._id), name: t.name ?? null, exitTypes: t.exitTypes || [],
+      taskLists: t.taskLists ? JSON.stringify(t.taskLists) : null,
+      assetChecklist: t.assetChecklist ? JSON.stringify(t.assetChecklist) : null,
+      accessRevocationList: t.accessRevocationList ? JSON.stringify(t.accessRevocationList) : null,
+      documentsToGenerate: t.documentsToGenerate || [],
+      createdBy: idStr(t.createdBy), createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    // employees must exist before offboarding_records (FK) — already migrated (Phase 1).
+    const offboardingRecords = await dbo.collection('offboarding_records').find({}).toArray();
+    counts.offboarding_records = await upsertBatched('offboarding_records', offboardingRecords.map((r) => ({
+      id: idStr(r._id), employeeId: idStr(r.employeeId), templateId: idStr(r.templateId), exitType: r.exitType ?? null,
+      exitReason: r.exitReason ?? null, lastWorkingDay: toDate(r.lastWorkingDay), noticePeriodStartDate: toDate(r.noticePeriodStartDate),
+      status: r.status ?? null, eligibleForRehire: r.eligibleForRehire ?? true,
+      exitInterview: r.exitInterview ? JSON.stringify(r.exitInterview) : null,
+      finalPayTriggered: r.finalPayTriggered ?? false, finalPayTriggeredAt: toDate(r.finalPayTriggeredAt),
+      completedAt: toDate(r.completedAt), initiatedBy: idStr(r.initiatedBy),
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    if (!DRY_RUN) {
+      const offRecordIds = offboardingRecords.map((r) => idStr(r._id));
+      if (offRecordIds.length) {
+        await knex('offboarding_tasks').whereIn('taskListId', knex('offboarding_task_lists').select('id').whereIn('recordId', offRecordIds)).del();
+        await knex('offboarding_task_lists').whereIn('recordId', offRecordIds).del();
+        await knex('offboarding_asset_checklist').whereIn('recordId', offRecordIds).del();
+        await knex('offboarding_access_revocation').whereIn('recordId', offRecordIds).del();
+        await knex('offboarding_generated_documents').whereIn('recordId', offRecordIds).del();
+      }
+    }
+    let offboardingTaskListCount = 0;
+    let offboardingTaskCount = 0;
+    if (!DRY_RUN) {
+      for (const r of offboardingRecords) {
+        for (const list of (r.taskLists || [])) {
+          const [inserted] = await knex('offboarding_task_lists').insert({
+            recordId: idStr(r._id), listKey: list.id ?? null, name: list.name ?? null, assignedTo: list.assignedTo ?? null,
+          }).returning('id');
+          offboardingTaskListCount += 1;
+          const newListId = inserted.id ?? inserted;
+          const taskRows = (list.tasks || []).map((t) => ({
+            taskListId: newListId, taskKey: t.id ?? null, title: t.title ?? null, description: t.description ?? null,
+            dueDate: toDate(t.dueDate), isRequired: t.isRequired !== false, status: t.status ?? 'pending',
+            completedBy: idStr(t.completedBy), completedAt: toDate(t.completedAt),
+            requiresDocument: !!t.requiresDocument, documentId: idStr(t.documentId), notes: t.notes ?? null,
+            category: t.category ?? null, taskType: t.taskType ?? null,
+          }));
+          if (taskRows.length) {
+            await knex('offboarding_tasks').insert(taskRows);
+            offboardingTaskCount += taskRows.length;
+          }
+        }
+      }
+    } else {
+      offboardingTaskListCount = offboardingRecords.reduce((s, r) => s + (r.taskLists || []).length, 0);
+      offboardingTaskCount = offboardingRecords.reduce((s, r) => s + (r.taskLists || []).reduce((s2, l) => s2 + (l.tasks || []).length, 0), 0);
+    }
+    counts.offboarding_task_lists = offboardingTaskListCount;
+    counts.offboarding_tasks = offboardingTaskCount;
+
+    const assetRows = offboardingRecords.flatMap((r) =>
+      (r.assetChecklist || []).map((a) => ({
+        recordId: idStr(r._id), itemKey: a.id ?? null, item: a.item ?? null, category: a.category ?? null,
+        returned: a.returned ?? false, returnedAt: toDate(a.returnedAt), returnedTo: idStr(a.returnedTo),
+        condition: a.condition ?? null, notes: a.notes ?? null,
+      }))
+    );
+    counts.offboarding_asset_checklist = await upsertBatched('offboarding_asset_checklist', assetRows, null);
+
+    const accessRows = offboardingRecords.flatMap((r) =>
+      (r.accessRevocationList || []).map((a) => ({
+        recordId: idStr(r._id), itemKey: a.id ?? null, system: a.system ?? null, category: a.category ?? null,
+        revoked: a.revoked ?? false, revokedAt: toDate(a.revokedAt), revokedBy: idStr(a.revokedBy),
+      }))
+    );
+    counts.offboarding_access_revocation = await upsertBatched('offboarding_access_revocation', accessRows, null);
+
+    const generatedDocRows = offboardingRecords.flatMap((r) =>
+      (r.generatedDocuments || []).map((g) => ({
+        recordId: idStr(r._id), type: g.type ?? null, fileUrl: g.fileUrl ?? null, generatedAt: toDate(g.generatedAt),
+      }))
+    );
+    counts.offboarding_generated_documents = await upsertBatched('offboarding_generated_documents', generatedDocRows, null);
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

@@ -1,8 +1,12 @@
-const { ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const { findOne, findMany, insertOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
+// `users` has been Postgres since Phase 1 (this file was still reading it off the
+// Mongo helper — a gap since it was only added later, on top of an already-migrated
+// collection); jobRequisitions/candidates/applications now live in Postgres too
+// (Phase 4, via seedDemoRecruitment.js/getDemoPipeline below).
+const { findOne, insertOne, knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { GUEST } = require('../../constants/roles');
 const { ensureDemoRecruitmentData } = require('../../lib/demo/seedDemoRecruitment');
@@ -14,8 +18,8 @@ const DEMO_EMAIL = 'demo-guest@workfola.internal';
 // and read-only, so a dedicated account per click would just be bookkeeping
 // with no safety benefit.
 const ensureDemoUser = async () => {
-  const existing = await findOne('users', { email: DEMO_EMAIL }, { projection: { _id: 1 } });
-  if (existing) return existing._id;
+  const existing = await findOne('users', { email: DEMO_EMAIL });
+  if (existing) return existing.id;
   // Never actually used to log in (demoLogin issues a token directly, bypassing
   // /api/auth/login entirely) — hashed so a stray login attempt against this email
   // fails cleanly via bcrypt.compare rather than erroring on a null hash.
@@ -33,7 +37,7 @@ const ensureDemoUser = async () => {
     createdAt: new Date(),
     updatedAt: new Date(),
   });
-  return result.insertedId;
+  return result.id;
 };
 
 // Public, unauthenticated — the entire point of "View Demo" is zero friction.
@@ -41,7 +45,7 @@ const ensureDemoUser = async () => {
 const demoLogin = async (req, res) => {
   const [userId] = await Promise.all([ensureDemoUser(), ensureDemoRecruitmentData()]);
   const accessToken = jwt.sign(
-    { userId: userId.toString() },
+    { userId: String(userId) },
     process.env.JWT_SECRET,
     { expiresIn: '2h' }, // short-lived — this is a sales walkthrough, not a session to persist
   );
@@ -52,19 +56,24 @@ const demoLogin = async (req, res) => {
 // caller — there is exactly one demo requisition, so there's nothing to parameterize
 // and therefore nothing for a guest to tamper with to reach other data.
 const getDemoPipeline = async (req, res) => {
-  const requisition = await findOne('jobRequisitions', { isDemoData: true });
+  const requisition = await findOne('job_requisitions', { isDemoData: true });
   if (!requisition) return returnFunction(res, 404, false, 'Demo data not seeded yet.');
 
-  const applications = await findMany('applications', { isDemoData: true, requisitionId: requisition._id }, { sort: { createdAt: -1 } });
-  const candidateIds = [...new Set(applications.map((a) => String(a.candidateId)))];
-  const candidates = candidateIds.length
-    ? await findMany('candidates', { _id: { $in: candidateIds.map((id) => new ObjectId(id)) } })
+  const applications = await knex('applications').where({ isDemoData: true, requisitionId: requisition.id }).orderBy('createdAt', 'desc');
+  const candidateIds = [...new Set(applications.map((a) => a.candidateId))];
+  const candidates = candidateIds.length ? await knex('candidates').whereIn('id', candidateIds) : [];
+  const candidateMap = Object.fromEntries(candidates.map((c) => [c.id, c]));
+
+  const assignments = applications.length
+    ? await knex('application_interview_assignments').whereIn('applicationId', applications.map((a) => a.id))
     : [];
-  const candidateMap = Object.fromEntries(candidates.map((c) => [String(c._id), c]));
+  const assignmentsByApp = {};
+  for (const a of assignments) (assignmentsByApp[a.applicationId] ||= []).push(a);
 
   const enriched = applications.map((a) => ({
     ...a,
-    candidate: candidateMap[String(a.candidateId)] || null,
+    candidate: candidateMap[a.candidateId] || null,
+    interviewAssignments: assignmentsByApp[a.id] || [],
   }));
   const byStage = {};
   enriched.forEach((a) => {

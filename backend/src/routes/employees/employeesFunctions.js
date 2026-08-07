@@ -4,16 +4,15 @@ const fs = require('fs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
-// employees, job_history, and their supporting lookups (Phase 1), plus leave_types/
-// leave_balances/leave_requests (Phase 3a), now live in Postgres. Everything this file
-// still touches that HASN'T been migrated yet (offboarding_records, onboarding,
-// notifications) stays on the Mongo helpers via commonDBFunctions/global.dbo, imported
-// separately below.
+// employees, job_history, and their supporting lookups (Phase 1), leave_types/
+// leave_balances/leave_requests (Phase 3a), and offboarding_records (Phase 4) now
+// live in Postgres. Everything this file still touches that HASN'T been migrated yet
+// (notifications) stays on the Mongo helpers via commonDBFunctions/global.dbo,
+// imported separately below.
 const {
   findOne, findMany, insertOne, insertMany, updateOne, deleteOne, countDocuments,
   knex, replaceChildRows, addChildRow, deleteChildRow,
 } = require('../../functions/Database/pgDBFunctions');
-const { findOne: mongoFindOne } = require('../../functions/Database/commonDBFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
 const { syncBasicPayCompensation } = require('../../lib/payroll/syncBasicPay');
@@ -105,9 +104,9 @@ const revokeLoginAccess = async (employeeId) => {
 // Status going to 'terminated' should always be backed by an offboarding record.
 // We don't auto-create one (offboarding needs a template + exit type HR must choose)
 // — just flag HR if this employee has none, so it isn't silently forgotten.
-// offboarding_records is unmigrated (Phase 3/4) — stays on Mongo.
+// offboarding_records now lives in Postgres (Phase 4).
 const flagMissingOffboardingIfNeeded = async (employee) => {
-  const activeRecord = await mongoFindOne('offboarding_records', { employeeId: new ObjectId(employee.id), status: { $ne: 'completed' } });
+  const activeRecord = await knex('offboarding_records').where({ employeeId: employee.id }).whereNot({ status: 'completed' }).first();
   if (activeRecord) return;
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Offboarding Not Started',

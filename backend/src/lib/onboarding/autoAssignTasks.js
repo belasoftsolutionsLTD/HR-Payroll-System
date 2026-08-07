@@ -1,9 +1,7 @@
 const bcrypt = require('bcryptjs');
-const { ObjectId } = require('mongodb');
-const { findOne, findMany, insertOne } = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// `employees`/`users` now live in Postgres; `onboarding_templates`/`onboarding_records`
-// are unmigrated, so they stay on the Mongo helpers above.
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — onboarding_templates, onboarding_records (+ onboarding_task_lists/
+// onboarding_tasks), employees, users all now live in Postgres.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyUser, notifyByRoles, notifyEmployee } = require('../../functions/HR/notifyUser');
 const { notifyManager } = require('../../routes/inbox/inboxFunctions');
@@ -85,7 +83,7 @@ const notifyStakeholder = async (assignedTo, employeeId, payload) => {
 };
 
 const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) => {
-  const template = await findOne('onboarding_templates', { _id: new ObjectId(templateId) });
+  const template = await pgDB.findOne('onboarding_templates', { id: String(templateId) });
   if (!template) throw new Error('Onboarding template not found.');
 
   const employee = await pgDB.findOne('employees', { id: String(employeeId) });
@@ -94,54 +92,55 @@ const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) 
   const start = new Date(startDate);
   const now = new Date();
 
-  const taskLists = (template.taskLists || []).map(list => ({
-    id: list.id,
-    name: list.name,
-    assignedTo: list.assignedTo,
-    tasks: (list.tasks || []).map(t => {
-      const due = new Date(start);
-      due.setDate(due.getDate() + (Number(t.dueOffsetDays) || 0));
-      return {
-        id: t.id,
-        title: t.title,
-        description: t.description || '',
-        dueDate: due,
-        isRequired: t.isRequired !== false,
-        status: 'pending',
-        completedBy: null,
-        completedAt: null,
-        requiresDocument: !!t.requiresDocument,
-        documentId: null,
-        notes: null,
-        resourceUrl: t.resourceUrl || null,
-      };
-    }),
-  }));
-
+  // template.taskLists/meetTheTeam are JSONB — already parsed JS values off the row.
+  const templateTaskLists = template.taskLists || [];
   const meetTheTeam = (template.meetTheTeam || []).map(m => ({
-    employeeId: new ObjectId(m.employeeId),
-    note: m.note || '',
-    met: false,
+    employeeId: String(m.employeeId), note: m.note || '', met: false,
   }));
 
+  const recordId = pgDB.newId();
   const doc = {
-    employeeId: new ObjectId(employeeId),
-    templateId: template._id,
+    id: recordId,
+    employeeId: String(employeeId),
+    templateId: template.id,
     status: start > now ? 'preboarding' : 'active',
     startDate: start,
     completedAt: null,
     welcomeMessage: template.welcomeMessage || '',
-    firstDayDetails: template.firstDayDetails || { location: '', reportingTime: '', whatToBring: '', additionalNotes: '' },
-    meetTheTeam,
-    taskLists,
-    progressPercentage: 0,
-    createdBy: createdBy ? new ObjectId(createdBy) : null,
+    firstDayDetails: JSON.stringify(template.firstDayDetails || { location: '', reportingTime: '', whatToBring: '', additionalNotes: '' }),
+    meetTheTeam: JSON.stringify(meetTheTeam),
+    compensationSetup: null,
+    createdBy: createdBy ? String(createdBy) : null,
     createdAt: now,
     updatedAt: now,
   };
+  await pgDB.insertOne('onboarding_records', doc);
 
-  const result = await insertOne('onboarding_records', doc);
-  const record = { ...doc, _id: result.insertedId };
+  // taskLists[].tasks[] — real child tables (see the migration file's own comment on
+  // why list.id/task.id can't be the primary key: templates copy the same id onto
+  // every record instantiated from them). Insert lists first to get their real
+  // internal ids, then their tasks.
+  const taskListsForNotify = [];
+  for (const list of templateTaskLists) {
+    const [insertedList] = await pgDB.knex('onboarding_task_lists').insert({
+      recordId, listKey: list.id, name: list.name, assignedTo: list.assignedTo,
+    }).returning('id');
+    const newListId = insertedList.id ?? insertedList;
+    const tasks = (list.tasks || []).map(t => {
+      const due = new Date(start);
+      due.setDate(due.getDate() + (Number(t.dueOffsetDays) || 0));
+      return {
+        taskListId: newListId, taskKey: t.id, title: t.title, description: t.description || '',
+        dueDate: due, isRequired: t.isRequired !== false, status: 'pending',
+        completedBy: null, completedAt: null, requiresDocument: !!t.requiresDocument,
+        documentId: null, notes: null, resourceUrl: t.resourceUrl || null,
+      };
+    });
+    if (tasks.length) await pgDB.knex('onboarding_tasks').insert(tasks);
+    taskListsForNotify.push({ assignedTo: list.assignedTo, name: list.name, taskCount: tasks.length });
+  }
+
+  const record = { ...doc, taskLists: templateTaskLists, meetTheTeam };
 
   // Welcome email (fire-and-forget — should never block onboarding creation). Provisioning
   // happens first so the credentials and the portal link that needs them travel together —
@@ -166,10 +165,10 @@ const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) 
   }
 
   // Per-stakeholder notifications, one per non-empty task list
-  await Promise.all(taskLists.filter(l => l.tasks.length).map(list =>
+  await Promise.all(taskListsForNotify.filter(l => l.taskCount).map(list =>
     notifyStakeholder(list.assignedTo, employeeId, {
       title: `Onboarding: ${employee.fullName}`,
-      body: `${list.tasks.length} "${list.name}" task${list.tasks.length !== 1 ? 's' : ''} assigned for ${employee.fullName}'s onboarding.`,
+      body: `${list.taskCount} "${list.name}" task${list.taskCount !== 1 ? 's' : ''} assigned for ${employee.fullName}'s onboarding.`,
       type: 'onboarding',
     }).catch(() => {})
   ));
@@ -183,7 +182,7 @@ const initiateOnboarding = async (employeeId, templateId, startDate, createdBy) 
 // template exists first. Returns null (caller should skip silently) if no
 // onboarding templates have been configured yet.
 const resolveDefaultTemplate = async (department) => {
-  const templates = await findMany('onboarding_templates', {});
+  const templates = await pgDB.knex('onboarding_templates');
   if (!templates.length) return null;
   return (
     templates.find(t => (t.targetDepartments || []).includes(department)) ||

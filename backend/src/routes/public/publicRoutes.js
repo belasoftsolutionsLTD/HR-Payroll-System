@@ -1,12 +1,20 @@
 const express = require('express');
 const multer  = require('multer');
 const PDFDocument = require('pdfkit');
-const { ObjectId } = require('mongodb');
+const { ObjectId } = require('mongodb'); // still needed for notifyHR's referenceId (inbox stays Mongo)
 const router = express.Router();
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const crypto = require('crypto');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// company_settings/project_invites are unmigrated and stay on the Mongo helpers below.
+const { findOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — jobRequisitions/candidates/applications now live in Postgres. `users`
+// has been Postgres since Phase 1 — the unsubscribe routes below were still reading
+// it off the Mongo helper, silently broken (writes went to a collection nothing
+// syncs anymore) since that phase; fixed here while this file was open for Phase 4.
+const pgDB = require('../../functions/Database/pgDBFunctions');
+const { knex, newId, insertOne } = pgDB;
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { verifyUnsubscribeToken } = require('../../lib/email/unsubscribeToken');
 const { respondToOfferCore } = require('../recruitment/recruitmentFunctions');
@@ -85,28 +93,29 @@ router.get('/company-info', async (req, res) => {
 // A requisition with a past applicationDeadline is treated as closed immediately, even
 // before the daily cron (closeExpiredRequisitions) has flipped its status — this filter
 // is the real-time guarantee, the cron is just what makes the change visible in HR's own
-// requisition list/status field too. Must be a function, not a static object — a plain
-// object literal would capture `new Date()` once at server startup and never advance.
-const notExpired = () => ({ $or: [{ applicationDeadline: null }, { applicationDeadline: { $gte: new Date() } }] });
+// requisition list/status field too. Applied inline per-query (a knex query builder,
+// unlike a plain object literal, only evaluates `new Date()` when the query actually runs).
+const notExpired = (query) => query.andWhere((qb) => qb.whereNull('applicationDeadline').orWhere('applicationDeadline', '>=', new Date()));
 
 // A requisition with no branchId set (or a company with no branches configured at all)
 // is shown to candidates as based at "Headquarters" rather than a blank/missing field.
 const withBranchName = async (jobs) => {
   const list = Array.isArray(jobs) ? jobs : [jobs];
-  const branchIds = [...new Set(list.filter((j) => j.branchId).map((j) => String(j.branchId)))].map((id) => new ObjectId(id));
-  const branches = branchIds.length ? await findMany('branches', { _id: { $in: branchIds } }, { projection: { name: 1 } }) : [];
-  const nameById = Object.fromEntries(branches.map((b) => [String(b._id), b.name]));
-  const enriched = list.map((j) => ({ ...j, branchName: (j.branchId && nameById[String(j.branchId)]) || 'Headquarters' }));
+  const branchIds = [...new Set(list.filter((j) => j.branchId).map((j) => j.branchId))];
+  const branches = branchIds.length ? await knex('branches').whereIn('id', branchIds).select('id', 'name') : [];
+  const nameById = Object.fromEntries(branches.map((b) => [b.id, b.name]));
+  const enriched = list.map((j) => ({ ...j, branchName: (j.branchId && nameById[j.branchId]) || 'Headquarters' }));
   return Array.isArray(jobs) ? enriched : enriched[0];
 };
 
 // GET /api/public/jobs — open requisitions for the careers site (no auth)
 router.get('/jobs', async (req, res) => {
   try {
-    const filter = { status: 'open', ...notExpired() };
-    if (req.query.department) filter.department = req.query.department;
-    if (req.query.location) filter.location = req.query.location;
-    const jobs = await findMany('jobRequisitions', filter, { sort: { createdAt: -1 } });
+    let query = knex('job_requisitions').where({ status: 'open' });
+    query = notExpired(query);
+    if (req.query.department) query = query.andWhere({ department: req.query.department });
+    if (req.query.location) query = query.andWhere({ location: req.query.location });
+    const jobs = await query.orderBy('createdAt', 'desc');
     return returnFunction(res, 200, true, 'OK', await withBranchName(jobs));
   } catch (e) {
     return returnFunction(res, 500, false, 'Server error');
@@ -116,7 +125,7 @@ router.get('/jobs', async (req, res) => {
 // GET /api/public/jobs/:id — job detail (no auth)
 router.get('/jobs/:id', async (req, res) => {
   try {
-    const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open', ...notExpired() });
+    const job = await notExpired(knex('job_requisitions').where({ id: req.params.id, status: 'open' })).first();
     if (!job) return returnFunction(res, 404, false, 'Job not found or closed');
     Object.assign(job, await withBranchName(job));
     return returnFunction(res, 200, true, 'OK', job);
@@ -142,14 +151,15 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
     if (!validateRequiredFields(req, res, ['firstName', 'lastName', 'email', 'phone'])) return;
     if (!req.file) return returnFunction(res, 400, false, 'A resume (PDF) is required.');
 
-    const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id), status: 'open', ...notExpired() });
+    const requisition = await notExpired(knex('job_requisitions').where({ id: req.params.id, status: 'open' })).first();
     if (!requisition) return returnFunction(res, 404, false, 'Job not found or closed');
     if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'This job is not currently accepting applications.');
 
     const email = req.body.email.toLowerCase().trim();
-    let candidate = await findOne('candidates', { email });
+    let candidate = await knex('candidates').where({ email }).first();
     if (!candidate) {
       const candDoc = {
+        id: newId(),
         firstName: req.body.firstName.trim(),
         lastName: req.body.lastName.trim(),
         email,
@@ -167,30 +177,29 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      const candResult = await insertOne('candidates', candDoc);
-      candidate = { _id: candResult.insertedId, ...candDoc };
+      candidate = await insertOne('candidates', candDoc);
     } else if (req.file) {
-      await updateOne('candidates', { _id: candidate._id }, { $set: { resumeUrl: req.file.path, updatedAt: new Date() } });
+      await knex('candidates').where({ id: candidate.id }).update({ resumeUrl: req.file.path, updatedAt: new Date() });
     }
 
-    const priorApplicationCount = await countDocuments('applications', { candidateId: candidate._id, requisitionId: requisition._id });
-    if (priorApplicationCount >= MAX_APPLICATIONS_PER_REQUISITION) {
+    const [{ count: priorApplicationCount }] = await knex('applications').where({ candidateId: candidate.id, requisitionId: requisition.id }).count('* as count');
+    if (Number(priorApplicationCount) >= MAX_APPLICATIONS_PER_REQUISITION) {
       return returnFunction(res, 409, false, `You have already applied for this position the maximum number of times (${MAX_APPLICATIONS_PER_REQUISITION}).`);
     }
 
     const firstStage = requisition.pipelineStages[0];
     const now = new Date();
     const appDoc = {
-      candidateId: candidate._id,
-      requisitionId: requisition._id,
+      id: newId(),
+      candidateId: candidate.id,
+      requisitionId: requisition.id,
       currentStageId: firstStage.id,
-      stageHistory: [{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: null }],
+      stageHistory: JSON.stringify([{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: null }]),
       status: 'active',
       rejectionReason: null,
       offerDetails: null,
       coverLetter: req.body.coverLetter || null,
-      answers: parseAnswers(req.body.answers),
-      scorecards: [],
+      answers: JSON.stringify(parseAnswers(req.body.answers)),
       overallScore: null,
       createdAt: now,
       updatedAt: now,
@@ -210,13 +219,13 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
       }).catch(() => {});
     }
 
-    const hrManagers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] } }, { projection: { _id: 1, email: 1 } });
+    const hrManagers = await knex('users').whereIn('role', ['super_admin', 'hr_manager']).select('id', 'email');
     if (hrManagers.length) {
       notifyHR({
         type: 'recruitment', subType: 'new_application',
         title: 'New Application Received',
         subtitle: `${fullName} applied for ${requisition.title} via the careers site.`,
-        referenceId: result.insertedId, referenceModel: 'applications',
+        referenceId: new ObjectId(result.id), referenceModel: 'applications',
         requiresAction: true, triggeredBy: null,
       }).catch(() => {});
       notifyByRoles(['super_admin', 'hr_manager'], {
@@ -233,7 +242,7 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
       }).catch(() => {}));
     }
 
-    return returnFunction(res, 201, true, 'Application submitted successfully. We will be in touch.', { _id: result.insertedId });
+    return returnFunction(res, 201, true, 'Application submitted successfully. We will be in touch.', { _id: result.id });
   } catch (e) {
     return returnFunction(res, 500, false, 'Server error');
   }
@@ -242,7 +251,7 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
 // GET /api/public/jobs/:id/pdf — downloadable job flyer (no auth)
 router.get('/jobs/:id/pdf', async (req, res) => {
   try {
-    const job = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+    const job = await knex('job_requisitions').where({ id: req.params.id }).first();
     if (!job) return returnFunction(res, 404, false, 'Job not found');
 
     const settings = await findOne('company_settings', {});
@@ -312,7 +321,7 @@ router.get('/jobs/:id/pdf', async (req, res) => {
 
     // How to apply
     section('How to Apply');
-    const applyUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/careers/${job._id}`;
+    const applyUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/careers/${job.id}`;
     doc.text('Apply online at:');
     doc.fillColor([pr, pg, pb]).text(applyUrl, { underline: true });
     doc.fillColor('#333333').moveDown();
@@ -333,7 +342,7 @@ router.get('/jobs/:id/pdf', async (req, res) => {
 // token, if any, and if the offer hasn't already been responded to or expired.
 async function findApplicationByOfferToken(rawToken) {
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-  return findOne('applications', { 'offerDetails.responseTokenHash': tokenHash });
+  return knex('applications').whereRaw("\"offerDetails\"->>'responseTokenHash' = ?", [tokenHash]).first();
 }
 
 // GET /api/public/offers/:token — candidate views their offer before deciding
@@ -343,8 +352,8 @@ router.get('/offers/:token', AsyncHandler(async (req, res) => {
   if (new Date(application.offerDetails.expiresAt) < new Date()) return returnFunction(res, 410, false, 'This offer has expired.');
 
   const [candidate, requisition] = await Promise.all([
-    findOne('candidates', { _id: application.candidateId }),
-    findOne('jobRequisitions', { _id: application.requisitionId }),
+    knex('candidates').where({ id: application.candidateId }).first(),
+    knex('job_requisitions').where({ id: application.requisitionId }).first(),
   ]);
 
   return returnFunction(res, 200, true, 'Offer found.', {
@@ -423,7 +432,7 @@ router.get('/unsubscribe/status', AsyncHandler(async (req, res) => {
   if (!uid || !token || !verifyUnsubscribeToken(uid, token)) {
     return returnFunction(res, 400, false, 'This unsubscribe link is invalid.');
   }
-  const user = await findOne('users', { _id: new ObjectId(uid) }, { projection: { email: 1, name: 1, unsubscribedFromEmails: 1 } });
+  const user = await knex('users').where({ id: String(uid) }).select('email', 'name', 'unsubscribedFromEmails').first();
   if (!user) return returnFunction(res, 404, false, 'Account not found.');
   return returnFunction(res, 200, true, 'OK', { email: user.email, name: user.name, unsubscribed: user.unsubscribedFromEmails === true });
 }));
@@ -435,8 +444,8 @@ router.post('/unsubscribe', AsyncHandler(async (req, res) => {
   if (!uid || !token || !verifyUnsubscribeToken(uid, token)) {
     return returnFunction(res, 400, false, 'This unsubscribe link is invalid.');
   }
-  const result = await updateOne('users', { _id: new ObjectId(uid) }, { $set: { unsubscribedFromEmails: unsubscribed !== false, updatedAt: new Date() } });
-  if (!result.matchedCount) return returnFunction(res, 404, false, 'Account not found.');
+  const [updated] = await knex('users').where({ id: String(uid) }).update({ unsubscribedFromEmails: unsubscribed !== false, updatedAt: new Date() }).returning('id');
+  if (!updated) return returnFunction(res, 404, false, 'Account not found.');
   return returnFunction(res, 200, true, unsubscribed !== false ? 'Unsubscribed.' : 'Resubscribed.');
 }));
 

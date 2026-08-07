@@ -1,4 +1,6 @@
-const { findOne } = require('../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — email_templates now lives in Postgres.
+const { findOne } = require('../functions/Database/pgDBFunctions');
 const { sendEmail } = require('./emailService');
 
 const renderTemplate = (body, tokens) => body.replace(/\{\{(\w+)\}\}/g, (_, key) => tokens[key] ?? '');
@@ -9,7 +11,7 @@ const renderTemplate = (body, tokens) => body.replace(/\{\{(\w+)\}\}/g, (_, key)
 // call site works out of the box even before an admin customizes anything in Settings.
 const sendTemplatedEmail = async ({ trigger, to, tokens, fallbackSubject, fallbackHtml, attachments }) => {
   if (!to) return;
-  const template = await findOne('emailTemplates', { trigger });
+  const template = await findOne('email_templates', { trigger });
   return sendEmail({
     to,
     subject: template ? renderTemplate(template.subject, tokens) : fallbackSubject,

@@ -2,12 +2,64 @@ const { ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — offboarding_templates, offboarding_records (+ offboarding_task_lists/
+// offboarding_tasks/offboarding_asset_checklist/offboarding_access_revocation/
+// offboarding_generated_documents), onboarding_documents, employees, users all now
+// live in Postgres. expense_claims/purchase_requests (via getOpenSpendItems) are
+// unmigrated (own future Spend phase) and stay on the Mongo helper — ObjectId is
+// still needed to call into it correctly.
+const { knex, newId, insertOne, updateOne } = require('../../functions/Database/pgDBFunctions');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const { initiateOffboarding, notifyStakeholder } = require('../../lib/offboarding/autoAssignTasks');
 const { getOpenSpendItems } = require('../../lib/spend/clearanceCheck');
 const { generateExperienceLetter, generateRelievingLetter, generateClearanceCertificate } = require('../../lib/offboarding/generateDocument');
+
+// Reconstructs the Mongo-shaped nested arrays from their real child tables — same
+// idiom (and same reasoning) as onboardingFunctions.js's attachTaskLists.
+const attachTaskLists = async (record) => {
+  if (!record) return record;
+  const lists = await knex('offboarding_task_lists').where({ recordId: record.id }).orderBy('id');
+  const tasks = lists.length
+    ? await knex('offboarding_tasks').whereIn('taskListId', lists.map((l) => l.id)).orderBy('id')
+    : [];
+  const tasksByListId = {};
+  for (const t of tasks) (tasksByListId[t.taskListId] ||= []).push(t);
+  const taskLists = lists.map((l) => ({
+    id: l.listKey, _internalId: l.id, name: l.name, assignedTo: l.assignedTo,
+    tasks: (tasksByListId[l.id] || []).map((t) => ({
+      id: t.taskKey, _internalId: t.id, title: t.title, description: t.description, dueDate: t.dueDate,
+      isRequired: t.isRequired, status: t.status, completedBy: t.completedBy, completedAt: t.completedAt,
+      requiresDocument: t.requiresDocument, documentId: t.documentId, notes: t.notes,
+      category: t.category, taskType: t.taskType,
+    })),
+  }));
+  return { ...record, taskLists };
+};
+
+const attachChecklists = async (record) => {
+  if (!record) return record;
+  const [assetChecklist, accessRevocationList, generatedDocuments] = await Promise.all([
+    knex('offboarding_asset_checklist').where({ recordId: record.id }).orderBy('id'),
+    knex('offboarding_access_revocation').where({ recordId: record.id }).orderBy('id'),
+    knex('offboarding_generated_documents').where({ recordId: record.id }).orderBy('id'),
+  ]);
+  return {
+    ...record,
+    assetChecklist: assetChecklist.map((a) => ({
+      id: a.itemKey, _internalId: a.id, item: a.item, category: a.category, returned: a.returned,
+      returnedAt: a.returnedAt, returnedTo: a.returnedTo, condition: a.condition, notes: a.notes,
+    })),
+    accessRevocationList: accessRevocationList.map((a) => ({
+      id: a.itemKey, _internalId: a.id, system: a.system, category: a.category, revoked: a.revoked,
+      revokedAt: a.revokedAt, revokedBy: a.revokedBy,
+    })),
+    generatedDocuments: generatedDocuments.map((g) => ({ type: g.type, fileUrl: g.fileUrl, generatedAt: g.generatedAt })),
+  };
+};
+
+const attachAll = async (record) => attachChecklists(await attachTaskLists(record));
 
 // A task counts as overdue for display if it isn't finished and its due date has
 // passed — computed at read time, same idiom as the onboarding module.
@@ -27,7 +79,8 @@ const computeProgress = (record) => {
 };
 
 const enrichEmployee = async (record) => {
-  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1, dateOfHire: 1, email: 1 } });
+  const employee = await knex('employees').where({ id: String(record.employeeId) })
+    .select('fullName', 'staffNumber', 'department', 'designation', 'dateOfHire', 'email').first();
   return { ...record, employee: employee || null };
 };
 
@@ -36,12 +89,12 @@ const enrichEmployee = async (record) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 const listTemplates = async (req, res) => {
-  const templates = await findMany('offboarding_templates', {}, { sort: { name: 1 } });
+  const templates = await knex('offboarding_templates').orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, templates);
 };
 
 const getTemplate = async (req, res) => {
-  const template = await findOne('offboarding_templates', { _id: new ObjectId(req.params.id) });
+  const template = await knex('offboarding_templates').where({ id: req.params.id }).first();
   if (!template) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, template);
 };
@@ -69,38 +122,39 @@ const createTemplate = async (req, res) => {
   const { name, exitTypes, taskLists, assetChecklist, accessRevocationList, documentsToGenerate } = req.body;
   if (!Array.isArray(exitTypes) || !exitTypes.length) return returnFunction(res, 400, false, 'Select at least one exit type.');
   const doc = {
+    id: newId(),
     name: name.trim(),
     exitTypes,
-    taskLists: withGeneratedIds(taskLists),
-    assetChecklist: withGeneratedItemIds(assetChecklist),
-    accessRevocationList: withGeneratedItemIds(accessRevocationList),
+    taskLists: JSON.stringify(withGeneratedIds(taskLists)),
+    assetChecklist: JSON.stringify(withGeneratedItemIds(assetChecklist)),
+    accessRevocationList: JSON.stringify(withGeneratedItemIds(accessRevocationList)),
     documentsToGenerate: documentsToGenerate || [],
-    createdBy: req.user?._id || null,
+    createdBy: req.user?.id || null,
     createdAt: new Date(),
   };
   const result = await insertOne('offboarding_templates', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const updateTemplate = async (req, res) => {
-  const existing = await findOne('offboarding_templates', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('offboarding_templates').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   const { name, exitTypes, taskLists, assetChecklist, accessRevocationList, documentsToGenerate } = req.body;
-  const update = {};
+  const update = { updatedAt: new Date() };
   if (name !== undefined)  update.name = name.trim();
   if (exitTypes !== undefined) update.exitTypes = exitTypes;
-  if (taskLists !== undefined) update.taskLists = withGeneratedIds(taskLists);
-  if (assetChecklist !== undefined) update.assetChecklist = withGeneratedItemIds(assetChecklist);
-  if (accessRevocationList !== undefined) update.accessRevocationList = withGeneratedItemIds(accessRevocationList);
+  if (taskLists !== undefined) update.taskLists = JSON.stringify(withGeneratedIds(taskLists));
+  if (assetChecklist !== undefined) update.assetChecklist = JSON.stringify(withGeneratedItemIds(assetChecklist));
+  if (accessRevocationList !== undefined) update.accessRevocationList = JSON.stringify(withGeneratedItemIds(accessRevocationList));
   if (documentsToGenerate !== undefined) update.documentsToGenerate = documentsToGenerate;
-  await updateOne('offboarding_templates', { _id: existing._id }, { $set: update });
+  await updateOne('offboarding_templates', { id: existing.id }, update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteTemplate = async (req, res) => {
-  const existing = await findOne('offboarding_templates', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('offboarding_templates').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
-  await deleteOne('offboarding_templates', { _id: existing._id });
+  await knex('offboarding_templates').where({ id: existing.id }).del();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -112,43 +166,39 @@ const createRecord = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'templateId', 'exitType', 'lastWorkingDay'])) return;
   const { employeeId, templateId, exitType, exitReason, lastWorkingDay } = req.body;
 
-  const activeExisting = await findOne('offboarding_records', {
-    employeeId: new ObjectId(employeeId),
-    status: { $ne: 'completed' },
-  });
+  const activeExisting = await knex('offboarding_records')
+    .where({ employeeId: String(employeeId) }).whereNot({ status: 'completed' }).first();
   if (activeExisting) return returnFunction(res, 409, false, 'This employee already has an active offboarding record.');
 
   let record;
   try {
-    record = await initiateOffboarding(employeeId, templateId, lastWorkingDay, exitType, exitReason, req.user?._id);
+    record = await initiateOffboarding(employeeId, templateId, lastWorkingDay, exitType, exitReason, req.user?.id);
   } catch (err) {
     return returnFunction(res, 400, false, err.message || 'Could not start offboarding.');
   }
-  return returnFunction(res, 201, true, 'Offboarding started.', { _id: record._id });
+  return returnFunction(res, 201, true, 'Offboarding started.', { _id: record.id });
 };
 
 const listRecords = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.exitType) filter.exitType = req.query.exitType;
+  let query = knex('offboarding_records');
+  if (req.query.status) query = query.where({ status: req.query.status });
+  if (req.query.exitType) query = query.where({ exitType: req.query.exitType });
 
-  const [total, records] = await Promise.all([
-    countDocuments('offboarding_records', filter),
-    findMany('offboarding_records', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const records = await query.orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  let enriched = await Promise.all(records.map(r => enrichEmployee(computeProgress(r))));
+  let enriched = await Promise.all(records.map(async (r) => enrichEmployee(computeProgress(await attachAll(r)))));
   if (req.query.department) {
     enriched = enriched.filter(r => r.employee?.department === req.query.department);
   }
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 const getRecord = async (req, res) => {
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
-  const enriched = await enrichEmployee(computeProgress(record));
+  const enriched = await enrichEmployee(computeProgress(await attachAll(record)));
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
@@ -161,36 +211,35 @@ const updateRecordTask = async (req, res) => {
   const VALID = ['pending', 'inProgress', 'completed'];
   if (!VALID.includes(status)) return returnFunction(res, 400, false, 'Invalid status.');
 
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (status === 'completed') {
-    const list = record.taskLists.find(l => l.id === taskListId);
-    const task = list?.tasks.find(t => t.id === taskId);
-    if (task?.taskType === 'spend_clearance') {
-      const { hasOpenItems, openClaims, openRequests } = await getOpenSpendItems(record.employeeId);
-      if (hasOpenItems) {
-        return returnFunction(res, 400, false,
-          `Cannot clear: ${openClaims.length} expense claim(s) and ${openRequests.length} purchase request(s) are still open. Approve or reject them first.`);
-      }
+  const list = await knex('offboarding_task_lists').where({ recordId: record.id, listKey: taskListId }).first();
+  const task = list && await knex('offboarding_tasks').where({ taskListId: list.id, taskKey: taskId }).first();
+  if (!list || !task) return returnFunction(res, 404, false, 'Task not found on this record.');
+
+  if (status === 'completed' && task.taskType === 'spend_clearance') {
+    // expense_claims/purchase_requests are still Mongo — they expect a real ObjectId.
+    const { hasOpenItems, openClaims, openRequests } = await getOpenSpendItems(new ObjectId(record.employeeId));
+    if (hasOpenItems) {
+      return returnFunction(res, 400, false,
+        `Cannot clear: ${openClaims.length} expense claim(s) and ${openRequests.length} purchase request(s) are still open. Approve or reject them first.`);
     }
   }
 
   const now = new Date();
-  const setFields = {
-    'taskLists.$[list].tasks.$[task].status': status,
-    'taskLists.$[list].tasks.$[task].completedAt': status === 'completed' ? now : null,
-    'taskLists.$[list].tasks.$[task].completedBy': status === 'completed' ? (req.user?._id ? new ObjectId(req.user._id) : null) : null,
-    updatedAt: now,
+  const taskUpdate = {
+    status,
+    completedAt: status === 'completed' ? now : null,
+    completedBy: status === 'completed' ? (req.user?.id || null) : null,
   };
-  if (notes !== undefined) setFields['taskLists.$[list].tasks.$[task].notes'] = notes;
-  if (record.status === 'initiated') setFields.status = 'inProgress';
+  if (notes !== undefined) taskUpdate.notes = notes;
+  await knex('offboarding_tasks').where({ id: task.id }).update(taskUpdate);
 
-  await global.dbo.collection('offboarding_records').updateOne(
-    { _id: record._id },
-    { $set: setFields },
-    { arrayFilters: [{ 'list.id': taskListId }, { 'task.id': taskId }] }
-  );
+  const recordUpdate = { updatedAt: now };
+  if (record.status === 'initiated') recordUpdate.status = 'inProgress';
+  await knex('offboarding_records').where({ id: record.id }).update(recordUpdate);
+
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -206,90 +255,80 @@ const addRecordTask = async (req, res) => {
   // /my/document for their own tasks, and HR can upload on behalf of any other
   // assignee's task via uploadRecordDocument.
 
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await attachTaskLists(await knex('offboarding_records').where({ id: req.params.id }).first());
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
 
   const now = new Date();
-  const newTask = {
-    id: crypto.randomUUID(),
-    title, description: description || '',
-    dueDate: dueDate ? new Date(dueDate) : now,
-    isRequired: isRequired !== false,
-    status: 'pending', completedBy: null, completedAt: null,
-    category: category || 'general', taskType: null,
-    requiresDocument: !!requiresDocument, documentId: null,
-  };
+  const taskKey = crypto.randomUUID();
 
-  const explicitList = taskListId ? record.taskLists.find(l => l.id === taskListId) : null;
-  const matchingList = explicitList || record.taskLists.find(l => l.assignedTo === assignedTo);
+  const explicitList = taskListId ? await knex('offboarding_task_lists').where({ recordId: record.id, listKey: taskListId }).first() : null;
+  const matchingListKey = explicitList ? explicitList.listKey : record.taskLists.find(l => l.assignedTo === assignedTo)?.id;
+  const matchingList = matchingListKey ? await knex('offboarding_task_lists').where({ recordId: record.id, listKey: matchingListKey }).first() : null;
 
   if (matchingList) {
-    await global.dbo.collection('offboarding_records').updateOne(
-      { _id: record._id, 'taskLists.id': matchingList.id },
-      { $push: { 'taskLists.$.tasks': newTask }, $set: { updatedAt: now } }
-    );
+    await knex('offboarding_tasks').insert({
+      taskListId: matchingList.id, taskKey, title, description: description || '',
+      dueDate: dueDate ? new Date(dueDate) : now, isRequired: isRequired !== false,
+      status: 'pending', completedBy: null, completedAt: null,
+      category: category || 'general', taskType: null, requiresDocument: !!requiresDocument, documentId: null,
+    });
   } else {
-    const newList = { id: crypto.randomUUID(), name: 'Additional Tasks', assignedTo, tasks: [newTask] };
-    await global.dbo.collection('offboarding_records').updateOne(
-      { _id: record._id },
-      { $push: { taskLists: newList }, $set: { updatedAt: now } }
-    );
+    const [newList] = await knex('offboarding_task_lists').insert({
+      recordId: record.id, listKey: crypto.randomUUID(), name: 'Additional Tasks', assignedTo,
+    }).returning('id');
+    await knex('offboarding_tasks').insert({
+      taskListId: newList.id ?? newList, taskKey, title, description: description || '',
+      dueDate: dueDate ? new Date(dueDate) : now, isRequired: isRequired !== false,
+      status: 'pending', completedBy: null, completedAt: null,
+      category: category || 'general', taskType: null, requiresDocument: !!requiresDocument, documentId: null,
+    });
   }
+  await knex('offboarding_records').where({ id: record.id }).update({ updatedAt: now });
 
-  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1 } });
+  const employee = await knex('employees').where({ id: String(record.employeeId) }).select('fullName').first();
   notifyStakeholder(assignedTo, record.employeeId, {
     title: `Offboarding: ${employee?.fullName ?? 'Employee'}`,
     body: `New task added: "${title}"`,
     type: 'offboarding',
   }).catch(() => {});
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { taskId: newTask.id });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { taskId: taskKey });
 };
 
 const updateAsset = async (req, res) => {
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
   const { returned, condition, notes } = req.body;
   const now = new Date();
-  await global.dbo.collection('offboarding_records').updateOne(
-    { _id: record._id, 'assetChecklist.id': req.params.assetId },
-    {
-      $set: {
-        'assetChecklist.$.returned': !!returned,
-        'assetChecklist.$.returnedAt': returned ? now : null,
-        'assetChecklist.$.returnedTo': returned ? (req.user?._id ? new ObjectId(req.user._id) : null) : null,
-        'assetChecklist.$.condition': condition ?? null,
-        'assetChecklist.$.notes': notes ?? null,
-        updatedAt: now,
-      },
-    }
-  );
+  await knex('offboarding_asset_checklist').where({ recordId: record.id, itemKey: req.params.assetId }).update({
+    returned: !!returned,
+    returnedAt: returned ? now : null,
+    returnedTo: returned ? (req.user?.id || null) : null,
+    condition: condition ?? null,
+    notes: notes ?? null,
+  });
+  await knex('offboarding_records').where({ id: record.id }).update({ updatedAt: now });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const updateAccess = async (req, res) => {
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
   const { revoked } = req.body;
   const now = new Date();
-  await global.dbo.collection('offboarding_records').updateOne(
-    { _id: record._id, 'accessRevocationList.id': req.params.accessId },
-    {
-      $set: {
-        'accessRevocationList.$.revoked': !!revoked,
-        'accessRevocationList.$.revokedAt': revoked ? now : null,
-        'accessRevocationList.$.revokedBy': revoked ? (req.user?._id ? new ObjectId(req.user._id) : null) : null,
-        updatedAt: now,
-      },
-    }
-  );
+  await knex('offboarding_access_revocation').where({ recordId: record.id, itemKey: req.params.accessId }).update({
+    revoked: !!revoked,
+    revokedAt: revoked ? now : null,
+    revokedBy: revoked ? (req.user?.id || null) : null,
+  });
+  await knex('offboarding_records').where({ id: record.id }).update({ updatedAt: now });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const updateRehire = async (req, res) => {
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
-  await updateOne('offboarding_records', { _id: record._id }, { $set: { eligibleForRehire: !!req.body.eligibleForRehire, updatedAt: new Date() } });
+  await knex('offboarding_records').where({ id: record.id }).update({ eligibleForRehire: !!req.body.eligibleForRehire, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -298,18 +337,19 @@ const updateRehire = async (req, res) => {
 const generateDocument = async (req, res) => {
   if (!validateRequiredFields(req, res, ['type'])) return;
   const { type } = req.body;
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await attachChecklists(await knex('offboarding_records').where({ id: req.params.id }).first());
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
-  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1, designation: 1, department: 1, dateOfHire: 1 } });
+  const employee = await knex('employees').where({ id: String(record.employeeId) })
+    .select('fullName', 'designation', 'department', 'dateOfHire').first();
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
   let fileUrl;
   if (type === 'experienceLetter') {
-    fileUrl = await generateExperienceLetter(record._id, { ...employee, lastWorkingDay: record.lastWorkingDay });
+    fileUrl = await generateExperienceLetter(record.id, { ...employee, lastWorkingDay: record.lastWorkingDay });
   } else if (type === 'relievingLetter') {
-    fileUrl = await generateRelievingLetter(record._id, { ...employee, lastWorkingDay: record.lastWorkingDay });
+    fileUrl = await generateRelievingLetter(record.id, { ...employee, lastWorkingDay: record.lastWorkingDay });
   } else if (type === 'clearanceCertificate') {
-    fileUrl = await generateClearanceCertificate(record._id, { ...employee, assetChecklist: record.assetChecklist, accessRevocationList: record.accessRevocationList });
+    fileUrl = await generateClearanceCertificate(record.id, { ...employee, assetChecklist: record.assetChecklist, accessRevocationList: record.accessRevocationList });
   } else if (type === 'finalPayslip') {
     return returnFunction(res, 400, false, 'Final payslips are generated from the Payroll module once the final pay run is processed, not here.');
   } else {
@@ -317,7 +357,8 @@ const generateDocument = async (req, res) => {
   }
 
   const generatedDoc = { type, generatedAt: new Date(), fileUrl };
-  await updateOne('offboarding_records', { _id: record._id }, { $push: { generatedDocuments: generatedDoc }, $set: { updatedAt: new Date() } });
+  await knex('offboarding_generated_documents').insert({ recordId: record.id, ...generatedDoc });
+  await knex('offboarding_records').where({ id: record.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 201, true, 'Document generated.', generatedDoc);
 };
 
@@ -325,13 +366,13 @@ const generateDocument = async (req, res) => {
 // into the payroll module's request-coupled cycle-creation logic directly. ────
 
 const triggerFinalPay = async (req, res) => {
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
   if (record.finalPayTriggered) return returnFunction(res, 400, false, 'Final pay has already been triggered for this employee.');
 
-  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1 } });
+  const employee = await knex('employees').where({ id: String(record.employeeId) }).select('fullName').first();
   const now = new Date();
-  await updateOne('offboarding_records', { _id: record._id }, { $set: { finalPayTriggered: true, finalPayTriggeredAt: now, updatedAt: now } });
+  await knex('offboarding_records').where({ id: record.id }).update({ finalPayTriggered: true, finalPayTriggeredAt: now, updatedAt: now });
 
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Final Pay Required',
@@ -340,7 +381,7 @@ const triggerFinalPay = async (req, res) => {
   }).catch(() => {});
 
   {
-    const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const hrUsers = await knex('users').whereIn('role', ['super_admin', 'hr_manager']).whereNot({ isActive: false }).select('email');
     const tokens = { employeeName: employee?.fullName ?? 'An employee', lastWorkingDay: new Date(record.lastWorkingDay).toDateString() };
     hrUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
       trigger: 'offboardingFinalPayRequired', to: u.email, tokens,
@@ -355,11 +396,11 @@ const triggerFinalPay = async (req, res) => {
 // ── Complete record (explicit HR action — closes the record, deactivates employee) ─
 
 const completeRecord = async (req, res) => {
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await knex('offboarding_records').where({ id: req.params.id }).first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
   if (record.status === 'completed') return returnFunction(res, 400, false, 'This record is already completed.');
 
-  const progressed = computeProgress(record);
+  const progressed = computeProgress(await attachTaskLists(record));
   const requiredTasks = progressed.taskLists.flatMap(l => l.tasks).filter(t => t.isRequired);
   const incompleteRequired = requiredTasks.filter(t => t.status !== 'completed');
   if (incompleteRequired.length) {
@@ -367,12 +408,12 @@ const completeRecord = async (req, res) => {
   }
 
   const now = new Date();
-  await updateOne('offboarding_records', { _id: record._id }, { $set: { status: 'completed', completedAt: now, updatedAt: now } });
-  await updateOne('employees', { _id: record.employeeId }, { $set: { status: 'inactive', updatedAt: now } });
+  await knex('offboarding_records').where({ id: record.id }).update({ status: 'completed', completedAt: now, updatedAt: now });
+  await knex('employees').where({ id: String(record.employeeId) }).update({ status: 'inactive', updatedAt: now });
   // The notification below has always said "account has been deactivated" — actually do it.
-  await global.dbo.collection('users').updateMany({ employeeId: record.employeeId }, { $set: { isActive: false } });
+  await knex('users').where({ employeeId: String(record.employeeId) }).update({ isActive: false });
 
-  const employee = await findOne('employees', { _id: record.employeeId }, { projection: { fullName: 1 } });
+  const employee = await knex('employees').where({ id: String(record.employeeId) }).select('fullName').first();
   if (employee) {
     notifyByRoles(['super_admin', 'hr_manager'], {
       title: 'Offboarding Complete',
@@ -389,7 +430,7 @@ const completeRecord = async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 const getAnalytics = async (req, res) => {
-  const records = await findMany('offboarding_records', {}, {});
+  const records = await Promise.all((await knex('offboarding_records')).map(attachChecklists));
 
   // Exit type breakdown
   const exitTypeCounts = {};
@@ -427,10 +468,10 @@ const getAnalytics = async (req, res) => {
 
 const getMyOffboarding = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, null);
-  const record = await findOne('offboarding_records', { employeeId: new ObjectId(req.user.employeeId) }, { sort: { createdAt: -1 } });
+  const record = await knex('offboarding_records').where({ employeeId: String(req.user.employeeId) }).orderBy('createdAt', 'desc').first();
   if (!record) return returnFunction(res, 200, true, req.locale.success, null);
 
-  const progressed = computeProgress(record);
+  const progressed = computeProgress(await attachAll(record));
   const myTaskList = progressed.taskLists.filter(l => l.assignedTo === 'employee');
   // Employees can see whether documents have been generated + download them, but
   // never the HR/IT/manager/finance task lists.
@@ -441,10 +482,7 @@ const updateMyTask = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
   const { taskId } = req.params;
 
-  const record = await findOne('offboarding_records', {
-    employeeId: new ObjectId(req.user.employeeId),
-    'taskLists.tasks.id': taskId,
-  });
+  const record = await attachTaskLists(await knex('offboarding_records').where({ employeeId: String(req.user.employeeId) }).orderBy('createdAt', 'desc').first());
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
 
   const owningList = record.taskLists.find(l => l.tasks.some(t => t.id === taskId));
@@ -453,34 +491,26 @@ const updateMyTask = async (req, res) => {
   }
 
   const now = new Date();
-  const setFields = {
-    'taskLists.$[list].tasks.$[task].status': 'completed',
-    'taskLists.$[list].tasks.$[task].completedAt': now,
-    'taskLists.$[list].tasks.$[task].completedBy': req.user?._id ? new ObjectId(req.user._id) : null,
-    updatedAt: now,
-  };
-  if (record.status === 'initiated') setFields.status = 'inProgress';
+  const listRow = await knex('offboarding_task_lists').where({ recordId: record.id, listKey: owningList.id }).first();
+  await knex('offboarding_tasks').where({ taskListId: listRow.id, taskKey: taskId }).update({
+    status: 'completed', completedAt: now, completedBy: req.user?.id || null,
+  });
+  const recordUpdate = { updatedAt: now };
+  if (record.status === 'initiated') recordUpdate.status = 'inProgress';
+  await knex('offboarding_records').where({ id: record.id }).update(recordUpdate);
 
-  await global.dbo.collection('offboarding_records').updateOne(
-    { _id: record._id },
-    { $set: setFields },
-    { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': taskId }] }
-  );
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 // Employee uploads a document for their own employee-assigned task — mirrors
 // onboarding's uploadMyDocument exactly, sharing the same onboarding_documents
-// collection (discriminated by recordType) so HR review/verify works identically.
+// table (discriminated by recordType) so HR review/verify works identically.
 const uploadMyDocument = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
   if (!validateRequiredFields(req, res, ['taskId'])) return;
   if (!req.file) return returnFunction(res, 400, false, 'A file is required.');
 
-  const record = await findOne('offboarding_records', {
-    employeeId: new ObjectId(req.user.employeeId),
-    'taskLists.tasks.id': req.body.taskId,
-  });
+  const record = await attachTaskLists(await knex('offboarding_records').where({ employeeId: String(req.user.employeeId) }).orderBy('createdAt', 'desc').first());
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
 
   const owningList = record.taskLists.find(l => l.tasks.some(t => t.id === req.body.taskId));
@@ -490,25 +520,14 @@ const uploadMyDocument = async (req, res) => {
   }
 
   const docResult = await insertOne('onboarding_documents', {
-    employeeId: new ObjectId(req.user.employeeId),
-    recordId: record._id,
-    recordType: 'offboarding',
-    taskId: req.body.taskId,
-    name: task.title,
-    type: 'upload',
-    fileUrl: `/uploads/${req.file.filename}`,
-    signedAt: null,
-    signedBy: null,
-    status: 'uploaded',
-    uploadedAt: new Date(),
-    createdAt: new Date(),
+    id: newId(), employeeId: String(req.user.employeeId), recordId: record.id, recordType: 'offboarding',
+    taskId: req.body.taskId, name: task.title, type: 'upload', fileUrl: `/uploads/${req.file.filename}`,
+    signedAt: null, signedBy: null, status: 'uploaded', uploadedAt: new Date(), createdAt: new Date(),
   });
 
-  await global.dbo.collection('offboarding_records').updateOne(
-    { _id: record._id },
-    { $set: { 'taskLists.$[list].tasks.$[task].documentId': docResult.insertedId, updatedAt: new Date() } },
-    { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': req.body.taskId }] }
-  );
+  const listRow = await knex('offboarding_task_lists').where({ recordId: record.id, listKey: owningList.id }).first();
+  await knex('offboarding_tasks').where({ taskListId: listRow.id, taskKey: req.body.taskId }).update({ documentId: docResult.id });
+  await knex('offboarding_records').where({ id: record.id }).update({ updatedAt: new Date() });
 
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Offboarding Document Uploaded',
@@ -516,7 +535,7 @@ const uploadMyDocument = async (req, res) => {
     type: 'general',
   }).catch(() => {});
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.id });
 };
 
 // HR uploads a document on behalf of any task, regardless of assignee — same
@@ -525,7 +544,7 @@ const uploadRecordDocument = async (req, res) => {
   if (!validateRequiredFields(req, res, ['taskId'])) return;
   if (!req.file) return returnFunction(res, 400, false, 'A file is required.');
 
-  const record = await findOne('offboarding_records', { _id: new ObjectId(req.params.id) });
+  const record = await attachTaskLists(await knex('offboarding_records').where({ id: req.params.id }).first());
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
 
   const owningList = record.taskLists.find(l => l.tasks.some(t => t.id === req.body.taskId));
@@ -533,40 +552,29 @@ const uploadRecordDocument = async (req, res) => {
   if (!owningList || !task) return returnFunction(res, 404, false, 'Task not found on this record.');
 
   const docResult = await insertOne('onboarding_documents', {
-    employeeId: record.employeeId,
-    recordId: record._id,
-    recordType: 'offboarding',
-    taskId: req.body.taskId,
-    name: task.title,
-    type: 'upload',
-    fileUrl: `/uploads/${req.file.filename}`,
-    signedAt: null,
-    signedBy: null,
-    status: 'uploaded',
-    uploadedAt: new Date(),
-    createdAt: new Date(),
+    id: newId(), employeeId: String(record.employeeId), recordId: record.id, recordType: 'offboarding',
+    taskId: req.body.taskId, name: task.title, type: 'upload', fileUrl: `/uploads/${req.file.filename}`,
+    signedAt: null, signedBy: null, status: 'uploaded', uploadedAt: new Date(), createdAt: new Date(),
   });
 
-  await global.dbo.collection('offboarding_records').updateOne(
-    { _id: record._id },
-    { $set: { 'taskLists.$[list].tasks.$[task].documentId': docResult.insertedId, updatedAt: new Date() } },
-    { arrayFilters: [{ 'list.id': owningList.id }, { 'task.id': req.body.taskId }] }
-  );
+  const listRow = await knex('offboarding_task_lists').where({ recordId: record.id, listKey: owningList.id }).first();
+  await knex('offboarding_tasks').where({ taskListId: listRow.id, taskKey: req.body.taskId }).update({ documentId: docResult.id });
+  await knex('offboarding_records').where({ id: record.id }).update({ updatedAt: new Date() });
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: docResult.id });
 };
 
 // ── Documents (HR view — supports the Record Detail "Documents" tab) ──────────
 
 const listRecordDocuments = async (req, res) => {
-  const docs = await findMany('onboarding_documents', { recordId: new ObjectId(req.params.id), recordType: 'offboarding' }, { sort: { createdAt: -1 } });
+  const docs = await knex('onboarding_documents').where({ recordId: req.params.id, recordType: 'offboarding' }).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, docs);
 };
 
 const verifyDocument = async (req, res) => {
-  const doc = await findOne('onboarding_documents', { _id: new ObjectId(req.params.id) });
+  const doc = await knex('onboarding_documents').where({ id: req.params.id }).first();
   if (!doc) return returnFunction(res, 404, false, req.locale.notFound);
-  await updateOne('onboarding_documents', { _id: doc._id }, { $set: { status: 'verified' } });
+  await knex('onboarding_documents').where({ id: doc.id }).update({ status: 'verified' });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -575,7 +583,7 @@ const submitExitInterview = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 403, false, 'No employee record linked.');
   if (!validateRequiredFields(req, res, ['reasonForLeaving', 'jobSatisfactionRating', 'managementRating', 'wouldRecommendCompany'])) return;
 
-  const record = await findOne('offboarding_records', { employeeId: new ObjectId(req.user.employeeId) }, { sort: { createdAt: -1 } });
+  const record = await knex('offboarding_records').where({ employeeId: String(req.user.employeeId) }).orderBy('createdAt', 'desc').first();
   if (!record) return returnFunction(res, 404, false, req.locale.notFound);
   if (record.exitInterview?.completedAt) return returnFunction(res, 409, false, 'You have already submitted your exit interview.');
 
@@ -595,7 +603,7 @@ const submitExitInterview = async (req, res) => {
     suggestions: suggestions || '',
     additionalComments: additionalComments || '',
   };
-  await updateOne('offboarding_records', { _id: record._id }, { $set: { exitInterview, updatedAt: now } });
+  await knex('offboarding_records').where({ id: record.id }).update({ exitInterview: JSON.stringify(exitInterview), updatedAt: now });
 
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Exit Interview Submitted',
@@ -608,11 +616,12 @@ const submitExitInterview = async (req, res) => {
 
 const getMyDocuments = async (req, res) => {
   if (!req.user?.employeeId) return returnFunction(res, 200, true, req.locale.success, []);
-  const record = await findOne('offboarding_records', { employeeId: new ObjectId(req.user.employeeId) }, { sort: { createdAt: -1 } });
+  const record = await knex('offboarding_records').where({ employeeId: String(req.user.employeeId) }).orderBy('createdAt', 'desc').first();
   if (!record) return returnFunction(res, 200, true, req.locale.success, []);
   // Employees only ever see experience/relieving letters — clearance certificates
   // are an internal HR/finance document, not something to hand to the departing employee.
-  const visible = (record.generatedDocuments || []).filter(d => ['experienceLetter', 'relievingLetter'].includes(d.type));
+  const generatedDocuments = await knex('offboarding_generated_documents').where({ recordId: record.id });
+  const visible = generatedDocuments.filter(d => ['experienceLetter', 'relievingLetter'].includes(d.type));
   return returnFunction(res, 200, true, req.locale.success, visible);
 };
 

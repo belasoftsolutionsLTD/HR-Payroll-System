@@ -1,5 +1,7 @@
-const { ObjectId } = require('mongodb');
-const { findOne, insertOne, insertMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — job_requisitions, candidates, applications (+ application_interview_
+// assignments) now live in Postgres.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 
 // Sales-demo data for the "View Demo" button on the login page — a single,
 // fully-fabricated requisition + pipeline so a prospective customer can click
@@ -10,8 +12,8 @@ const { findOne, insertOne, insertMany } = require('../../functions/Database/com
 //
 // Idempotent — safe to call on every /api/demo/login hit; only seeds once.
 const ensureDemoRecruitmentData = async () => {
-  const existing = await findOne('jobRequisitions', { isDemoData: true }, { projection: { _id: 1 } });
-  if (existing) return existing._id;
+  const existing = await knex('job_requisitions').where({ isDemoData: true }).select('id').first();
+  if (existing) return existing.id;
 
   const stages = [
     { id: 's-sourced', name: 'Sourced', type: 'sourcing', requiresScorecard: false, autoActions: [] },
@@ -27,7 +29,9 @@ const ensureDemoRecruitmentData = async () => {
     { id: 'c-comm', name: 'Communication', description: 'Explains ideas clearly to technical and non-technical audiences', weight: 3 },
   ];
 
-  const requisitionResult = await insertOne('jobRequisitions', {
+  const requisitionId = newId();
+  await knex('job_requisitions').insert({
+    id: requisitionId,
     isDemoData: true,
     title: 'Senior Product Designer',
     department: 'Product',
@@ -35,20 +39,19 @@ const ensureDemoRecruitmentData = async () => {
     branchId: null,
     employmentType: 'fullTime',
     headcount: 1,
-    salaryRange: { min: 180000, max: 240000, currency: 'KES' },
+    salaryRange: JSON.stringify({ min: 180000, max: 240000, currency: 'KES' }),
     description: 'Zenith Retail Group is hiring a Senior Product Designer to lead design across our customer-facing storefront and internal operations tools.',
     applicationDeadline: null,
-    competencies,
-    pipelineStages: stages,
-    screeningQuestions: [],
-    approvalChain: [],
+    competencies: JSON.stringify(competencies),
+    pipelineStages: JSON.stringify(stages),
+    screeningQuestions: JSON.stringify([]),
+    approvalChain: JSON.stringify([]),
     status: 'open',
     hiringManagerId: null,
     createdBy: null,
     createdAt: new Date(),
     updatedAt: new Date(),
   });
-  const requisitionId = requisitionResult.insertedId;
 
   const candidateDefs = [
     { firstName: 'Amara', lastName: 'Chege', source: 'careerSite' },
@@ -61,6 +64,7 @@ const ensureDemoRecruitmentData = async () => {
     { firstName: 'Samuel', lastName: 'Kiptoo', source: 'sourced' },
   ];
   const candidates = candidateDefs.map((c) => ({
+    id: newId(),
     isDemoData: true,
     firstName: c.firstName,
     lastName: c.lastName,
@@ -79,8 +83,8 @@ const ensureDemoRecruitmentData = async () => {
     createdAt: new Date(),
     updatedAt: new Date(),
   }));
-  const candidateResult = await insertMany('candidates', candidates);
-  const candidateIds = Object.values(candidateResult.insertedIds);
+  await knex('candidates').insert(candidates);
+  const candidateIds = candidates.map((c) => c.id);
 
   const now = new Date();
   const daysAgo = (n) => new Date(now.getTime() - n * 86400000);
@@ -88,9 +92,12 @@ const ensureDemoRecruitmentData = async () => {
   const historyFor = (stageId, stageName, enteredDaysAgo, exited) => ([{
     stageId, stageName, enteredAt: daysAgo(enteredDaysAgo), exitedAt: exited ? daysAgo(exited) : undefined, movedBy: null,
   }]);
+  // interviewerId is a fake, standalone id here (a real Mongo-ObjectId-shaped hex
+  // string for display purposes only) — this demo data never references a real user,
+  // so there's nothing to look up.
   const fakeInterviewer = (name) => ({
     stageId: 's-interview',
-    interviewerId: new ObjectId(),
+    interviewerId: newId(),
     interviewerName: name,
     scheduledAt: daysAgo(2),
     meetingLink: 'https://meet.example-demo.com/panel',
@@ -99,7 +106,7 @@ const ensureDemoRecruitmentData = async () => {
     assignedAt: daysAgo(4),
   });
 
-  const applications = [
+  const applicationDefs = [
     { candidateId: candidateIds[0], currentStageId: 's-sourced', status: 'active', stageHistory: historyFor('s-sourced', 'Sourced', 1) },
     { candidateId: candidateIds[1], currentStageId: 's-screen', status: 'active', stageHistory: [...historyFor('s-sourced', 'Sourced', 6, 3), ...historyFor('s-screen', 'Screening', 3)] },
     { candidateId: candidateIds[2], currentStageId: 's-screen', status: 'active', stageHistory: [...historyFor('s-sourced', 'Sourced', 5, 2), ...historyFor('s-screen', 'Screening', 2)] },
@@ -131,25 +138,34 @@ const ensureDemoRecruitmentData = async () => {
       candidateId: candidateIds[7], currentStageId: 's-screen', status: 'rejected', rejectionReason: 'Not enough e-commerce design experience for this role.',
       stageHistory: [...historyFor('s-sourced', 'Sourced', 14, 10), ...historyFor('s-screen', 'Screening', 10)],
     },
-  ].map((a) => ({
+  ];
+
+  const applications = applicationDefs.map((a) => ({
+    id: newId(),
     isDemoData: true,
     requisitionId,
     candidateId: a.candidateId,
     currentStageId: a.currentStageId,
-    stageHistory: a.stageHistory,
+    stageHistory: JSON.stringify(a.stageHistory),
     status: a.status,
-    rejectionReason: a.rejectionReason,
-    offerDetails: a.offerDetails,
+    rejectionReason: a.rejectionReason || null,
+    offerDetails: a.offerDetails ? JSON.stringify(a.offerDetails) : null,
     coverLetter: '',
-    answers: [],
-    scorecards: [],
-    interviewAssignments: a.interviewAssignments || [],
-    overallScore: a.overallScore,
+    answers: JSON.stringify([]),
+    overallScore: a.overallScore ?? null,
     createdAt: a.stageHistory[0].enteredAt,
     updatedAt: now,
   }));
+  await knex('applications').insert(applications);
 
-  await insertMany('applications', applications);
+  // interviewAssignments — a real child table now (application_interview_
+  // assignments), not an embedded array; insert after applications since each row
+  // needs its parent's real id.
+  const assignmentRows = applicationDefs.flatMap((a, i) =>
+    (a.interviewAssignments || []).map((asg) => ({ applicationId: applications[i].id, ...asg }))
+  );
+  if (assignmentRows.length) await knex('application_interview_assignments').insert(assignmentRows);
+
   return requisitionId;
 };
 

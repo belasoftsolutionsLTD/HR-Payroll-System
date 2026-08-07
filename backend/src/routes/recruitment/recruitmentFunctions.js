@@ -1,20 +1,18 @@
-const { ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const {
-  findOne, findMany, insertOne, updateOne, deleteOne, countDocuments, aggregate,
-} = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
-// employees/users (Phase 1) and leave_types/leave_balances (Phase 3a) now live in
-// Postgres; candidates/applications/jobRequisitions/scorecards are unmigrated (Phase 4)
-// and stay on the Mongo helpers above.
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — job_requisitions, candidates, applications (+ application_interview_
+// assignments), scorecards, interview_kits, nurture_campaigns (+ touchpoints),
+// email_templates, employees, users, leave_types/leave_balances (Phase 3a) all now
+// live in Postgres.
 const pgDB = require('../../functions/Database/pgDBFunctions');
+const { knex, newId, insertOne, updateOne } = pgDB;
+const { ObjectId } = require('mongodb');
 const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
 const { initiateOnboarding, resolveDefaultTemplate } = require('../../lib/onboarding/autoAssignTasks');
-const { sendEmail } = require('../../services/emailService');
 const { fireAutoActions } = require('../../lib/recruitment/autoActions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -28,32 +26,43 @@ const candidateTokens = (candidate, requisition) => ({
   companyName: process.env.COMPANY_NAME || 'Workfola',
 });
 
+// Reconstructs the Mongo-shaped `interviewAssignments[]` array from its real child
+// table (application_interview_assignments) — a real $push/$pull-per-row entity in
+// the original code, unlike stageHistory/answers/offerDetails (JSONB, whole-replaced).
+const attachInterviewAssignments = async (application) => {
+  if (!application) return application;
+  const assignments = await knex('application_interview_assignments').where({ applicationId: application.id }).orderBy('id');
+  return { ...application, interviewAssignments: assignments };
+};
+const attachInterviewAssignmentsMany = (applications) => Promise.all(applications.map(attachInterviewAssignments));
+
 // ── Requisitions ───────────────────────────────────────────────────────────────
 
 const createRequisition = async (req, res) => {
   if (!validateRequiredFields(req, res, ['title', 'department', 'location', 'employmentType', 'headcount', 'salaryRange', 'description'])) return;
 
   const doc = {
+    id: newId(),
     title: req.body.title.trim(),
     department: req.body.department,
     location: req.body.location,
     // Optional — which of the company's configured branches this role is based at.
     // null means "no specific branch" — the public careers page falls back to
     // showing "Headquarters" for these, same as when the company has no branches at all.
-    branchId: req.body.branchId ? new ObjectId(req.body.branchId) : null,
+    branchId: req.body.branchId ? String(req.body.branchId) : null,
     employmentType: req.body.employmentType,
     headcount: Number(req.body.headcount),
-    salaryRange: {
+    salaryRange: JSON.stringify({
       min: Number(req.body.salaryRange?.min) || 0,
       max: Number(req.body.salaryRange?.max) || 0,
       currency: req.body.salaryRange?.currency || 'KES',
-    },
+    }),
     description: req.body.description,
     applicationDeadline: req.body.applicationDeadline ? new Date(req.body.applicationDeadline) : null,
-    competencies: Array.isArray(req.body.competencies) ? req.body.competencies : [],
-    pipelineStages: Array.isArray(req.body.pipelineStages) ? req.body.pipelineStages : [],
-    screeningQuestions: Array.isArray(req.body.screeningQuestions) ? req.body.screeningQuestions : [],
-    approvalChain: Array.isArray(req.body.approvalChain)
+    competencies: JSON.stringify(Array.isArray(req.body.competencies) ? req.body.competencies : []),
+    pipelineStages: JSON.stringify(Array.isArray(req.body.pipelineStages) ? req.body.pipelineStages : []),
+    screeningQuestions: JSON.stringify(Array.isArray(req.body.screeningQuestions) ? req.body.screeningQuestions : []),
+    approvalChain: JSON.stringify(Array.isArray(req.body.approvalChain)
       ? req.body.approvalChain.map((a) => ({
         approverId: a.approverId,
         approverName: a.approverName,
@@ -61,49 +70,44 @@ const createRequisition = async (req, res) => {
         actedAt: null,
         comment: null,
       }))
-      : [],
+      : []),
     status: 'draft',
-    hiringManagerId: new ObjectId(req.body.hiringManagerId),
-    createdBy: new ObjectId(req.user._id),
+    hiringManagerId: String(req.body.hiringManagerId),
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
-  const result = await insertOne('jobRequisitions', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const result = await insertOne('job_requisitions', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const listRequisitions = async (req, res) => {
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.department) filter.department = req.query.department;
-  if (req.query.location) filter.location = req.query.location;
+  let query = knex('job_requisitions');
+  if (req.query.status) query = query.where({ status: req.query.status });
+  if (req.query.department) query = query.where({ department: req.query.department });
+  if (req.query.location) query = query.where({ location: req.query.location });
 
   const { page, limit, skip } = getPagination(req.query);
-  const [total, data] = await Promise.all([
-    countDocuments('jobRequisitions', filter),
-    findMany('jobRequisitions', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const data = await query.orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  const ids = data.map((r) => r._id);
+  const ids = data.map((r) => r.id);
   const counts = ids.length
-    ? await aggregate('applications', [
-      { $match: { requisitionId: { $in: ids } } },
-      { $group: { _id: '$requisitionId', count: { $sum: 1 } } },
-    ])
+    ? await knex('applications').whereIn('requisitionId', ids).select('requisitionId').count('* as count').groupBy('requisitionId')
     : [];
-  const countMap = Object.fromEntries(counts.map((c) => [String(c._id), c.count]));
-  const enriched = data.map((r) => ({ ...r, applicantCount: countMap[String(r._id)] || 0 }));
+  const countMap = Object.fromEntries(counts.map((c) => [c.requisitionId, Number(c.count)]));
+  const enriched = data.map((r) => ({ ...r, applicantCount: countMap[r.id] || 0 }));
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 const getRequisition = async (req, res) => {
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+  const requisition = await knex('job_requisitions').where({ id: req.params.id }).first();
   if (!requisition) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const applicantCount = await countDocuments('applications', { requisitionId: requisition._id });
-  return returnFunction(res, 200, true, req.locale.success, { ...requisition, applicantCount });
+  const [{ count }] = await knex('applications').where({ requisitionId: requisition.id }).count('* as count');
+  return returnFunction(res, 200, true, req.locale.success, { ...requisition, applicantCount: Number(count) });
 };
 
 const updateRequisition = async (req, res) => {
@@ -111,28 +115,30 @@ const updateRequisition = async (req, res) => {
     'title', 'department', 'location', 'branchId', 'employmentType', 'headcount', 'salaryRange',
     'description', 'applicationDeadline', 'competencies', 'pipelineStages', 'screeningQuestions', 'approvalChain', 'hiringManagerId',
   ];
+  const JSONB_FIELDS = new Set(['salaryRange', 'competencies', 'pipelineStages', 'screeningQuestions', 'approvalChain']);
   const update = { updatedAt: new Date() };
   allowed.forEach((f) => {
     if (req.body[f] === undefined) return;
-    if (f === 'hiringManagerId') update[f] = new ObjectId(req.body[f]);
-    else if (f === 'branchId') update[f] = req.body[f] ? new ObjectId(req.body[f]) : null;
+    if (f === 'hiringManagerId') update[f] = String(req.body[f]);
+    else if (f === 'branchId') update[f] = req.body[f] ? String(req.body[f]) : null;
     else if (f === 'applicationDeadline') update[f] = req.body[f] ? new Date(req.body[f]) : null;
+    else if (JSONB_FIELDS.has(f)) update[f] = JSON.stringify(req.body[f]);
     else update[f] = req.body[f];
   });
 
-  const result = await updateOne('jobRequisitions', { _id: new ObjectId(req.params.id) }, { $set: update });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const [updated] = await knex('job_requisitions').where({ id: req.params.id }).update(update).returning('id');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const submitRequisition = async (req, res) => {
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+  const requisition = await knex('job_requisitions').where({ id: req.params.id }).first();
   if (!requisition) return returnFunction(res, 404, false, req.locale.notFound);
   if (requisition.status !== 'draft') return returnFunction(res, 400, false, 'Only draft requisitions can be submitted for approval.');
   if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'Add at least one pipeline stage before submitting.');
   if (!requisition.approvalChain?.length) return returnFunction(res, 400, false, 'Add at least one approver before submitting.');
 
-  await updateOne('jobRequisitions', { _id: requisition._id }, { $set: { status: 'pendingApproval', updatedAt: new Date() } });
+  await knex('job_requisitions').where({ id: requisition.id }).update({ status: 'pendingApproval', updatedAt: new Date() });
 
   await Promise.all(requisition.approvalChain.map((a) => notifyUser(a.approverId, {
     title: 'Requisition Approval Needed',
@@ -147,11 +153,11 @@ const approveRequisition = async (req, res) => {
   if (!validateRequiredFields(req, res, ['status'])) return;
   if (!['approved', 'rejected'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be approved or rejected.');
 
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+  const requisition = await knex('job_requisitions').where({ id: req.params.id }).first();
   if (!requisition) return returnFunction(res, 404, false, req.locale.notFound);
   if (requisition.status !== 'pendingApproval') return returnFunction(res, 400, false, 'Requisition is not awaiting approval.');
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSuperAdmin = req.user.role === 'super_admin';
   const stepIndex = requisition.approvalChain.findIndex((a) => String(a.approverId) === userId);
   if (stepIndex === -1 && !isSuperAdmin) {
@@ -171,8 +177,8 @@ const approveRequisition = async (req, res) => {
     ? 'draft'
     : (approvalChain.every((a) => a.status === 'approved') ? 'open' : 'pendingApproval');
 
-  await updateOne('jobRequisitions', { _id: requisition._id }, {
-    $set: { approvalChain, status: overallStatus, updatedAt: new Date() },
+  await knex('job_requisitions').where({ id: requisition.id }).update({
+    approvalChain: JSON.stringify(approvalChain), status: overallStatus, updatedAt: new Date(),
   });
 
   notifyByRoles(['super_admin', 'hr_manager'], {
@@ -185,25 +191,27 @@ const approveRequisition = async (req, res) => {
 };
 
 const deleteRequisition = async (req, res) => {
-  const result = await updateOne('jobRequisitions', { _id: new ObjectId(req.params.id) }, { $set: { status: 'closed', updatedAt: new Date() } });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const [updated] = await knex('job_requisitions').where({ id: req.params.id }).update({ status: 'closed', updatedAt: new Date() }).returning('id');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 // ── Applications / Pipeline ──────────────────────────────────────────────────────
 
 const listApplicationsForRequisition = async (req, res) => {
-  const requisitionId = new ObjectId(req.params.id);
-  const applications = await findMany('applications', { requisitionId }, { sort: { createdAt: -1 } });
+  const requisitionId = req.params.id;
+  const applications = await attachInterviewAssignmentsMany(
+    await knex('applications').where({ requisitionId }).orderBy('createdAt', 'desc')
+  );
 
-  const candidateIds = [...new Set(applications.map((a) => String(a.candidateId)))].map((id) => new ObjectId(id));
-  const candidates = candidateIds.length ? await findMany('candidates', { _id: { $in: candidateIds } }) : [];
-  const candidateMap = Object.fromEntries(candidates.map((c) => [String(c._id), c]));
+  const candidateIds = [...new Set(applications.map((a) => a.candidateId))];
+  const candidates = candidateIds.length ? await knex('candidates').whereIn('id', candidateIds) : [];
+  const candidateMap = Object.fromEntries(candidates.map((c) => [c.id, c]));
 
   // Batch-load scorecards for every application's *current* stage so the kanban card can
   // show "2 of 3 panelists submitted" without an extra request per card.
   const allScorecards = applications.length
-    ? await findMany('scorecards', { applicationId: { $in: applications.map((a) => a._id) } }, { projection: { applicationId: 1, stageId: 1, interviewerId: 1 } })
+    ? await knex('scorecards').whereIn('applicationId', applications.map((a) => a.id)).select('applicationId', 'stageId', 'interviewerId')
     : [];
   const submittedByAppStage = {};
   allScorecards.forEach((sc) => {
@@ -213,12 +221,12 @@ const listApplicationsForRequisition = async (req, res) => {
   });
 
   const enriched = applications.map((a) => {
-    const key = `${a._id}_${a.currentStageId}`;
+    const key = `${a.id}_${a.currentStageId}`;
     const submittedInterviewerIds = submittedByAppStage[key] || new Set();
     const stageAssignments = (a.interviewAssignments || []).filter((asg) => asg.stageId === a.currentStageId);
     return {
       ...a,
-      candidate: candidateMap[String(a.candidateId)] || null,
+      candidate: candidateMap[a.candidateId] || null,
       currentStageScorecards: {
         submitted: submittedInterviewerIds.size,
         required: stageAssignments.length || null, // null = no one specifically assigned yet
@@ -237,7 +245,7 @@ const listApplicationsForRequisition = async (req, res) => {
 // Replicates the legacy hire flow: creates the employee record, seeds leave balances
 // and onboarding tasks, and decrements the requisition's remaining headcount.
 const hireCandidate = async (application, requisition, actingUser) => {
-  const candidate = await findOne('candidates', { _id: application.candidateId });
+  const candidate = await knex('candidates').where({ id: application.candidateId }).first();
   const hireDate = new Date();
   const staffNumber = await generateStaffNumber(hireDate.getFullYear());
   const fullName = candidate ? `${candidate.firstName} ${candidate.lastName}` : 'New Employee';
@@ -273,7 +281,7 @@ const hireCandidate = async (application, requisition, actingUser) => {
   // One leave_balances record per active leave type — builds up via the monthly
   // accrual cron (lib/leave/accrualEngine.js), same as direct employee creation.
   // leave_types/leave_balances now live in Postgres (Phase 3a).
-  const activeLeaveTypes = await pgDB.knex('leave_types').where({ isActive: true }).select('id');
+  const activeLeaveTypes = await knex('leave_types').where({ isActive: true }).select('id');
   if (activeLeaveTypes.length) {
     await pgDB.insertMany('leave_balances', activeLeaveTypes.map(lt => ({
       employeeId: empResult.id, leaveTypeId: lt.id, year: hireDate.getFullYear(),
@@ -284,18 +292,17 @@ const hireCandidate = async (application, requisition, actingUser) => {
 
   const onboardingTemplate = await resolveDefaultTemplate(empDoc.department);
   if (onboardingTemplate) {
-    await initiateOnboarding(empResult.id, onboardingTemplate._id, hireDate, null).catch(() => {});
+    await initiateOnboarding(empResult.id, onboardingTemplate.id, hireDate, null).catch(() => {});
   }
 
-  await updateOne('applications', { _id: application._id }, { $set: { status: 'hired', updatedAt: new Date() } });
+  await knex('applications').where({ id: application.id }).update({ status: 'hired', updatedAt: new Date() });
 
-  const updatedReq = await global.dbo.collection('jobRequisitions').findOneAndUpdate(
-    { _id: requisition._id },
-    { $inc: { headcount: -1 }, $set: { updatedAt: new Date() } },
-    { returnDocument: 'after' }
-  );
+  // Atomic decrement (Postgres gives this for free — no findOneAndUpdate/$inc
+  // workaround needed).
+  const [updatedReq] = await knex('job_requisitions').where({ id: requisition.id })
+    .update({ headcount: knex.raw('"headcount" - 1'), updatedAt: new Date() }).returning('*');
   if (updatedReq && updatedReq.headcount <= 0) {
-    await updateOne('jobRequisitions', { _id: requisition._id }, { $set: { status: 'filled' } });
+    await knex('job_requisitions').where({ id: requisition.id }).update({ status: 'filled' });
   }
 
   notifyHR({
@@ -331,7 +338,7 @@ const moveApplicationStageCore = async (application, requisition, toStageId, act
   const isForwardMove = fromIndex === -1 || toIndex > fromIndex;
   if (isForwardMove && fromStage?.requiresScorecard) {
     const stageAssignments = (application.interviewAssignments || []).filter((a) => a.stageId === fromStage.id);
-    const stageScorecards = await findMany('scorecards', { applicationId: application._id, stageId: fromStage.id }, { projection: { interviewerId: 1 } });
+    const stageScorecards = await knex('scorecards').where({ applicationId: application.id, stageId: fromStage.id }).select('interviewerId');
 
     if (stageAssignments.length > 0) {
       // Panel interview — every assigned interviewer must have submitted their own scorecard.
@@ -349,14 +356,14 @@ const moveApplicationStageCore = async (application, requisition, toStageId, act
   const stageHistory = application.stageHistory.map((h, i) => (
     i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
   ));
-  stageHistory.push({ stageId: toStage.id, stageName: toStage.name, enteredAt: now, movedBy: actingUser?._id ? new ObjectId(actingUser._id) : null });
+  stageHistory.push({ stageId: toStage.id, stageName: toStage.name, enteredAt: now, movedBy: actingUser?.id || null });
 
-  await updateOne('applications', { _id: application._id }, {
-    $set: { currentStageId: toStage.id, stageHistory, updatedAt: now },
+  await knex('applications').where({ id: application.id }).update({
+    currentStageId: toStage.id, stageHistory: JSON.stringify(stageHistory), updatedAt: now,
   });
 
-  if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
-  await fireAutoActions({ ...application, currentStageId: toStage.id }, toStage, global.dbo, 'onEnter');
+  if (fromStage) await fireAutoActions(application, fromStage, 'onExit');
+  await fireAutoActions({ ...application, currentStageId: toStage.id }, toStage, 'onEnter');
 
   let hiredEmployeeId = null;
   if (toStage.type === 'hired') {
@@ -369,11 +376,11 @@ const moveApplicationStageCore = async (application, requisition, toStageId, act
 const moveApplicationStage = async (req, res) => {
   if (!validateRequiredFields(req, res, ['stageId'])) return;
 
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  const application = await attachInterviewAssignments(await knex('applications').where({ id: req.params.id }).first());
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
   if (application.status !== 'active') return returnFunction(res, 400, false, 'Only active applications can be moved.');
 
-  const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
+  const requisition = await knex('job_requisitions').where({ id: application.requisitionId }).first();
   if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
 
   const targetStage = requisition.pipelineStages.find((s) => s.id === req.body.stageId);
@@ -398,14 +405,13 @@ const updateApplicationStatus = async (req, res) => {
   if (req.body.status === 'rejected') update.rejectionReason = req.body.rejectionReason || null;
   if (req.body.status === 'active') update.rejectionReason = null;
 
-  const result = await updateOne('applications', { _id: new ObjectId(req.params.id) }, { $set: update });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const [updated] = await knex('applications').where({ id: req.params.id }).update(update).returning('*');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
 
   if (req.body.status === 'rejected') {
-    const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
     const [candidate, requisition] = await Promise.all([
-      findOne('candidates', { _id: application.candidateId }),
-      findOne('jobRequisitions', { _id: application.requisitionId }),
+      knex('candidates').where({ id: updated.candidateId }).first(),
+      knex('job_requisitions').where({ id: updated.requisitionId }).first(),
     ]);
     if (candidate?.email) {
       const tokens = candidateTokens(candidate, requisition);
@@ -443,7 +449,7 @@ const bulkApplicationAction = async (req, res) => {
     return returnFunction(res, 400, false, `action must be one of: ${BULK_APPLICATION_ACTIONS.join(', ')}`);
   }
 
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.params.id) });
+  const requisition = await knex('job_requisitions').where({ id: req.params.id }).first();
   if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
 
   // 'shortlist' moves to an HR-chosen stage; 'hire' always targets the requisition's
@@ -468,15 +474,17 @@ const bulkApplicationAction = async (req, res) => {
 
   for (const id of applicationIds) {
     try {
-      const application = await findOne('applications', { _id: new ObjectId(id), requisitionId: requisition._id });
+      const application = await attachInterviewAssignments(
+        await knex('applications').where({ id, requisitionId: requisition.id }).first()
+      );
       if (!application) throw new Error('Application not found in this requisition.');
       if (application.status !== 'active') throw new Error('Only active applications can be updated.');
 
       if (action === 'reject') {
-        await updateOne('applications', { _id: application._id }, {
-          $set: { status: 'rejected', rejectionReason: rejectionReason || null, updatedAt: new Date() },
+        await knex('applications').where({ id: application.id }).update({
+          status: 'rejected', rejectionReason: rejectionReason || null, updatedAt: new Date(),
         });
-        const candidate = await findOne('candidates', { _id: application.candidateId });
+        const candidate = await knex('candidates').where({ id: application.candidateId }).first();
         if (candidate?.email) {
           const tokens = candidateTokens(candidate, requisition);
           sendTemplatedEmail({
@@ -524,7 +532,7 @@ const extendOffer = async (req, res) => {
     return returnFunction(res, 400, false, 'Offer expiry cannot be after the start date.');
   }
 
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  const application = await attachInterviewAssignments(await knex('applications').where({ id: req.params.id }).first());
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
   // A candidate must actively confirm their own offer — HR extending it doesn't count as
@@ -539,11 +547,11 @@ const extendOffer = async (req, res) => {
     status: 'pending',
     responseTokenHash: crypto.createHash('sha256').update(rawResponseToken).digest('hex'),
   };
-  await updateOne('applications', { _id: application._id }, { $set: { offerDetails, updatedAt: new Date() } });
+  await knex('applications').where({ id: application.id }).update({ offerDetails: JSON.stringify(offerDetails), updatedAt: new Date() });
 
   const [candidate, requisition] = await Promise.all([
-    findOne('candidates', { _id: application.candidateId }),
-    findOne('jobRequisitions', { _id: application.requisitionId }),
+    knex('candidates').where({ id: application.candidateId }).first(),
+    knex('job_requisitions').where({ id: application.requisitionId }).first(),
   ]);
 
   // Extending an offer IS the action that moves a candidate into the "Offer" stage —
@@ -557,11 +565,11 @@ const extendOffer = async (req, res) => {
     const stageHistory = (application.stageHistory || []).map((h, i) => (
       i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
     ));
-    stageHistory.push({ stageId: offerStage.id, stageName: offerStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) });
-    await updateOne('applications', { _id: application._id }, { $set: { currentStageId: offerStage.id, stageHistory, updatedAt: now } });
+    stageHistory.push({ stageId: offerStage.id, stageName: offerStage.name, enteredAt: now, movedBy: req.user.id });
+    await knex('applications').where({ id: application.id }).update({ currentStageId: offerStage.id, stageHistory: JSON.stringify(stageHistory), updatedAt: now });
 
-    if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
-    await fireAutoActions({ ...application, currentStageId: offerStage.id }, offerStage, global.dbo, 'onEnter');
+    if (fromStage) await fireAutoActions(application, fromStage, 'onExit');
+    await fireAutoActions({ ...application, currentStageId: offerStage.id }, offerStage, 'onEnter');
   }
 
   if (candidate?.email) {
@@ -583,15 +591,14 @@ const extendOffer = async (req, res) => {
 // token route (see publicRoutes.js) apply identical accept/decline logic — actingUser
 // is null for candidate self-service, since there's no logged-in user in that flow.
 const respondToOfferCore = async (application, status, actingUser) => {
-  await updateOne('applications', { _id: application._id }, {
-    $set: { 'offerDetails.status': status, updatedAt: new Date() },
-  });
+  const offerDetails = { ...application.offerDetails, status };
+  await knex('applications').where({ id: application.id }).update({ offerDetails: JSON.stringify(offerDetails), updatedAt: new Date() });
 
   // Accepting the offer moves the candidate straight into the requisition's "hired" stage
   // (if one is configured) instead of leaving that as a separate manual drag.
   let hiredEmployeeId = null;
   if (status === 'accepted' && application.status === 'active') {
-    const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
+    const requisition = await knex('job_requisitions').where({ id: application.requisitionId }).first();
     const fromStage = requisition?.pipelineStages.find((s) => s.id === application.currentStageId);
     const hiredStage = requisition?.pipelineStages.find((s) => s.type === 'hired');
 
@@ -600,11 +607,11 @@ const respondToOfferCore = async (application, status, actingUser) => {
       const stageHistory = application.stageHistory.map((h, i) => (
         i === application.stageHistory.length - 1 && !h.exitedAt ? { ...h, exitedAt: now } : h
       ));
-      stageHistory.push({ stageId: hiredStage.id, stageName: hiredStage.name, enteredAt: now, movedBy: actingUser?._id ? new ObjectId(actingUser._id) : null });
-      await updateOne('applications', { _id: application._id }, { $set: { currentStageId: hiredStage.id, stageHistory, updatedAt: now } });
+      stageHistory.push({ stageId: hiredStage.id, stageName: hiredStage.name, enteredAt: now, movedBy: actingUser?.id || null });
+      await knex('applications').where({ id: application.id }).update({ currentStageId: hiredStage.id, stageHistory: JSON.stringify(stageHistory), updatedAt: now });
 
-      if (fromStage) await fireAutoActions(application, fromStage, global.dbo, 'onExit');
-      await fireAutoActions({ ...application, currentStageId: hiredStage.id }, hiredStage, global.dbo, 'onEnter');
+      if (fromStage) await fireAutoActions(application, fromStage, 'onExit');
+      await fireAutoActions({ ...application, currentStageId: hiredStage.id }, hiredStage, 'onEnter');
 
       hiredEmployeeId = await hireCandidate({ ...application, currentStageId: hiredStage.id }, requisition, actingUser);
     }
@@ -617,7 +624,7 @@ const respondToOffer = async (req, res) => {
   if (!validateRequiredFields(req, res, ['status'])) return;
   if (!['accepted', 'declined'].includes(req.body.status)) return returnFunction(res, 400, false, 'status must be accepted or declined.');
 
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  const application = await attachInterviewAssignments(await knex('applications').where({ id: req.params.id }).first());
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
   const hiredEmployeeId = await respondToOfferCore(application, req.body.status, req.user);
@@ -639,16 +646,16 @@ const assignInterviewer = async (req, res) => {
     return returnFunction(res, 400, false, 'Interview time must be at least 5 minutes from now.');
   }
 
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  const application = await attachInterviewAssignments(await knex('applications').where({ id: req.params.id }).first());
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const requisition = await findOne('jobRequisitions', { _id: application.requisitionId });
+  const requisition = await knex('job_requisitions').where({ id: application.requisitionId }).first();
   if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
 
-  const interviewer = await findOne('users', { _id: new ObjectId(req.body.interviewerId) });
+  const interviewer = await knex('users').where({ id: String(req.body.interviewerId) }).first();
   if (!interviewer) return returnFunction(res, 404, false, 'Interviewer account not found.');
 
-  const already = (application.interviewAssignments || []).some(
+  const already = application.interviewAssignments.some(
     (a) => a.stageId === req.body.stageId && String(a.interviewerId) === req.body.interviewerId
   );
   if (already) return returnFunction(res, 409, false, 'This interviewer is already assigned to this stage.');
@@ -664,8 +671,9 @@ const assignInterviewer = async (req, res) => {
   }
 
   const assignment = {
+    applicationId: application.id,
     stageId: req.body.stageId,
-    interviewerId: new ObjectId(req.body.interviewerId),
+    interviewerId: String(req.body.interviewerId),
     interviewerName: interviewer.name,
     scheduledAt,
     // Candidate-facing logistics — deliberately separate from interviewerId/interviewerName
@@ -675,12 +683,10 @@ const assignInterviewer = async (req, res) => {
     requiredDocuments: req.body.requiredDocuments || null,
     assignedAt: new Date(),
   };
-  await updateOne('applications', { _id: application._id }, {
-    $push: { interviewAssignments: assignment },
-    $set: { updatedAt: new Date() },
-  });
+  await knex('application_interview_assignments').insert(assignment);
+  await knex('applications').where({ id: application.id }).update({ updatedAt: new Date() });
 
-  notifyUser(interviewer._id, {
+  notifyUser(interviewer.id, {
     title: 'Interview Assigned',
     body: `You've been assigned to interview a candidate at the "${req.body.stageId}" stage, scheduled ${assignment.scheduledAt.toLocaleString()}.`,
     type: 'recruitment',
@@ -689,7 +695,7 @@ const assignInterviewer = async (req, res) => {
   // Tell the candidate their interview is scheduled, with every logistical detail they
   // need (meeting link, location, time, required documents) — but never who is
   // interviewing them, which is HR/internal-only information.
-  const candidate = await findOne('candidates', { _id: application.candidateId });
+  const candidate = await knex('candidates').where({ id: application.candidateId }).first();
   if (candidate?.email) {
     const tokens = candidateTokens(candidate, requisition);
     const when = assignment.scheduledAt.toLocaleString('en-KE', { dateStyle: 'full', timeStyle: 'short' });
@@ -719,15 +725,15 @@ const assignInterviewer = async (req, res) => {
 // HR-triggered reminder email to the candidate ahead of their scheduled interview/assessment
 // — a deliberate manual action (not an automated cron job) so HR decides when to reach out.
 const sendInterviewReminder = async (req, res) => {
-  const application = await findOne('applications', { _id: new ObjectId(req.params.id) });
+  const application = await knex('applications').where({ id: req.params.id }).first();
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const assignment = (application.interviewAssignments || []).find((a) => a.stageId === req.params.stageId);
+  const assignment = await knex('application_interview_assignments').where({ applicationId: application.id, stageId: req.params.stageId }).first();
   if (!assignment) return returnFunction(res, 404, false, 'No interview assignment found for this stage.');
 
   const [candidate, requisition] = await Promise.all([
-    findOne('candidates', { _id: application.candidateId }),
-    findOne('jobRequisitions', { _id: application.requisitionId }),
+    knex('candidates').where({ id: application.candidateId }).first(),
+    knex('job_requisitions').where({ id: application.requisitionId }).first(),
   ]);
   if (!candidate?.email) return returnFunction(res, 400, false, 'This candidate has no email on file.');
 
@@ -752,65 +758,61 @@ const sendInterviewReminder = async (req, res) => {
 };
 
 const unassignInterviewer = async (req, res) => {
-  await updateOne('applications', { _id: new ObjectId(req.params.id) }, {
-    $pull: { interviewAssignments: { stageId: req.params.stageId, interviewerId: new ObjectId(req.params.interviewerId) } },
-    $set: { updatedAt: new Date() },
-  });
+  await knex('application_interview_assignments').where({
+    applicationId: req.params.id, stageId: req.params.stageId, interviewerId: String(req.params.interviewerId),
+  }).del();
+  await knex('applications').where({ id: req.params.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Interviewer unassigned.');
 };
 
 // Self-scoped view for an interviewer (any role, including plain staff) to see
 // their own upcoming/past interview assignments and jump straight to the scorecard
-// form — deliberately filtered server-side to req.user._id so this is safe to expose
+// form — deliberately filtered server-side to req.user.id so this is safe to expose
 // broadly, unlike listScorecardsForApplication/getScorecard which return other
 // interviewers' assessments and candidate PII and must stay MGMT-only.
 const getMyInterviews = async (req, res) => {
-  const interviewerId = new ObjectId(req.user._id);
+  const interviewerId = String(req.user.id);
 
-  const applications = await findMany('applications', {
-    'interviewAssignments.interviewerId': interviewerId,
-  }, { sort: { updatedAt: -1 } });
+  const myAssignmentRows = await knex('application_interview_assignments').where({ interviewerId }).orderBy('assignedAt', 'desc');
+  if (!myAssignmentRows.length) return returnFunction(res, 200, true, 'OK', []);
 
-  if (!applications.length) return returnFunction(res, 200, true, 'OK', []);
+  const applicationIds = [...new Set(myAssignmentRows.map((a) => a.applicationId))];
+  const applications = await knex('applications').whereIn('id', applicationIds);
+  const applicationById = Object.fromEntries(applications.map((a) => [a.id, a]));
 
-  const candidateIds = [...new Set(applications.map((a) => String(a.candidateId)))].map((id) => new ObjectId(id));
-  const requisitionIds = [...new Set(applications.map((a) => String(a.requisitionId)))].map((id) => new ObjectId(id));
+  const candidateIds = [...new Set(applications.map((a) => a.candidateId))];
+  const requisitionIds = [...new Set(applications.map((a) => a.requisitionId))];
   const [candidates, requisitions, myScorecards] = await Promise.all([
-    findMany('candidates', { _id: { $in: candidateIds } }, { projection: { firstName: 1, lastName: 1 } }),
-    findMany('jobRequisitions', { _id: { $in: requisitionIds } }, { projection: { title: 1, pipelineStages: 1, competencies: 1 } }),
-    findMany('scorecards', { interviewerId, applicationId: { $in: applications.map((a) => a._id) } }, { projection: { applicationId: 1, stageId: 1 } }),
+    candidateIds.length ? knex('candidates').whereIn('id', candidateIds).select('id', 'firstName', 'lastName') : [],
+    requisitionIds.length ? knex('job_requisitions').whereIn('id', requisitionIds).select('id', 'title', 'pipelineStages', 'competencies') : [],
+    knex('scorecards').where({ interviewerId }).whereIn('applicationId', applicationIds).select('applicationId', 'stageId'),
   ]);
-  const candidateById = Object.fromEntries(candidates.map((c) => [String(c._id), c]));
-  const requisitionById = Object.fromEntries(requisitions.map((r) => [String(r._id), r]));
+  const candidateById = Object.fromEntries(candidates.map((c) => [c.id, c]));
+  const requisitionById = Object.fromEntries(requisitions.map((r) => [r.id, r]));
   const submittedKeys = new Set(myScorecards.map((s) => `${s.applicationId}:${s.stageId}`));
 
-  const rows = [];
-  for (const application of applications) {
-    const requisition = requisitionById[String(application.requisitionId)];
-    const candidate = candidateById[String(application.candidateId)];
-    const myAssignments = (application.interviewAssignments || []).filter(
-      (a) => String(a.interviewerId) === String(interviewerId)
-    );
-    for (const assignment of myAssignments) {
-      const stage = requisition?.pipelineStages?.find((s) => s.id === assignment.stageId);
-      rows.push({
-        applicationId: application._id,
-        candidateName: candidate ? `${candidate.firstName} ${candidate.lastName}` : 'Unknown candidate',
-        jobTitle: requisition?.title || 'Unknown role',
-        stageId: assignment.stageId,
-        stageName: stage?.name || assignment.stageId,
-        scheduledAt: assignment.scheduledAt,
-        meetingLink: assignment.meetingLink,
-        location: assignment.location,
-        requiredDocuments: assignment.requiredDocuments,
-        // Denormalized here (rather than requiring the frontend to fetch the requisition
-        // separately) because GET /requisitions/:id is MGMT-gated and this endpoint is
-        // the one thing a plain-staff interviewer is allowed to call.
-        competencies: requisition?.competencies || [],
-        scorecardSubmitted: submittedKeys.has(`${application._id}:${assignment.stageId}`),
-      });
-    }
-  }
+  const rows = myAssignmentRows.map((assignment) => {
+    const application = applicationById[assignment.applicationId];
+    const requisition = application && requisitionById[application.requisitionId];
+    const candidate = application && candidateById[application.candidateId];
+    const stage = requisition?.pipelineStages?.find((s) => s.id === assignment.stageId);
+    return {
+      applicationId: assignment.applicationId,
+      candidateName: candidate ? `${candidate.firstName} ${candidate.lastName}` : 'Unknown candidate',
+      jobTitle: requisition?.title || 'Unknown role',
+      stageId: assignment.stageId,
+      stageName: stage?.name || assignment.stageId,
+      scheduledAt: assignment.scheduledAt,
+      meetingLink: assignment.meetingLink,
+      location: assignment.location,
+      requiredDocuments: assignment.requiredDocuments,
+      // Denormalized here (rather than requiring the frontend to fetch the requisition
+      // separately) because GET /requisitions/:id is MGMT-gated and this endpoint is
+      // the one thing a plain-staff interviewer is allowed to call.
+      competencies: requisition?.competencies || [],
+      scorecardSubmitted: submittedKeys.has(`${assignment.applicationId}:${assignment.stageId}`),
+    };
+  });
 
   rows.sort((a, b) => new Date(b.scheduledAt) - new Date(a.scheduledAt));
   return returnFunction(res, 200, true, 'OK', rows);
@@ -819,14 +821,14 @@ const getMyInterviews = async (req, res) => {
 // ── Scorecards ────────────────────────────────────────────────────────────────
 
 const recomputeOverallScore = async (applicationId) => {
-  const scorecards = await findMany('scorecards', { applicationId });
+  const scorecards = await knex('scorecards').where({ applicationId });
   if (!scorecards.length) return;
   const perScorecardAvgs = scorecards.map((sc) => {
     const ratings = sc.competencyRatings.map((r) => r.rating);
     return ratings.reduce((a, b) => a + b, 0) / ratings.length;
   });
   const overallScore = perScorecardAvgs.reduce((a, b) => a + b, 0) / perScorecardAvgs.length;
-  await updateOne('applications', { _id: applicationId }, { $set: { overallScore: Math.round(overallScore * 100) / 100 } });
+  await knex('applications').where({ id: applicationId }).update({ overallScore: Math.round(overallScore * 100) / 100 });
 };
 
 const submitScorecard = async (req, res) => {
@@ -835,33 +837,34 @@ const submitScorecard = async (req, res) => {
     return returnFunction(res, 400, false, 'Rate at least one competency.');
   }
 
-  const applicationId = new ObjectId(req.params.id);
-  const application = await findOne('applications', { _id: applicationId });
+  const applicationId = req.params.id;
+  const application = await attachInterviewAssignments(await knex('applications').where({ id: applicationId }).first());
   if (!application) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const stageAssignments = (application.interviewAssignments || []).filter((a) => a.stageId === req.body.stageId);
-  const isAssigned = stageAssignments.some((a) => String(a.interviewerId) === String(req.user._id));
+  const stageAssignments = application.interviewAssignments.filter((a) => a.stageId === req.body.stageId);
+  const isAssigned = stageAssignments.some((a) => String(a.interviewerId) === String(req.user.id));
   if (stageAssignments.length > 0 && !isAssigned && req.user.role !== 'super_admin') {
     return returnFunction(res, 403, false, 'This interview is assigned to a different interviewer.');
   }
 
-  const existing = await findOne('scorecards', {
-    applicationId, stageId: req.body.stageId, interviewerId: new ObjectId(req.user._id),
-  });
+  const existing = await knex('scorecards').where({
+    applicationId, stageId: req.body.stageId, interviewerId: String(req.user.id),
+  }).first();
   if (existing) return returnFunction(res, 409, false, 'You have already submitted a scorecard for this stage.');
 
   const doc = {
+    id: newId(),
     applicationId,
     requisitionId: application.requisitionId,
     stageId: req.body.stageId,
-    interviewerId: new ObjectId(req.user._id),
+    interviewerId: String(req.user.id),
     interviewerName: req.user.name || 'Interviewer',
-    competencyRatings: req.body.competencyRatings.map((r) => ({
+    competencyRatings: JSON.stringify(req.body.competencyRatings.map((r) => ({
       competencyId: r.competencyId,
       competencyName: r.competencyName,
       rating: Number(r.rating),
       notes: r.notes || '',
-    })),
+    }))),
     overallRecommendation: req.body.overallRecommendation,
     strengths: req.body.strengths,
     concerns: req.body.concerns,
@@ -869,22 +872,22 @@ const submitScorecard = async (req, res) => {
   };
   const result = await insertOne('scorecards', doc);
 
-  await updateOne('applications', { _id: applicationId }, {
-    $push: { scorecards: result.insertedId },
-    $set: { updatedAt: new Date() },
-  });
+  // NOTE: the old Mongo code also $push'd this scorecard's id onto
+  // applications.scorecards[] — dropped here since that field was write-only and
+  // never read anywhere (see the migration file's own comment on why).
+  await knex('applications').where({ id: applicationId }).update({ updatedAt: new Date() });
   await recomputeOverallScore(applicationId);
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const listScorecardsForApplication = async (req, res) => {
-  const scorecards = await findMany('scorecards', { applicationId: new ObjectId(req.params.id) }, { sort: { submittedAt: -1 } });
+  const scorecards = await knex('scorecards').where({ applicationId: req.params.id }).orderBy('submittedAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, scorecards);
 };
 
 const getScorecard = async (req, res) => {
-  const scorecard = await findOne('scorecards', { _id: new ObjectId(req.params.id) });
+  const scorecard = await knex('scorecards').where({ id: req.params.id }).first();
   if (!scorecard) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, scorecard);
 };
@@ -895,10 +898,11 @@ const createCandidate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['firstName', 'lastName', 'email', 'source'])) return;
 
   const email = req.body.email.toLowerCase().trim();
-  const existing = await findOne('candidates', { email });
+  const existing = await knex('candidates').where({ email }).first();
   if (existing) return returnFunction(res, 409, false, 'A candidate with this email already exists.');
 
   const doc = {
+    id: newId(),
     firstName: req.body.firstName.trim(),
     lastName: req.body.lastName.trim(),
     email,
@@ -907,7 +911,7 @@ const createCandidate = async (req, res) => {
     resumeUrl: req.body.resumeUrl || null,
     linkedInUrl: req.body.linkedInUrl || null,
     source: req.body.source,
-    referredBy: req.body.referredBy ? new ObjectId(req.body.referredBy) : null,
+    referredBy: req.body.referredBy ? String(req.body.referredBy) : null,
     tags: Array.isArray(req.body.tags) ? req.body.tags : [],
     isPassiveTalent: !!req.body.isPassiveTalent,
     consentGivenAt: new Date(),
@@ -917,34 +921,35 @@ const createCandidate = async (req, res) => {
     updatedAt: new Date(),
   };
   const result = await insertOne('candidates', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const listCandidates = async (req, res) => {
-  const filter = {};
-  if (req.query.source) filter.source = req.query.source;
-  if (req.query.tags) filter.tags = { $in: [].concat(req.query.tags) };
-  if (req.query.isPassiveTalent !== undefined) filter.isPassiveTalent = req.query.isPassiveTalent === 'true';
+  let query = knex('candidates');
+  if (req.query.source) query = query.where({ source: req.query.source });
+  if (req.query.tags) {
+    const tags = [].concat(req.query.tags);
+    query = query.whereRaw('"tags" && ?::text[]', [tags]);
+  }
+  if (req.query.isPassiveTalent !== undefined) query = query.where({ isPassiveTalent: req.query.isPassiveTalent === 'true' });
 
   const { page, limit, skip } = getPagination(req.query);
-  const [total, data] = await Promise.all([
-    countDocuments('candidates', filter),
-    findMany('candidates', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, total, page, limit));
+  const [{ count }] = await query.clone().count('* as count');
+  const data = await query.orderBy('createdAt', 'desc').limit(limit).offset(skip);
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, Number(count), page, limit));
 };
 
 const getCandidate = async (req, res) => {
-  const candidate = await findOne('candidates', { _id: new ObjectId(req.params.id) });
+  const candidate = await knex('candidates').where({ id: req.params.id }).first();
   if (!candidate) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const applications = await findMany('applications', { candidateId: candidate._id }, { sort: { createdAt: -1 } });
-  const requisitionIds = [...new Set(applications.map((a) => String(a.requisitionId)))].map((id) => new ObjectId(id));
+  const applications = await knex('applications').where({ candidateId: candidate.id }).orderBy('createdAt', 'desc');
+  const requisitionIds = [...new Set(applications.map((a) => a.requisitionId))];
   const requisitions = requisitionIds.length
-    ? await findMany('jobRequisitions', { _id: { $in: requisitionIds } }, { projection: { title: 1, department: 1 } })
+    ? await knex('job_requisitions').whereIn('id', requisitionIds).select('id', 'title', 'department')
     : [];
-  const reqMap = Object.fromEntries(requisitions.map((r) => [String(r._id), r]));
-  const enrichedApplications = applications.map((a) => ({ ...a, requisition: reqMap[String(a.requisitionId)] || null }));
+  const reqMap = Object.fromEntries(requisitions.map((r) => [r.id, r]));
+  const enrichedApplications = applications.map((a) => ({ ...a, requisition: reqMap[a.requisitionId] || null }));
 
   return returnFunction(res, 200, true, req.locale.success, { ...candidate, applications: enrichedApplications });
 };
@@ -954,42 +959,42 @@ const updateCandidate = async (req, res) => {
   const update = { updatedAt: new Date() };
   allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
 
-  const result = await updateOne('candidates', { _id: new ObjectId(req.params.id) }, { $set: update });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const [updated] = await knex('candidates').where({ id: req.params.id }).update(update).returning('id');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const convertCandidate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['requisitionId'])) return;
 
-  const candidate = await findOne('candidates', { _id: new ObjectId(req.params.id) });
+  const candidate = await knex('candidates').where({ id: req.params.id }).first();
   if (!candidate) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const requisition = await findOne('jobRequisitions', { _id: new ObjectId(req.body.requisitionId) });
+  const requisition = await knex('job_requisitions').where({ id: req.body.requisitionId }).first();
   if (!requisition) return returnFunction(res, 404, false, 'Requisition not found.');
   if (!requisition.pipelineStages?.length) return returnFunction(res, 400, false, 'Requisition has no pipeline stages configured.');
 
-  const existingActive = await findOne('applications', { candidateId: candidate._id, requisitionId: requisition._id, status: 'active' });
+  const existingActive = await knex('applications').where({ candidateId: candidate.id, requisitionId: requisition.id, status: 'active' }).first();
   if (existingActive) return returnFunction(res, 409, false, 'This candidate already has an active application for this requisition.');
 
-  const priorApplicationCount = await countDocuments('applications', { candidateId: candidate._id, requisitionId: requisition._id });
-  if (priorApplicationCount >= MAX_APPLICATIONS_PER_REQUISITION) {
+  const [{ count: priorApplicationCount }] = await knex('applications').where({ candidateId: candidate.id, requisitionId: requisition.id }).count('* as count');
+  if (Number(priorApplicationCount) >= MAX_APPLICATIONS_PER_REQUISITION) {
     return returnFunction(res, 409, false, `This candidate has already applied for this position the maximum number of times (${MAX_APPLICATIONS_PER_REQUISITION}).`);
   }
 
   const firstStage = requisition.pipelineStages[0];
   const now = new Date();
   const doc = {
-    candidateId: candidate._id,
-    requisitionId: requisition._id,
+    id: newId(),
+    candidateId: candidate.id,
+    requisitionId: requisition.id,
     currentStageId: firstStage.id,
-    stageHistory: [{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: new ObjectId(req.user._id) }],
+    stageHistory: JSON.stringify([{ stageId: firstStage.id, stageName: firstStage.name, enteredAt: now, movedBy: req.user.id }]),
     status: 'active',
     rejectionReason: null,
     offerDetails: null,
     coverLetter: req.body.coverLetter || null,
-    answers: [],
-    scorecards: [],
+    answers: JSON.stringify([]),
     overallScore: null,
     createdAt: now,
     updatedAt: now,
@@ -997,10 +1002,10 @@ const convertCandidate = async (req, res) => {
   const result = await insertOne('applications', doc);
 
   if (candidate.isPassiveTalent) {
-    await updateOne('candidates', { _id: candidate._id }, { $set: { isPassiveTalent: false, updatedAt: now } });
+    await knex('candidates').where({ id: candidate.id }).update({ isPassiveTalent: false, updatedAt: now });
   }
 
-  return returnFunction(res, 201, true, 'Candidate moved into active pipeline.', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Candidate moved into active pipeline.', { _id: result.id });
 };
 
 // ── Nurture Campaigns (passive talent CRM) ───────────────────────────────────
@@ -1008,27 +1013,30 @@ const convertCandidate = async (req, res) => {
 const createNurtureCampaign = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'targetTags'])) return;
   const doc = {
+    id: newId(),
     name: req.body.name.trim(),
     description: req.body.description || '',
     targetTags: Array.isArray(req.body.targetTags) ? req.body.targetTags : [],
-    touchpoints: [],
     status: 'active',
-    createdBy: new ObjectId(req.user._id),
+    createdBy: req.user.id,
     createdAt: new Date(),
   };
-  const result = await insertOne('nurtureCampaigns', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const result = await insertOne('nurture_campaigns', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const listNurtureCampaigns = async (req, res) => {
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
-  const campaigns = await findMany('nurtureCampaigns', filter, { sort: { createdAt: -1 } });
+  let query = knex('nurture_campaigns');
+  if (req.query.status) query = query.where({ status: req.query.status });
+  const campaigns = await query.orderBy('createdAt', 'desc');
 
   const enriched = await Promise.all(campaigns.map(async (c) => {
-    const matchedCandidateCount = c.targetTags?.length
-      ? await countDocuments('candidates', { tags: { $in: c.targetTags }, isPassiveTalent: true })
-      : 0;
+    let matchedCandidateCount = 0;
+    if (c.targetTags?.length) {
+      const [{ count }] = await knex('candidates')
+        .whereRaw('"tags" && ?::text[]', [c.targetTags]).where({ isPassiveTalent: true }).count('* as count');
+      matchedCandidateCount = Number(count);
+    }
     return { ...c, matchedCandidateCount };
   }));
 
@@ -1037,37 +1045,41 @@ const listNurtureCampaigns = async (req, res) => {
 
 const addNurtureTouchpoint = async (req, res) => {
   if (!validateRequiredFields(req, res, ['candidateId', 'channel', 'note'])) return;
+  const campaign = await knex('nurture_campaigns').where({ id: req.params.id }).first();
+  if (!campaign) return returnFunction(res, 404, false, req.locale.notFound);
+
   const touchpoint = {
-    candidateId: new ObjectId(req.body.candidateId),
+    campaignId: campaign.id,
+    candidateId: String(req.body.candidateId),
     channel: req.body.channel,
     note: req.body.note,
     sentAt: new Date(),
-    byUserId: new ObjectId(req.user._id),
+    byUserId: req.user.id,
     response: req.body.response || null,
   };
-  const result = await updateOne('nurtureCampaigns', { _id: new ObjectId(req.params.id) }, { $push: { touchpoints: touchpoint } });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  await knex('nurture_campaign_touchpoints').insert(touchpoint);
   return returnFunction(res, 201, true, 'Touchpoint logged.', touchpoint);
 };
 
 const listNurtureCandidates = async (req, res) => {
-  const filter = { isPassiveTalent: true };
-  if (req.query.tags) filter.tags = { $in: [].concat(req.query.tags) };
+  let query = knex('candidates').where({ isPassiveTalent: true });
+  if (req.query.tags) {
+    const tags = [].concat(req.query.tags);
+    query = query.whereRaw('"tags" && ?::text[]', [tags]);
+  }
 
-  const candidates = await findMany('candidates', filter, { sort: { createdAt: -1 } });
-  const campaigns = await findMany('nurtureCampaigns', {});
+  const candidates = await query.orderBy('createdAt', 'desc');
+  const touchpoints = await knex('nurture_campaign_touchpoints');
 
   const lastTouchpointMap = {};
-  campaigns.forEach((c) => {
-    (c.touchpoints || []).forEach((t) => {
-      const key = String(t.candidateId);
-      const sentAt = new Date(t.sentAt);
-      if (!lastTouchpointMap[key] || sentAt > lastTouchpointMap[key]) lastTouchpointMap[key] = sentAt;
-    });
+  touchpoints.forEach((t) => {
+    const key = t.candidateId;
+    const sentAt = new Date(t.sentAt);
+    if (!lastTouchpointMap[key] || sentAt > lastTouchpointMap[key]) lastTouchpointMap[key] = sentAt;
   });
 
   const enriched = candidates
-    .map((c) => ({ ...c, lastTouchpointAt: lastTouchpointMap[String(c._id)] || null }))
+    .map((c) => ({ ...c, lastTouchpointAt: lastTouchpointMap[c.id] || null }))
     .sort((a, b) => {
       if (!a.lastTouchpointAt && !b.lastTouchpointAt) return 0;
       if (!a.lastTouchpointAt) return -1;
@@ -1084,24 +1096,25 @@ const getRecruitmentOverview = async (req, res) => {
   const now = new Date();
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-  const [openRequisitions, activeCandidates, offersOut, hiresThisMonth] = await Promise.all([
-    countDocuments('jobRequisitions', { status: 'open' }),
-    countDocuments('applications', { status: 'active' }),
-    countDocuments('applications', { 'offerDetails.status': 'pending' }),
-    countDocuments('applications', { status: 'hired', updatedAt: { $gte: startOfMonth } }),
+  const [[{ count: openRequisitions }], [{ count: activeCandidates }], [{ count: offersOut }], [{ count: hiresThisMonth }]] = await Promise.all([
+    knex('job_requisitions').where({ status: 'open' }).count('* as count'),
+    knex('applications').where({ status: 'active' }).count('* as count'),
+    knex('applications').whereRaw("\"offerDetails\"->>'status' = ?", ['pending']).count('* as count'),
+    knex('applications').where({ status: 'hired' }).where('updatedAt', '>=', startOfMonth).count('* as count'),
   ]);
 
   return returnFunction(res, 200, true, req.locale.success, {
-    openRequisitions, activeCandidates, offersOut, hiresThisMonth,
+    openRequisitions: Number(openRequisitions), activeCandidates: Number(activeCandidates),
+    offersOut: Number(offersOut), hiresThisMonth: Number(hiresThisMonth),
   });
 };
 
 const getRequisitionFunnel = async (req, res) => {
-  const requisitionId = new ObjectId(req.params.requisitionId);
-  const requisition = await findOne('jobRequisitions', { _id: requisitionId });
+  const requisitionId = req.params.requisitionId;
+  const requisition = await knex('job_requisitions').where({ id: requisitionId }).first();
   if (!requisition) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const applications = await findMany('applications', { requisitionId });
+  const applications = await knex('applications').where({ requisitionId });
   const totalApplicants = applications.length;
 
   const funnel = requisition.pipelineStages.map((stage) => {
@@ -1118,16 +1131,16 @@ const getRequisitionFunnel = async (req, res) => {
 };
 
 const getTimeToFill = async (req, res) => {
-  const hiredApplications = await findMany('applications', { status: 'hired' });
+  const hiredApplications = await knex('applications').where({ status: 'hired' });
   if (!hiredApplications.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const requisitionIds = [...new Set(hiredApplications.map((a) => String(a.requisitionId)))].map((id) => new ObjectId(id));
-  const requisitions = await findMany('jobRequisitions', { _id: { $in: requisitionIds } });
-  const reqMap = Object.fromEntries(requisitions.map((r) => [String(r._id), r]));
+  const requisitionIds = [...new Set(hiredApplications.map((a) => a.requisitionId))];
+  const requisitions = await knex('job_requisitions').whereIn('id', requisitionIds);
+  const reqMap = Object.fromEntries(requisitions.map((r) => [r.id, r]));
 
   const byDept = {};
   hiredApplications.forEach((a) => {
-    const requisition = reqMap[String(a.requisitionId)];
+    const requisition = reqMap[a.requisitionId];
     if (!requisition) return;
     const hiredEntry = a.stageHistory.find((h) => h.stageId === a.currentStageId);
     const endDate = hiredEntry?.enteredAt ? new Date(hiredEntry.enteredAt) : new Date(a.updatedAt);
@@ -1146,11 +1159,11 @@ const getTimeToFill = async (req, res) => {
 };
 
 const getTimeInStage = async (req, res) => {
-  const applications = await findMany('applications', {});
+  const applications = await knex('applications');
   const stageDurations = {};
 
   applications.forEach((a) => {
-    a.stageHistory.forEach((h) => {
+    (a.stageHistory || []).forEach((h) => {
       if (!h.exitedAt) return;
       const days = (new Date(h.exitedAt) - new Date(h.enteredAt)) / 86400000;
       if (!stageDurations[h.stageName]) stageDurations[h.stageName] = [];
@@ -1168,14 +1181,14 @@ const getTimeInStage = async (req, res) => {
 };
 
 const getSourceEffectiveness = async (req, res) => {
-  const candidates = await findMany('candidates', {}, { projection: { source: 1 } });
-  const applications = await findMany('applications', {}, { projection: { candidateId: 1, status: 1 } });
+  const candidates = await knex('candidates').select('id', 'source');
+  const applications = await knex('applications').select('candidateId', 'status');
 
-  const candidateSourceMap = Object.fromEntries(candidates.map((c) => [String(c._id), c.source]));
+  const candidateSourceMap = Object.fromEntries(candidates.map((c) => [c.id, c.source]));
   const bySource = {};
 
   applications.forEach((a) => {
-    const source = candidateSourceMap[String(a.candidateId)] || 'unknown';
+    const source = candidateSourceMap[a.candidateId] || 'unknown';
     if (!bySource[source]) bySource[source] = { source, applications: 0, hires: 0 };
     bySource[source].applications += 1;
     if (a.status === 'hired') bySource[source].hires += 1;
@@ -1190,7 +1203,7 @@ const getSourceEffectiveness = async (req, res) => {
 };
 
 const getOfferAcceptanceRate = async (req, res) => {
-  const applications = await findMany('applications', { offerDetails: { $ne: null } });
+  const applications = await knex('applications').whereNotNull('offerDetails');
 
   const byMonth = {};
   applications.forEach((a) => {
@@ -1214,36 +1227,40 @@ const getOfferAcceptanceRate = async (req, res) => {
 const createInterviewKit = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name'])) return;
   const doc = {
+    id: newId(),
     name: req.body.name.trim(),
-    competencies: Array.isArray(req.body.competencies) ? req.body.competencies : [],
-    createdBy: new ObjectId(req.user._id),
+    competencies: JSON.stringify(Array.isArray(req.body.competencies) ? req.body.competencies : []),
+    createdBy: req.user.id,
     createdAt: new Date(),
   };
-  const result = await insertOne('interviewKits', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const result = await insertOne('interview_kits', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const listInterviewKits = async (req, res) => {
-  const kits = await findMany('interviewKits', {}, { sort: { createdAt: -1 } });
+  const kits = await knex('interview_kits').orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, kits);
 };
 
 const updateInterviewKit = async (req, res) => {
   const update = { updatedAt: new Date() };
   if (req.body.name !== undefined) update.name = req.body.name;
-  if (req.body.competencies !== undefined) update.competencies = req.body.competencies;
-  const result = await updateOne('interviewKits', { _id: new ObjectId(req.params.id) }, { $set: update });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  if (req.body.competencies !== undefined) update.competencies = JSON.stringify(req.body.competencies);
+  const [updated] = await knex('interview_kits').where({ id: req.params.id }).update(update).returning('id');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteInterviewKit = async (req, res) => {
-  const result = await deleteOne('interviewKits', { _id: new ObjectId(req.params.id) });
-  if (!result.deletedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const deleted = await knex('interview_kits').where({ id: req.params.id }).del();
+  if (!deleted) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 // ── Email Templates ───────────────────────────────────────────────────────────
+// Recruitment's own direct CRUD on email_templates, keyed by real id (not by
+// trigger) — shared with the Settings module's trigger-catalog override pattern
+// on the same table (see settings/emailTemplatesFunctions.js).
 
 const EMAIL_TRIGGERS = ['applicationReceived', 'stageAdvance', 'rejection', 'offerExtended', 'nurture', 'interviewReminder', 'interviewScheduled'];
 
@@ -1251,38 +1268,40 @@ const createEmailTemplate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'trigger', 'subject', 'body'])) return;
   if (!EMAIL_TRIGGERS.includes(req.body.trigger)) return returnFunction(res, 400, false, `trigger must be one of: ${EMAIL_TRIGGERS.join(', ')}`);
   const doc = {
+    id: newId(),
     name: req.body.name.trim(),
     trigger: req.body.trigger,
     subject: req.body.subject,
     body: req.body.body,
-    createdBy: new ObjectId(req.user._id),
+    createdBy: req.user.id,
+    createdAt: new Date(),
   };
-  const result = await insertOne('emailTemplates', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const result = await insertOne('email_templates', doc);
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const listEmailTemplates = async (req, res) => {
-  const filter = {};
-  if (req.query.trigger) filter.trigger = req.query.trigger;
-  const templates = await findMany('emailTemplates', filter);
+  let query = knex('email_templates');
+  if (req.query.trigger) query = query.where({ trigger: req.query.trigger });
+  const templates = await query;
   return returnFunction(res, 200, true, req.locale.success, templates);
 };
 
 const updateEmailTemplate = async (req, res) => {
   const allowed = ['name', 'trigger', 'subject', 'body'];
-  const update = {};
+  const update = { updatedAt: new Date() };
   allowed.forEach((f) => { if (req.body[f] !== undefined) update[f] = req.body[f]; });
   if (update.trigger && !EMAIL_TRIGGERS.includes(update.trigger)) {
     return returnFunction(res, 400, false, `trigger must be one of: ${EMAIL_TRIGGERS.join(', ')}`);
   }
-  const result = await updateOne('emailTemplates', { _id: new ObjectId(req.params.id) }, { $set: update });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const [updated] = await knex('email_templates').where({ id: req.params.id }).update(update).returning('id');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteEmailTemplate = async (req, res) => {
-  const result = await deleteOne('emailTemplates', { _id: new ObjectId(req.params.id) });
-  if (!result.deletedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const deleted = await knex('email_templates').where({ id: req.params.id }).del();
+  if (!deleted) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 

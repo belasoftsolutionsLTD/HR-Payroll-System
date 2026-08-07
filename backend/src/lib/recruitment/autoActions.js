@@ -1,17 +1,21 @@
-const { ObjectId } = require('mongodb');
-const { findOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 4) — candidates/jobRequisitions/email_templates now live in Postgres.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { notifyUser } = require('../../functions/HR/notifyUser');
 const { sendEmail } = require('../../services/emailService');
 const { renderTemplate } = require('../../services/emailTemplateService');
 
-// direction: 'onEnter' | 'onExit' — called from the stage-move handler after writing stageHistory
-async function fireAutoActions(application, stage, db, direction) {
+// direction: 'onEnter' | 'onExit' — called from the stage-move handler after writing
+// stageHistory. The `db` param was always unused (dead ever since Mongo — every real
+// read here already went through the shared DB helpers, not the raw handle) — dropped
+// rather than carried forward as `dbo`/`knex` nobody reads.
+async function fireAutoActions(application, stage, direction) {
   const actions = (stage.autoActions || []).filter((a) => a.trigger === direction);
   if (!actions.length) return;
 
   const [candidate, requisition] = await Promise.all([
-    findOne('candidates', { _id: new ObjectId(application.candidateId) }),
-    findOne('jobRequisitions', { _id: new ObjectId(application.requisitionId) }),
+    knex('candidates').where({ id: String(application.candidateId) }).first(),
+    knex('job_requisitions').where({ id: String(application.requisitionId) }).first(),
   ]);
 
   for (const action of actions) {
@@ -26,7 +30,7 @@ async function fireAutoActions(application, stage, db, direction) {
 
       if (action.action === 'emailCandidate' && candidate?.email) {
         const template = action.templateId
-          ? await findOne('emailTemplates', { _id: new ObjectId(action.templateId) })
+          ? await knex('email_templates').where({ id: String(action.templateId) }).first()
           : null;
         const tokens = {
           candidateName: `${candidate.firstName} ${candidate.lastName}`,
@@ -43,8 +47,8 @@ async function fireAutoActions(application, stage, db, direction) {
       }
 
       if (action.action === 'autoReject') {
-        await updateOne('applications', { _id: application._id }, {
-          $set: { status: 'rejected', rejectionReason: 'Automatically rejected by pipeline rule.', updatedAt: new Date() },
+        await knex('applications').where({ id: application.id }).update({
+          status: 'rejected', rejectionReason: 'Automatically rejected by pipeline rule.', updatedAt: new Date(),
         });
       }
     } catch {
