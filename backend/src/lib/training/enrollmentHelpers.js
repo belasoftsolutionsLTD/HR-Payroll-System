@@ -1,4 +1,8 @@
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 5) — enrollments, courses, learningPaths now live in Postgres. `employeeId`
+// on an enrollment is a users.id (see trainingFunctions.js's own header comment for
+// the full naming-quirk explanation) — users has been Postgres since Phase 1.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const { notifyUser } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -19,21 +23,22 @@ const recomputeProgress = (moduleProgress, requiredModuleIds) => {
 };
 
 const createSingleCourseEnrollment = async ({ employeeId, courseId, learningPathId = null, enrolledBy, enrollmentTrigger, dueDate }) => {
-  const existing = await findOne('enrollments', { employeeId, courseId });
-  if (existing) return { created: false, _id: existing._id };
+  const existing = await knex('enrollments').where({ employeeId: String(employeeId), courseId: String(courseId) }).first();
+  if (existing) return { created: false, _id: existing.id };
 
+  const id = newId();
   const doc = {
-    employeeId, courseId, learningPathId,
-    enrolledBy, enrollmentTrigger,
+    id, employeeId: String(employeeId), courseId: String(courseId), learningPathId: learningPathId ? String(learningPathId) : null,
+    enrolledBy: enrolledBy ? String(enrolledBy) : null, enrollmentTrigger,
     dueDate: dueDate || null,
     status: 'notStarted',
     completedAt: null,
     progressPercentage: 0,
-    moduleProgress: [],
+    moduleProgress: JSON.stringify([]),
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('enrollments', doc);
+  await knex('enrollments').insert(doc);
   notifyUser(employeeId, {
     title: 'New Training Assigned',
     body: 'You have been assigned a new course.',
@@ -42,8 +47,8 @@ const createSingleCourseEnrollment = async ({ employeeId, courseId, learningPath
   }).catch(() => {});
   (async () => {
     const [user, course] = await Promise.all([
-      findOne('users', { _id: employeeId }, { projection: { email: 1, name: 1 } }),
-      findOne('courses', { _id: courseId }, { projection: { title: 1 } }),
+      knex('users').where({ id: String(employeeId) }).select('email', 'name').first(),
+      knex('courses').where({ id: String(courseId) }).select('title').first(),
     ]);
     if (!user?.email) return;
     const tokens = { employeeName: user.name || 'there', courseTitle: course?.title || 'a new course' };
@@ -53,32 +58,33 @@ const createSingleCourseEnrollment = async ({ employeeId, courseId, learningPath
       fallbackHtml: `<p>Dear ${tokens.employeeName},</p><p>You have been assigned a new course: "${tokens.courseTitle}".</p>`,
     }).catch(() => {});
   })().catch(() => {});
-  return { created: true, _id: result.insertedId };
+  return { created: true, _id: id };
 };
 
 const createLearningPathEnrollment = async ({ employeeId, learningPathId, enrolledBy, enrollmentTrigger, dueDate }) => {
-  const existingPathEnrollment = await findOne('enrollments', { employeeId, learningPathId, courseId: null });
-  if (existingPathEnrollment) return { created: false, _id: existingPathEnrollment._id };
+  const existingPathEnrollment = await knex('enrollments').where({ employeeId: String(employeeId), learningPathId: String(learningPathId) }).whereNull('courseId').first();
+  if (existingPathEnrollment) return { created: false, _id: existingPathEnrollment.id };
 
-  const path_ = await findOne('learningPaths', { _id: learningPathId });
+  const path_ = await knex('learning_paths').where({ id: String(learningPathId) }).first();
   if (!path_) return { created: false, error: 'Learning path not found.' };
 
+  const id = newId();
   const doc = {
-    employeeId, courseId: null, learningPathId,
-    enrolledBy, enrollmentTrigger,
+    id, employeeId: String(employeeId), courseId: null, learningPathId: String(learningPathId),
+    enrolledBy: enrolledBy ? String(enrolledBy) : null, enrollmentTrigger,
     dueDate: dueDate || null,
     status: 'notStarted',
     completedAt: null,
     progressPercentage: 0,
-    moduleProgress: [],
+    moduleProgress: JSON.stringify([]),
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('enrollments', doc);
+  await knex('enrollments').insert(doc);
 
   // Also enroll the employee in each course that makes up the path, so it shows up
   // in their regular course list and can be started/continued individually.
-  for (const c of path_.courses) {
+  for (const c of (path_.courses || [])) {
     await createSingleCourseEnrollment({
       employeeId, courseId: c.courseId, learningPathId,
       enrolledBy, enrollmentTrigger, dueDate,
@@ -92,7 +98,7 @@ const createLearningPathEnrollment = async ({ employeeId, learningPathId, enroll
     link: `/my/training/learning-paths/${learningPathId}`,
   }).catch(() => {});
   (async () => {
-    const user = await findOne('users', { _id: employeeId }, { projection: { email: 1, name: 1 } });
+    const user = await knex('users').where({ id: String(employeeId) }).select('email', 'name').first();
     if (!user?.email) return;
     const tokens = { employeeName: user.name || 'there', pathName: path_.name };
     sendTemplatedEmail({
@@ -102,7 +108,7 @@ const createLearningPathEnrollment = async ({ employeeId, learningPathId, enroll
     }).catch(() => {});
   })().catch(() => {});
 
-  return { created: true, _id: result.insertedId };
+  return { created: true, _id: id };
 };
 
 // When a course-level enrollment that belongs to a learning path completes, recompute
@@ -111,33 +117,31 @@ const createLearningPathEnrollment = async ({ employeeId, learningPathId, enroll
 const maybeAdvanceLearningPath = async (courseEnrollment) => {
   if (!courseEnrollment.learningPathId) return;
 
-  const pathEnrollment = await findOne('enrollments', {
-    employeeId: courseEnrollment.employeeId, learningPathId: courseEnrollment.learningPathId, courseId: null,
-  });
+  const pathEnrollment = await knex('enrollments').where({
+    employeeId: String(courseEnrollment.employeeId), learningPathId: String(courseEnrollment.learningPathId),
+  }).whereNull('courseId').first();
   if (!pathEnrollment) return;
 
-  const path_ = await findOne('learningPaths', { _id: courseEnrollment.learningPathId });
+  const path_ = await knex('learning_paths').where({ id: String(courseEnrollment.learningPathId) }).first();
   if (!path_) return;
 
-  const requiredCourseIds = path_.courses.filter((c) => c.isRequired).map((c) => c.courseId);
-  const courseEnrollments = await findMany('enrollments', {
-    employeeId: courseEnrollment.employeeId,
-    courseId: { $in: path_.courses.map((c) => c.courseId) },
-  }, { projection: { courseId: 1, status: 1 } });
-  const statusByCourse = Object.fromEntries(courseEnrollments.map((e) => [String(e.courseId), e.status]));
+  const courseIds = (path_.courses || []).map((c) => c.courseId);
+  const requiredCourseIds = (path_.courses || []).filter((c) => c.isRequired).map((c) => c.courseId);
+  const courseEnrollments = courseIds.length
+    ? await knex('enrollments').where({ employeeId: String(courseEnrollment.employeeId) }).whereIn('courseId', courseIds).select('courseId', 'status')
+    : [];
+  const statusByCourse = Object.fromEntries(courseEnrollments.map((e) => [e.courseId, e.status]));
 
-  const completedRequired = requiredCourseIds.filter((cid) => statusByCourse[String(cid)] === 'completed').length;
+  const completedRequired = requiredCourseIds.filter((cid) => statusByCourse[cid] === 'completed').length;
   const progressPercentage = requiredCourseIds.length ? Math.round((completedRequired / requiredCourseIds.length) * 100) : 0;
   const allDone = requiredCourseIds.length > 0 && completedRequired === requiredCourseIds.length;
 
   const now = new Date();
-  await updateOne('enrollments', { _id: pathEnrollment._id }, {
-    $set: {
-      progressPercentage,
-      status: allDone ? 'completed' : progressPercentage > 0 ? 'inProgress' : 'notStarted',
-      ...(allDone && pathEnrollment.status !== 'completed' ? { completedAt: now } : {}),
-      updatedAt: now,
-    },
+  await knex('enrollments').where({ id: pathEnrollment.id }).update({
+    progressPercentage,
+    status: allDone ? 'completed' : progressPercentage > 0 ? 'inProgress' : 'notStarted',
+    ...(allDone && pathEnrollment.status !== 'completed' ? { completedAt: now } : {}),
+    updatedAt: now,
   });
 };
 

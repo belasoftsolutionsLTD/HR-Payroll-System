@@ -66,35 +66,38 @@ async function checkLowStockAlerts() {
 // the smallest addition that gives it one, reused as-is by Logistics for driver license
 // expiry rather than building a parallel tracking system. Same single-fixed-offset +
 // sent-flag idempotency pattern as leaveStartReminder (30 days ahead, once per cert).
+// employee_certifications now lives in Postgres as a real child table (Phase 1) — this
+// was still reading employees.certifications as a raw embedded Mongo array via
+// global.dbo, silently broken since that phase (found while sweeping this file for
+// Phase 5). alertSent didn't exist as a real column until Phase 5 added it here,
+// specifically because this cron function needs it.
 async function checkExpiringCertifications() {
-  if (!global.dbo) return;
   const target = new Date();
   target.setUTCDate(target.getUTCDate() + 30);
   const dayStart = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate()));
   const dayEnd = new Date(dayStart); dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
 
-  const employees = await global.dbo.collection('employees').find({
-    certifications: { $elemMatch: { expiryDate: { $gte: dayStart, $lt: dayEnd }, alertSent: { $ne: true } } },
-  }, { projection: { fullName: 1, certifications: 1 } }).toArray();
-  if (!employees.length) return;
+  const due = await pgDB.knex('employee_certifications')
+    .where('expiryDate', '>=', dayStart).where('expiryDate', '<', dayEnd)
+    .whereNot({ alertSent: true });
+  if (!due.length) return;
 
-  for (const emp of employees) {
-    const due = emp.certifications.filter((c) => c.expiryDate && new Date(c.expiryDate) >= dayStart && new Date(c.expiryDate) < dayEnd && !c.alertSent);
-    for (const cert of due) {
-      notifyEmployee(emp._id, {
-        title: 'Certification Expiring Soon',
-        body: `Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.`,
-        type: 'general',
-      }).catch(() => {});
-      emailEmployee(emp._id, 'certificationExpiring', { certName: cert.name, expiryDate: new Date(cert.expiryDate).toISOString().split('T')[0] },
-        'Certification Expiring Soon',
-        `<p>Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.</p>`);
-      await global.dbo.collection('employees').updateOne(
-        { _id: emp._id },
-        { $set: { 'certifications.$[cert].alertSent': true } },
-        { arrayFilters: [{ 'cert.id': cert.id }] }
-      );
-    }
+  const empIds = [...new Set(due.map((c) => c.employeeId))];
+  const employees = await pgDB.knex('employees').whereIn('id', empIds).select('id', 'fullName');
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e]));
+
+  for (const cert of due) {
+    const emp = empMap[cert.employeeId];
+    if (!emp) continue;
+    notifyEmployee(emp.id, {
+      title: 'Certification Expiring Soon',
+      body: `Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.`,
+      type: 'general',
+    }).catch(() => {});
+    emailEmployee(emp.id, 'certificationExpiring', { certName: cert.name, expiryDate: new Date(cert.expiryDate).toISOString().split('T')[0] },
+      'Certification Expiring Soon',
+      `<p>Your "${cert.name}" certification expires on ${new Date(cert.expiryDate).toISOString().split('T')[0]} — renew it soon.</p>`);
+    await pgDB.knex('employee_certifications').where({ id: cert.id }).update({ alertSent: true });
   }
 }
 
@@ -447,38 +450,33 @@ async function leaveEndReminder() {
 
 // ── Training / LMS: overdue detection + automation rule engine ────────────────
 
+// enrollments/courses now live in Postgres (Phase 5).
 async function checkOverdueTraining() {
-  if (!global.dbo) return;
-
   const now = new Date();
-  const overdue = await global.dbo.collection('enrollments').find({
-    dueDate: { $lt: now, $ne: null },
-    status: { $in: ['notStarted', 'inProgress'] },
-  }).toArray();
+  const overdue = await pgDB.knex('enrollments')
+    .whereNotNull('dueDate').where('dueDate', '<', now)
+    .whereIn('status', ['notStarted', 'inProgress']);
 
   if (!overdue.length) return;
 
-  const courseIds = [...new Set(overdue.filter((e) => e.courseId).map((e) => String(e.courseId)))].map((id) => new ObjectId(id));
+  const courseIds = [...new Set(overdue.filter((e) => e.courseId).map((e) => e.courseId))];
   const courses = courseIds.length
-    ? await global.dbo.collection('courses').find({ _id: { $in: courseIds } }, { projection: { title: 1 } }).toArray()
+    ? await pgDB.knex('courses').whereIn('id', courseIds).select('id', 'title')
     : [];
-  const titleMap = Object.fromEntries(courses.map((c) => [String(c._id), c.title]));
+  const titleMap = Object.fromEntries(courses.map((c) => [c.id, c.title]));
 
   for (const enr of overdue) {
-    await global.dbo.collection('enrollments').updateOne(
-      { _id: enr._id },
-      { $set: { status: 'overdue', updatedAt: now } }
-    );
-    // enrollments.employeeId is the learner's users._id directly (not an employees._id),
-    // so this must use notifyUser, not notifyEmployee (which expects an employees._id).
+    await pgDB.knex('enrollments').where({ id: enr.id }).update({ status: 'overdue', updatedAt: now });
+    // enrollments.employeeId is the learner's users.id directly (not an employees.id),
+    // so this must use notifyUser, not notifyEmployee (which expects an employees.id).
     notifyUser(enr.employeeId, {
       title: 'Training Overdue',
-      body: `"${titleMap[String(enr.courseId)] || 'A required course'}" was due and is now overdue — please complete it.`,
+      body: `"${titleMap[enr.courseId] || 'A required course'}" was due and is now overdue — please complete it.`,
       type: 'training',
       link: '/my/training',
     }).catch(() => {});
-    emailUser(enr.employeeId, 'trainingOverdue', { courseTitle: titleMap[String(enr.courseId)] || 'A required course' },
-      'Training Overdue', `<p>"${titleMap[String(enr.courseId)] || 'A required course'}" was due and is now overdue — please complete it.</p>`);
+    emailUser(enr.employeeId, 'trainingOverdue', { courseTitle: titleMap[enr.courseId] || 'A required course' },
+      'Training Overdue', `<p>"${titleMap[enr.courseId] || 'A required course'}" was due and is now overdue — please complete it.</p>`);
   }
 
   console.log(`[CRON] Marked ${overdue.length} training enrollment(s) overdue`);

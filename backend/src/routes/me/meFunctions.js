@@ -5,11 +5,11 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users/job_history/staff_notes (Phase 1), attendance_records (Phase 3b),
-// and job_requisitions/candidates/applications (Phase 4) now live in Postgres;
-// everything else this file touches (appraisal_records/goals/reviews, employee_awards,
-// scheduled_events, project_members/projects/project_time_entries, tasks) is
-// unmigrated and stays on the Mongo helpers via commonDBFunctions/global.dbo,
-// imported separately below.
+// job_requisitions/candidates/applications (Phase 4), and appraisal_records/goals/
+// reviews/review_cycles (Phase 5) now live in Postgres; everything else this file
+// touches (employee_awards, scheduled_events, project_members/projects/
+// project_time_entries, tasks) is unmigrated and stays on the Mongo helpers via
+// commonDBFunctions/global.dbo, imported separately below.
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -293,21 +293,20 @@ const getDepartmentData = async (req, res) => {
 };
 
 // ── Performance ────────────────────────────────────────────────────────────────
-// appraisal_records/goals/reviews/review_cycles are unmigrated (Phase 5) — stay Mongo.
+// appraisal_records/goals/reviews/review_cycles now live in Postgres (Phase 5).
 const getMyPerformance = async (req, res) => {
   const empId = myEmployeeId(req);
   if (!empId) return returnFunction(res, 404, false, 'No employee record linked.');
-  const empObjectId = new ObjectId(empId);
 
   const [appraisals, goals, rawReviews] = await Promise.all([
-    findMany('appraisal_records', { employeeId: empObjectId }, { sort: { createdAt: -1 } }),
-    findMany('goals', { employeeId: empObjectId }, { sort: { createdAt: -1 } }),
-    findMany('reviews', { employeeId: empObjectId, status: 'submitted' }, { sort: { submittedAt: -1 } }),
+    pgDB.knex('appraisal_records').where({ employeeId: empId }).orderBy('createdAt', 'desc'),
+    pgDB.knex('goals').where({ employeeId: empId }).orderBy('createdAt', 'desc'),
+    pgDB.knex('reviews').where({ employeeId: empId, status: 'submitted' }).orderBy('submittedAt', 'desc'),
   ]);
 
   const reviews = await Promise.all(rawReviews.map(async r => {
     const cycle = r.cycleId
-      ? await findOne('review_cycles', { _id: r.cycleId }, { projection: { name: 1, type: 1 } })
+      ? await pgDB.knex('review_cycles').where({ id: r.cycleId }).select('name', 'type').first()
       : null;
     return { ...r, cycleName: cycle?.name ?? null };
   }));

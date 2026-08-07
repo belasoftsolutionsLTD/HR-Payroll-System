@@ -830,6 +830,214 @@ async function main() {
     );
     counts.offboarding_generated_documents = await upsertBatched('offboarding_generated_documents', generatedDocRows, null);
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  PHASE 5 — Training, Performance
+    // ══════════════════════════════════════════════════════════════════════
+
+    // certificate_number_* counters — Phase 1's own counters migration deliberately
+    // only pulled staff_number_* (the only sequence relevant at that point); this key
+    // only starts mattering now that generateCertificateNumber (trainingFunctions.js)
+    // is fixed to use the real Postgres counters table instead of a dead Mongo one.
+    // Seeding the real current seq here (not starting fresh at 0) matters — found via
+    // live verification, where a fresh-from-0 counter generated a new certificate
+    // numbered CERT-2026-00001, silently overwriting the real, already-issued
+    // certificate PDF of the same name on disk.
+    const certNumberCounters = await dbo.collection('counters')
+      .find({ _id: { $regex: /^certificate_number_/ } }).toArray();
+    counts.counters = (counts.counters || 0) + await upsertBatched('counters', certNumberCounters.map((c) => ({
+      id: idStr(c._id), seq: c.seq ?? 0,
+    })));
+
+    // ── Training ─────────────────────────────────────────────────────────
+    const courses = await dbo.collection('courses').find({}).toArray();
+    counts.courses = await upsertBatched('courses', courses.map((c) => ({
+      id: idStr(c._id), title: c.title ?? null, description: c.description ?? null, coverImageUrl: c.coverImageUrl ?? null,
+      category: c.category ?? null, tags: c.tags || [], skillsTaught: c.skillsTaught || [],
+      estimatedDurationMinutes: c.estimatedDurationMinutes ?? null, difficultyLevel: c.difficultyLevel ?? null,
+      status: c.status ?? null, isMandatory: c.isMandatory ?? false, targetRoles: c.targetRoles || [],
+      targetDepartments: c.targetDepartments || [], hasCertificate: c.hasCertificate ?? false,
+      certificateValidityDays: c.certificateValidityDays ?? null, deliveryMethod: c.deliveryMethod ?? null,
+      createdBy: idStr(c.createdBy),
+      authors: (c.authors || []).map(idStr), publishedAt: toDate(c.publishedAt),
+      createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    const courseModules = await dbo.collection('courseModules').find({}).toArray();
+    counts.course_modules = await upsertBatched('course_modules', courseModules.map((m) => ({
+      id: idStr(m._id), courseId: idStr(m.courseId), title: m.title ?? null, order: m.order ?? null,
+      type: m.type ?? null, content: m.content ? JSON.stringify(m.content) : null, isRequired: m.isRequired ?? true,
+      minimumPassScore: m.minimumPassScore ?? null, createdAt: toDate(m.createdAt),
+    })));
+
+    const enrollments = await dbo.collection('enrollments').find({}).toArray();
+    counts.enrollments = await upsertBatched('enrollments', enrollments.map((e) => ({
+      id: idStr(e._id), employeeId: idStr(e.employeeId), courseId: idStr(e.courseId), learningPathId: idStr(e.learningPathId),
+      enrolledBy: idStr(e.enrolledBy), enrollmentTrigger: e.enrollmentTrigger ?? null, dueDate: toDate(e.dueDate),
+      status: e.status ?? null, completedAt: toDate(e.completedAt), progressPercentage: e.progressPercentage ?? 0,
+      moduleProgress: e.moduleProgress ? JSON.stringify(e.moduleProgress) : null,
+      createdAt: toDate(e.createdAt), updatedAt: toDate(e.updatedAt),
+    })));
+
+    const learningPaths = await dbo.collection('learningPaths').find({}).toArray();
+    counts.learning_paths = await upsertBatched('learning_paths', learningPaths.map((p) => ({
+      id: idStr(p._id), name: p.name ?? null, description: p.description ?? null,
+      courses: p.courses ? JSON.stringify(p.courses) : null, targetRoles: p.targetRoles || [],
+      targetDepartments: p.targetDepartments || [], enrollmentTrigger: p.enrollmentTrigger ?? null,
+      dueDateOffsetDays: p.dueDateOffsetDays ?? null, status: p.status ?? null, createdBy: idStr(p.createdBy),
+      createdAt: toDate(p.createdAt),
+    })));
+
+    const quizzes = await dbo.collection('quizzes').find({}).toArray();
+    counts.quizzes = await upsertBatched('quizzes', quizzes.map((q) => ({
+      id: idStr(q._id), moduleId: idStr(q.moduleId), courseId: idStr(q.courseId), passingScore: q.passingScore ?? null,
+      maxAttempts: q.maxAttempts ?? null, shuffleQuestions: q.shuffleQuestions ?? false, shuffleOptions: q.shuffleOptions ?? false,
+      timeLimitMinutes: q.timeLimitMinutes ?? null, questions: q.questions ? JSON.stringify(q.questions) : null,
+    })));
+
+    const certificates = await dbo.collection('certificates').find({}).toArray();
+    counts.certificates = await upsertBatched('certificates', certificates.map((c) => ({
+      id: idStr(c._id), employeeId: idStr(c.employeeId), courseId: idStr(c.courseId), enrollmentId: idStr(c.enrollmentId),
+      certificateNumber: c.certificateNumber ?? null, issuedAt: toDate(c.issuedAt), expiresAt: toDate(c.expiresAt),
+      pdfUrl: c.pdfUrl ?? null,
+    })));
+
+    const externalCertificates = await dbo.collection('externalCertificates').find({}).toArray();
+    counts.external_certificates = await upsertBatched('external_certificates', externalCertificates.map((c) => ({
+      id: idStr(c._id), employeeId: idStr(c.employeeId), name: c.name ?? null, issuingOrganization: c.issuingOrganization ?? null,
+      issuedDate: toDate(c.issuedDate), expiryDate: toDate(c.expiryDate), fileUrl: c.fileUrl ?? null,
+      verificationUrl: c.verificationUrl ?? null, status: c.status ?? null, verifiedBy: idStr(c.verifiedBy),
+      uploadedAt: toDate(c.uploadedAt),
+    })));
+
+    const trainingRules = await dbo.collection('trainingAssignmentRules').find({}).toArray();
+    counts.training_assignment_rules = await upsertBatched('training_assignment_rules', trainingRules.map((r) => ({
+      id: idStr(r._id), name: r.name ?? null, trigger: r.trigger ?? null,
+      triggerConditions: r.triggerConditions ? JSON.stringify(r.triggerConditions) : null,
+      action: r.action ? JSON.stringify(r.action) : null, isActive: r.isActive ?? true, createdBy: idStr(r.createdBy),
+      createdAt: toDate(r.createdAt),
+    })));
+
+    const ruleLogs = await dbo.collection('ruleExecutionLogs').find({}).toArray();
+    counts.rule_execution_logs = await upsertBatched('rule_execution_logs', ruleLogs.map((l) => ({
+      id: idStr(l._id), ruleId: idStr(l.ruleId), runAt: toDate(l.runAt), matched: l.matched ?? 0, created: l.created ?? 0,
+    })));
+
+    const trainingFeedback = await dbo.collection('trainingFeedback').find({}).toArray();
+    counts.training_feedback = await upsertBatched('training_feedback', trainingFeedback.map((f) => ({
+      id: idStr(f._id), enrollmentId: idStr(f.enrollmentId), courseId: idStr(f.courseId), employeeId: idStr(f.employeeId),
+      rating: f.rating ?? null, review: f.review ?? null, submittedAt: toDate(f.submittedAt),
+    })));
+
+    const trainingSessions = await dbo.collection('trainingSessions').find({}).toArray();
+    counts.training_sessions = await upsertBatched('training_sessions', trainingSessions.map((s) => ({
+      id: idStr(s._id), courseId: idStr(s.courseId), title: s.title ?? null, facilitatorId: idStr(s.facilitatorId),
+      facilitatorName: s.facilitatorName ?? null, scheduledAt: toDate(s.scheduledAt), durationMinutes: s.durationMinutes ?? null,
+      meetingLink: s.meetingLink ?? null, capacity: s.capacity ?? null, attendeeIds: (s.attendeeIds || []).map(idStr),
+      status: s.status ?? null, attendance: s.attendance ? JSON.stringify(s.attendance) : null, createdBy: idStr(s.createdBy),
+      createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    // ── Performance ──────────────────────────────────────────────────────
+    const appraisals = await dbo.collection('appraisal_records').find({}).toArray();
+    counts.appraisal_records = await upsertBatched('appraisal_records', appraisals.map((a) => ({
+      id: idStr(a._id), employeeId: idStr(a.employeeId), reviewPeriod: a.reviewPeriod ?? null, periodKey: a.periodKey ?? null,
+      reviewerId: idStr(a.reviewerId), goalsSet: a.goalsSet || [], goalsAchieved: a.goalsAchieved || [], rating: a.rating ?? null,
+      comments: a.comments ?? null, status: a.status ?? null, reviewedBy: idStr(a.reviewedBy), reviewedAt: toDate(a.reviewedAt),
+      reviewComment: a.reviewComment ?? null, createdAt: toDate(a.createdAt),
+    })));
+
+    const reviewTemplates = await dbo.collection('review_templates').find({}).toArray();
+    counts.review_templates = await upsertBatched('review_templates', reviewTemplates.map((t) => ({
+      id: idStr(t._id), name: t.name ?? null, description: t.description ?? null, cycleTypes: t.cycleTypes || [],
+      sections: t.sections ? JSON.stringify(t.sections) : null, isActive: t.isActive ?? true, createdBy: idStr(t.createdBy),
+      createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt), isDemoSeed: t.isDemoSeed ?? false,
+    })));
+
+    const reviewCycles = await dbo.collection('review_cycles').find({}).toArray();
+    counts.review_cycles = await upsertBatched('review_cycles', reviewCycles.map((c) => ({
+      id: idStr(c._id), name: c.name ?? null, type: c.type ?? null, templateId: idStr(c.templateId), status: c.status ?? null,
+      phases: c.phases ? JSON.stringify(c.phases) : null, audience: c.audience ? JSON.stringify(c.audience) : null,
+      participants: c.participants ? JSON.stringify(c.participants) : null, createdBy: idStr(c.createdBy),
+      createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt), isDemoSeed: c.isDemoSeed ?? false,
+    })));
+
+    const reviews = await dbo.collection('reviews').find({}).toArray();
+    counts.reviews = await upsertBatched('reviews', reviews.map((r) => ({
+      id: idStr(r._id), cycleId: idStr(r.cycleId), employeeId: idStr(r.employeeId), reviewerId: idStr(r.reviewerId),
+      reviewType: r.reviewType ?? null, status: r.status ?? null, responses: r.responses ? JSON.stringify(r.responses) : null,
+      overallRating: r.overallRating ?? null, recommendation: r.recommendation ?? null, calibrationBox: r.calibrationBox ?? null,
+      calibrationNotes: r.calibrationNotes ?? null, submittedAt: toDate(r.submittedAt),
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt), isDemoSeed: r.isDemoSeed ?? false,
+    })));
+
+    const goals = await dbo.collection('goals').find({}).toArray();
+    counts.goals = await upsertBatched('goals', goals.map((g) => ({
+      id: idStr(g._id), employeeId: idStr(g.employeeId), department: g.department ?? null, createdBy: idStr(g.createdBy),
+      title: g.title ?? null, description: g.description ?? null, category: g.category ?? null, period: g.period ?? null,
+      startDate: toDate(g.startDate), endDate: toDate(g.endDate), status: g.status ?? null, progress: g.progress ?? 0,
+      visibility: g.visibility ?? null, parentGoalId: idStr(g.parentGoalId), keyResults: g.keyResults ? JSON.stringify(g.keyResults) : null,
+      createdAt: toDate(g.createdAt), updatedAt: toDate(g.updatedAt), isDemoSeed: g.isDemoSeed ?? false,
+    })));
+
+    // goal_check_ins — auto-increment id, delete-then-insert per goal.
+    if (!DRY_RUN) await knex('goal_check_ins').whereIn('goalId', goals.map((g) => idStr(g._id))).del();
+    const checkInRows = goals.flatMap((g) =>
+      (g.checkIns || []).map((ci) => ({
+        goalId: idStr(g._id), progress: ci.progress ?? null, note: ci.note ?? null, updatedBy: idStr(ci.updatedBy),
+        updatedAt: toDate(ci.updatedAt),
+      }))
+    );
+    counts.goal_check_ins = await upsertBatched('goal_check_ins', checkInRows, null);
+
+    // goal_comments — real id of its own (fresh ObjectId per comment), upsert by id.
+    const commentRows = goals.flatMap((g) =>
+      (g.comments || []).map((c) => ({
+        id: idStr(c._id), goalId: idStr(g._id), text: c.text ?? null, authorId: idStr(c.authorId),
+        authorName: c.authorName ?? null, createdAt: toDate(c.createdAt),
+      }))
+    );
+    counts.goal_comments = await upsertBatched('goal_comments', commentRows);
+
+    const feedbackDocs = await dbo.collection('feedback').find({}).toArray();
+    counts.feedback = await upsertBatched('feedback', feedbackDocs.map((f) => ({
+      id: idStr(f._id), giverId: idStr(f.giverId), recipientId: idStr(f.recipientId), type: f.type ?? null,
+      category: f.category ?? null, message: f.message ?? null, visibility: f.visibility ?? null,
+      isAnonymous: f.isAnonymous ?? false, isVisibleToEmployee: f.isVisibleToEmployee ?? true, relatedCycleId: idStr(f.relatedCycleId),
+      createdAt: toDate(f.createdAt), isDemoSeed: f.isDemoSeed ?? false,
+    })));
+
+    const oneOnOnes = await dbo.collection('oneOnOnes').find({}).toArray();
+    counts.one_on_ones = await upsertBatched('one_on_ones', oneOnOnes.map((o) => ({
+      id: idStr(o._id), managerId: idStr(o.managerId), employeeId: idStr(o.employeeId), scheduledAt: toDate(o.scheduledAt),
+      status: o.status ?? null, sharedNotes: o.sharedNotes ?? null, privateManagerNotes: o.privateManagerNotes ?? null,
+      createdBy: idStr(o.createdBy), createdAt: toDate(o.createdAt), updatedAt: toDate(o.updatedAt), completedAt: toDate(o.completedAt),
+    })));
+
+    // one_on_one_agenda_items — real id of its own (fresh randomUUID per item), upsert by id.
+    const agendaItemRows = oneOnOnes.flatMap((o) =>
+      (o.agendaItems || []).map((a) => ({
+        id: a.id, oneOnOneId: idStr(o._id), text: a.text ?? null, addedBy: idStr(a.addedBy),
+        isDone: a.isDone ?? false, createdAt: toDate(a.createdAt),
+      }))
+    );
+    counts.one_on_one_agenda_items = await upsertBatched('one_on_one_agenda_items', agendaItemRows);
+
+    const pips = await dbo.collection('performanceImprovementPlans').find({}).toArray();
+    counts.performance_improvement_plans = await upsertBatched('performance_improvement_plans', pips.map((p) => ({
+      id: idStr(p._id), employeeId: idStr(p.employeeId), managerId: idStr(p.managerId), createdBy: idStr(p.createdBy),
+      reason: p.reason ?? null, startDate: toDate(p.startDate), endDate: toDate(p.endDate), status: p.status ?? null,
+      goals: p.goals ? JSON.stringify(p.goals) : null, outcome: p.outcome ?? null, relatedReviewId: idStr(p.relatedReviewId),
+      createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt), isDemoSeed: p.isDemoSeed ?? false, closedAt: toDate(p.closedAt),
+    })));
+
+    // pip_check_ins — real id of its own (fresh randomUUID per item), upsert by id.
+    const pipCheckInRows = pips.flatMap((p) =>
+      (p.checkIns || []).map((ci) => ({
+        id: ci.id, pipId: idStr(p._id), note: ci.note ?? null, addedBy: idStr(ci.addedBy), createdAt: toDate(ci.createdAt),
+      }))
+    );
+    counts.pip_check_ins = await upsertBatched('pip_check_ins', pipCheckInRows);
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

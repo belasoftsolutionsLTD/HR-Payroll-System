@@ -1,38 +1,37 @@
-const { ObjectId } = require('mongodb');
+const { randomUUID } = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, aggregate } = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 3b) —
-// attendance_records now lives in Postgres; this file's other collections are unmigrated
-// and stay on the Mongo helpers above.
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 5) — appraisal_records, review_templates, review_cycles, reviews, goals (+
+// check-ins/comments), feedback, one_on_ones (+ agenda items),
+// performance_improvement_plans (+ check-ins), employees, users,
+// attendance_records (Phase 3b) all now live in Postgres.
 const pgDB = require('../../functions/Database/pgDBFunctions');
+const { knex, newId, insertOne, updateOne } = pgDB;
+const { evaluateRulesForUser } = require('../../lib/training/autoEnrollment');
 const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 const emailEmployeeByTrigger = async (employeeId, trigger, tokens, fallbackSubject, fallbackHtml) => {
-  const user = await findOne('users', { employeeId: new ObjectId(employeeId) }, { projection: { email: 1 } });
+  const user = await knex('users').where({ employeeId: String(employeeId) }).select('email').first();
   if (!user?.email) return;
   return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
 };
 const emailUserByTrigger = async (userId, trigger, tokens, fallbackSubject, fallbackHtml) => {
-  const user = await findOne('users', { _id: new ObjectId(userId) }, { projection: { email: 1 } });
+  const user = await knex('users').where({ id: String(userId) }).select('email').first();
   if (!user?.email) return;
   return sendTemplatedEmail({ trigger, to: user.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {});
 };
-const { evaluateRulesForUser } = require('../../lib/training/autoEnrollment');
 
 // ── Existing appraisal functions (keep) ───────────────────────────────────────
 
 const getEmployeePerformance = async (req, res) => {
-  const requested = new ObjectId(req.params.employeeId);
+  const requested = String(req.params.employeeId);
   const scopedIds = await getScopedEmployeeIds(req.user);
-  if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(requested))) {
+  if (scopedIds !== null && !scopedIds.includes(requested)) {
     return returnFunction(res, 403, false, "You are not authorized to view this employee's appraisals.");
   }
-  const records = await findMany('appraisal_records',
-    { employeeId: requested },
-    { sort: { createdAt: -1 } }
-  );
+  const records = await knex('appraisal_records').where({ employeeId: requested }).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, records);
 };
 
@@ -41,7 +40,7 @@ const VALID_PERIODS = ['Q1', 'Q2', 'Q3', 'Q4'];
 const createAppraisal = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'reviewPeriod', 'rating'])) return;
   const scopedIds = await getScopedEmployeeIds(req.user);
-  if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(req.body.employeeId))) {
+  if (scopedIds !== null && !scopedIds.includes(String(req.body.employeeId))) {
     return returnFunction(res, 403, false, "You are not authorized to create an appraisal for this employee.");
   }
   const rating = parseInt(req.body.rating);
@@ -60,9 +59,7 @@ const createAppraisal = async (req, res) => {
 
   // Only one non-rejected appraisal per employee per quarter — a rejected one may be
   // redone, so it doesn't block a resubmission for the same period.
-  const duplicate = await findOne('appraisal_records', {
-    employeeId: new ObjectId(req.body.employeeId), periodKey, status: { $ne: 'rejected' },
-  });
+  const duplicate = await knex('appraisal_records').where({ employeeId: String(req.body.employeeId), periodKey }).whereNot({ status: 'rejected' }).first();
   if (duplicate) return returnFunction(res, 409, false, `An appraisal for ${periodKey} already exists for this employee.`);
 
   // HR authoring an appraisal directly is final immediately (no one above HR to review
@@ -70,10 +67,11 @@ const createAppraisal = async (req, res) => {
   const status = _isHR(req.user.role) ? 'approved' : 'submitted';
 
   const doc = {
-    employeeId: new ObjectId(req.body.employeeId),
+    id: newId(),
+    employeeId: String(req.body.employeeId),
     reviewPeriod: req.body.reviewPeriod,
     periodKey,
-    reviewerId: new ObjectId(req.user._id),
+    reviewerId: req.user.id,
     goalsSet: req.body.goalsSet || [],
     goalsAchieved: req.body.goalsAchieved || [],
     rating,
@@ -84,7 +82,7 @@ const createAppraisal = async (req, res) => {
   };
   const result = await insertOne('appraisal_records', doc);
 
-  const employee = await findOne('employees', { _id: new ObjectId(req.body.employeeId) }, { projection: { fullName: 1 } });
+  const employee = await knex('employees').where({ id: String(req.body.employeeId) }).select('fullName').first();
   const empName = employee?.fullName ?? 'An employee';
   const ratingLabel = ['', 'Unsatisfactory', 'Needs Improvement', 'Meets Expectations', 'Exceeds Expectations', 'Outstanding'][doc.rating] ?? `${doc.rating}/5`;
   const employeeMessage = status === 'approved'
@@ -103,7 +101,7 @@ const createAppraisal = async (req, res) => {
     type: 'general',
   }).catch(() => {});
 
-  const employeeUser = await findOne('users', { employeeId: new ObjectId(req.body.employeeId) }, { projection: { email: 1 } });
+  const employeeUser = await knex('users').where({ employeeId: String(req.body.employeeId) }).select('email').first();
   if (employeeUser?.email) {
     sendTemplatedEmail({
       trigger: 'appraisalSubmitted',
@@ -114,7 +112,7 @@ const createAppraisal = async (req, res) => {
     }).catch(() => {});
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 // HR approves or rejects a department_head's submitted appraisal. A rejected appraisal
@@ -127,17 +125,17 @@ const reviewAppraisal = async (req, res) => {
     return returnFunction(res, 400, false, 'Decision must be "approved" or "rejected".');
   }
 
-  const existing = await findOne('appraisal_records', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('appraisal_records').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   if (existing.status !== 'submitted') {
     return returnFunction(res, 400, false, 'Only appraisals awaiting review can be approved or rejected.');
   }
 
-  await updateOne('appraisal_records', { _id: existing._id }, {
-    $set: { status: decision, reviewedBy: new ObjectId(req.user._id), reviewedAt: new Date(), reviewComment: comment || null },
+  await knex('appraisal_records').where({ id: existing.id }).update({
+    status: decision, reviewedBy: req.user.id, reviewedAt: new Date(), reviewComment: comment || null,
   });
 
-  const employee = await findOne('employees', { _id: existing.employeeId }, { projection: { fullName: 1 } });
+  const employee = await knex('employees').where({ id: existing.employeeId }).select('fullName').first();
   const empName = employee?.fullName ?? 'the employee';
 
   notifyEmployee(existing.employeeId, {
@@ -169,10 +167,10 @@ const reviewAppraisal = async (req, res) => {
 };
 
 const updateAppraisal = async (req, res) => {
-  const existing = await findOne('appraisal_records', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('appraisal_records').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   const scopedIds = await getScopedEmployeeIds(req.user);
-  if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(existing.employeeId))) {
+  if (scopedIds !== null && !scopedIds.includes(existing.employeeId)) {
     return returnFunction(res, 403, false, "You are not authorized to edit this employee's appraisal.");
   }
   // An approved appraisal is final — only HR may still correct it (administrative
@@ -190,30 +188,34 @@ const updateAppraisal = async (req, res) => {
   delete update._id; delete update.status; delete update.reviewedBy; delete update.reviewedAt;
   delete update.reviewComment; delete update.periodKey; delete update.employeeId; delete update.reviewerId;
   if (update.rating) update.rating = parseInt(update.rating);
-  await updateOne('appraisal_records', { _id: existing._id }, { $set: update });
+  await knex('appraisal_records').where({ id: existing.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const getPerformanceAlerts = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
-  const matchStage = scopedIds !== null ? [{ $match: { employeeId: { $in: scopedIds } } }] : [];
 
-  const flagged = await global.dbo.collection('appraisal_records').aggregate([
-    ...matchStage,
-    { $sort: { employeeId: 1, createdAt: -1 } },
-    { $group: { _id: '$employeeId', ratings: { $push: '$rating' } } },
-    { $addFields: { lastTwo: { $slice: ['$ratings', 2] } } },
-    { $match: { $expr: { $and: [
-      { $gte: [{ $size: '$lastTwo' }, 2] },
-      { $lte: [{ $arrayElemAt: ['$lastTwo', 0] }, 2] },
-      { $lte: [{ $arrayElemAt: ['$lastTwo', 1] }, 2] },
-    ]}}},
-  ]).toArray();
+  // Ported from a Mongo $sort+$group($push)+$slice+$expr pipeline (flags an employee
+  // whose last two appraisal ratings were both <=2) to a plain JS reduction — same
+  // idiom used for every other Mongo aggregate() ported in this migration.
+  let query = knex('appraisal_records').orderBy('employeeId').orderBy('createdAt', 'desc');
+  if (scopedIds !== null) query = query.whereIn('employeeId', scopedIds);
+  const records = await query;
+
+  const ratingsByEmployee = new Map();
+  for (const r of records) {
+    if (!ratingsByEmployee.has(r.employeeId)) ratingsByEmployee.set(r.employeeId, []);
+    const arr = ratingsByEmployee.get(r.employeeId);
+    if (arr.length < 2) arr.push(r.rating);
+  }
+  const flagged = [...ratingsByEmployee.entries()]
+    .filter(([, lastTwo]) => lastTwo.length >= 2 && lastTwo[0] <= 2 && lastTwo[1] <= 2)
+    .map(([employeeId, lastTwo]) => ({ employeeId, ratings: lastTwo }));
 
   const enriched = await Promise.all(flagged.map(async (f) => {
-    const emp = await findOne('employees', { _id: f._id }, { projection: { fullName: 1, staffNumber: 1, department: 1, designation: 1 } });
-    return { employee: emp, ratings: f.lastTwo };
+    const emp = await knex('employees').where({ id: f.employeeId }).select('fullName', 'staffNumber', 'department', 'designation').first();
+    return { employee: emp, ratings: f.ratings };
   }));
 
   return returnFunction(res, 200, true, req.locale.success, enriched);
@@ -222,6 +224,17 @@ const getPerformanceAlerts = async (req, res) => {
 // ── Goals ─────────────────────────────────────────────────────────────────────
 
 const GOAL_STATUSES = ['not_started', 'in_progress', 'at_risk', 'completed'];
+
+// Reconstructs the Mongo-shaped `checkIns[]`/`comments[]` arrays from their real
+// child tables — same idiom as onboarding's attachTaskLists (Phase 4).
+const attachGoalChildren = async (goal) => {
+  if (!goal) return goal;
+  const [checkIns, comments] = await Promise.all([
+    knex('goal_check_ins').where({ goalId: goal.id }).orderBy('id'),
+    knex('goal_comments').where({ goalId: goal.id }).orderBy('createdAt'),
+  ]);
+  return { ...goal, checkIns, comments: comments.map((c) => ({ _id: c.id, ...c })) };
+};
 
 const listGoals = async (req, res) => {
   const extra = {};
@@ -233,9 +246,9 @@ const listGoals = async (req, res) => {
 
   // HR/super_admin — unrestricted (same as before), still honors ?employeeId= narrowing.
   if (scopedIds === null) {
-    const filter = { ...extra };
-    if (req.query.employeeId) filter.employeeId = new ObjectId(req.query.employeeId);
-    const goals = await findMany('goals', filter, { sort: { createdAt: -1 } });
+    let query = knex('goals').where(extra);
+    if (req.query.employeeId) query = query.where({ employeeId: String(req.query.employeeId) });
+    const goals = await query.orderBy('createdAt', 'desc');
     return returnFunction(res, 200, true, req.locale.success, goals);
   }
   if (!scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
@@ -246,22 +259,26 @@ const listGoals = async (req, res) => {
   // my direct reports, or my department), plus company-wide-visible goals from anyone,
   // plus team-visible goals within my own department (dept heads only — team visibility
   // for a plain-staff manager isn't worth the extra complexity here).
-  const orClauses = [{ employeeId: { $in: scopedIds } }, { visibility: 'company' }];
-  if (req.user.role === 'department_head' && req.user.department) {
-    orClauses.push({ visibility: 'team', department: req.user.department });
-  }
+  const visibleOutsideScope = (qb) => {
+    qb.where({ visibility: 'company' });
+    if (req.user.role === 'department_head' && req.user.department) {
+      qb.orWhere((qb2) => qb2.where({ visibility: 'team', department: req.user.department }));
+    }
+  };
 
   if (req.query.employeeId) {
-    const requested = new ObjectId(req.query.employeeId);
-    const inScope = scopedIds.some((id) => String(id) === String(requested));
-    const filter = inScope
-      ? { employeeId: requested, ...extra }
-      : { employeeId: requested, $or: orClauses.filter((c) => !c.employeeId), ...extra };
-    const goals = await findMany('goals', filter, { sort: { createdAt: -1 } });
+    const requested = String(req.query.employeeId);
+    const inScope = scopedIds.includes(requested);
+    let query = knex('goals').where({ employeeId: requested }).where(extra);
+    if (!inScope) query = query.where(visibleOutsideScope);
+    const goals = await query.orderBy('createdAt', 'desc');
     return returnFunction(res, 200, true, req.locale.success, goals);
   }
 
-  const goals = await findMany('goals', { $or: orClauses, ...extra }, { sort: { createdAt: -1 } });
+  const goals = await knex('goals')
+    .where((qb) => { qb.whereIn('employeeId', scopedIds).orWhere(visibleOutsideScope); })
+    .where(extra)
+    .orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, goals);
 };
 
@@ -269,7 +286,7 @@ const createGoal = async (req, res) => {
   if (!validateRequiredFields(req, res, ['title', 'category', 'period'])) return;
 
   const keyResults = (req.body.keyResults || []).map(kr => ({
-    _id: new ObjectId(),
+    _id: newId(),
     description: kr.description,
     type: kr.type || 'number',
     startValue: Number(kr.startValue) || 0,
@@ -279,22 +296,23 @@ const createGoal = async (req, res) => {
     isCompleted: false,
   }));
 
-  let employeeId = null;
-  if (req.body.employeeId) {
-    employeeId = new ObjectId(req.body.employeeId);
-  } else {
-    const emp = await findOne('employees', { userId: new ObjectId(req.user._id) }, { projection: { _id: 1 } });
-    if (emp) employeeId = emp._id;
-  }
+  // req.body.employeeId wins when given (HR/manager creating a goal for someone else);
+  // otherwise this is a self-authored goal — req.user.employeeId (already resolved by
+  // AuthMiddleware) is the real link, not a query. This used to look employees up by
+  // `employees.userId`, a field that has never existed in this schema (confirmed via a
+  // live check — 0/N documents have it), so the fallback path always silently produced
+  // employeeId: null for anyone creating their own goal without explicitly passing one.
+  const employeeId = req.body.employeeId ? String(req.body.employeeId) : (req.user.employeeId ? String(req.user.employeeId) : null);
 
   // department was previously never stamped here despite listGoals filtering on it for
   // 'team' visibility — that visibility tier could never actually match anything.
-  const targetEmp = employeeId ? await findOne('employees', { _id: employeeId }, { projection: { department: 1 } }) : null;
+  const targetEmp = employeeId ? await knex('employees').where({ id: employeeId }).select('department').first() : null;
 
   const doc = {
+    id: newId(),
     employeeId,
     department: targetEmp?.department || null,
-    createdBy: new ObjectId(req.user._id),
+    createdBy: req.user.id,
     title: req.body.title,
     description: req.body.description || '',
     category: req.body.category,
@@ -304,16 +322,14 @@ const createGoal = async (req, res) => {
     status: 'not_started',
     progress: 0,
     visibility: req.body.visibility || 'private',
-    parentGoalId: req.body.parentGoalId ? new ObjectId(req.body.parentGoalId) : null,
-    keyResults,
-    checkIns: [],
-    comments: [],
+    parentGoalId: req.body.parentGoalId ? String(req.body.parentGoalId) : null,
+    keyResults: JSON.stringify(keyResults),
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
   const result = await insertOne('goals', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const _isHR = (role) => ['super_admin', 'hr_manager'].includes(role);
@@ -333,11 +349,11 @@ const isAuthorizedForReview = async (req, employeeId, reviewType, cycleId) => {
     // Peer authorship isn't managerial — it's whoever HR explicitly nominated as a peer
     // reviewer for this employee in this specific cycle (cycle.participants.$.peersAssigned).
     if (!req.user.employeeId || !cycleId) return false;
-    const cycle = await findOne('review_cycles', { _id: new ObjectId(cycleId) }, { projection: { participants: 1 } });
+    const cycle = await knex('review_cycles').where({ id: String(cycleId) }).select('participants').first();
     const participant = cycle?.participants?.find((p) => String(p.employeeId) === String(employeeId));
     return !!participant?.peersAssigned?.some((pa) => String(pa.peerId) === String(req.user.employeeId));
   }
-  const employee = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { managerId: 1, department: 1 } });
+  const employee = await knex('employees').where({ id: String(employeeId) }).select('managerId', 'department').first();
   if (!employee) return false;
   if (req.user.role === 'department_head') return !!req.user.department && employee.department === req.user.department;
   return !!req.user.employeeId && String(employee.managerId || '') === String(req.user.employeeId);
@@ -353,13 +369,13 @@ const getScopedEmployeeIds = async (user) => {
   if (_isHR(user.role)) return null;
   if (user.role === 'department_head') {
     if (!user.department) return [];
-    const emps = await findMany('employees', { department: user.department }, { projection: { _id: 1 } });
-    return emps.map((e) => e._id);
+    const emps = await knex('employees').where({ department: user.department }).select('id');
+    return emps.map((e) => e.id);
   }
   if (!user.employeeId) return [];
-  const directReports = await findMany('employees', { managerId: new ObjectId(user.employeeId) }, { projection: { _id: 1 } });
-  const ids = directReports.map((e) => e._id);
-  ids.push(new ObjectId(user.employeeId));
+  const directReports = await knex('employees').where({ managerId: String(user.employeeId) }).select('id');
+  const ids = directReports.map((e) => e.id);
+  ids.push(String(user.employeeId));
   return ids;
 };
 
@@ -371,7 +387,7 @@ const canManageGoal = async (req, goal) => {
   if (_isHR(req.user.role)) return true;
   if (goal.employeeId && String(goal.employeeId) === String(req.user.employeeId)) return true;
   if (!goal.employeeId) return false;
-  const employee = await findOne('employees', { _id: goal.employeeId }, { projection: { managerId: 1, department: 1 } });
+  const employee = await knex('employees').where({ id: goal.employeeId }).select('managerId', 'department').first();
   if (!employee) return false;
   if (req.user.role === 'department_head') return !!req.user.department && employee.department === req.user.department;
   return !!req.user.employeeId && String(employee.managerId || '') === String(req.user.employeeId);
@@ -388,14 +404,14 @@ const canViewGoal = async (req, goal) => {
 };
 
 const getGoal = async (req, res) => {
-  const goal = await findOne('goals', { _id: new ObjectId(req.params.id) });
+  const goal = await knex('goals').where({ id: req.params.id }).first();
   if (!goal) return returnFunction(res, 404, false, 'Goal not found.');
   if (!(await canViewGoal(req, goal))) return returnFunction(res, 403, false, 'Forbidden.');
-  return returnFunction(res, 200, true, req.locale.success, goal);
+  return returnFunction(res, 200, true, req.locale.success, await attachGoalChildren(goal));
 };
 
 const updateGoal = async (req, res) => {
-  const goal = await findOne('goals', { _id: new ObjectId(req.params.id) });
+  const goal = await knex('goals').where({ id: req.params.id }).first();
   if (!goal) return returnFunction(res, 404, false, 'Goal not found.');
   if (!(await canManageGoal(req, goal))) return returnFunction(res, 403, false, 'Forbidden.');
 
@@ -408,71 +424,65 @@ const updateGoal = async (req, res) => {
     return returnFunction(res, 400, false, 'Invalid status.');
   }
   if (update.keyResults) {
-    update.keyResults = update.keyResults.map(kr => ({
+    update.keyResults = JSON.stringify(update.keyResults.map(kr => ({
       ...kr,
-      _id: kr._id ? new ObjectId(kr._id) : new ObjectId(),
+      _id: kr._id || newId(),
       startValue: Number(kr.startValue) || 0,
       targetValue: Number(kr.targetValue) || 0,
       currentValue: Number(kr.currentValue) || 0,
-    }));
+    })));
   }
 
-  await updateOne('goals', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('goals').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteGoal = async (req, res) => {
-  const goal = await findOne('goals', { _id: new ObjectId(req.params.id) });
+  const goal = await knex('goals').where({ id: req.params.id }).first();
   if (!goal) return returnFunction(res, 404, false, 'Goal not found.');
   if (!(await canManageGoal(req, goal))) return returnFunction(res, 403, false, 'Forbidden.');
-  await global.dbo.collection('goals').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('goals').where({ id: req.params.id }).del();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 const addCheckin = async (req, res) => {
   if (!validateRequiredFields(req, res, ['progress'])) return;
 
-  const goal = await findOne('goals', { _id: new ObjectId(req.params.id) });
+  const goal = await knex('goals').where({ id: req.params.id }).first();
   if (!goal) return returnFunction(res, 404, false, 'Goal not found.');
   if (!(await canViewGoal(req, goal))) return returnFunction(res, 403, false, 'Forbidden.');
 
   const checkin = {
+    goalId: goal.id,
     progress: Number(req.body.progress),
     note: req.body.note || '',
-    updatedBy: new ObjectId(req.user._id),
+    updatedBy: req.user.id,
     updatedAt: new Date(),
   };
 
-  await global.dbo.collection('goals').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    {
-      $push: { checkIns: checkin },
-      $set: { progress: checkin.progress, updatedAt: new Date() },
-    }
-  );
+  await knex('goal_check_ins').insert(checkin);
+  await knex('goals').where({ id: goal.id }).update({ progress: checkin.progress, updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Check-in added.', checkin);
 };
 
 const addGoalComment = async (req, res) => {
   if (!validateRequiredFields(req, res, ['text'])) return;
 
-  const goal = await findOne('goals', { _id: new ObjectId(req.params.id) });
+  const goal = await knex('goals').where({ id: req.params.id }).first();
   if (!goal) return returnFunction(res, 404, false, 'Goal not found.');
   if (!(await canViewGoal(req, goal))) return returnFunction(res, 403, false, 'Forbidden.');
 
   const comment = {
-    _id: new ObjectId(),
+    id: newId(),
+    goalId: goal.id,
     text: req.body.text.trim(),
-    authorId: new ObjectId(req.user._id),
+    authorId: req.user.id,
     authorName: req.user.name,
     createdAt: new Date(),
   };
 
-  await global.dbo.collection('goals').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $push: { comments: comment } }
-  );
-  return returnFunction(res, 200, true, 'Comment added.', comment);
+  await knex('goal_comments').insert(comment);
+  return returnFunction(res, 200, true, 'Comment added.', { ...comment, _id: comment.id });
 };
 
 // ── Review Templates ────────────────────────────────────────────────────────────
@@ -480,8 +490,6 @@ const addGoalComment = async (req, res) => {
 // structured questions instead of a blank free-text form. Sections/questions get a
 // server-assigned id (crypto.randomUUID) so responses can reference them stably even
 // if the template's wording is edited later.
-
-const { randomUUID } = require('crypto');
 
 const _normalizeTemplateSections = (sections) => (Array.isArray(sections) ? sections : []).map((s) => ({
   id: s.id || randomUUID(),
@@ -495,13 +503,14 @@ const _normalizeTemplateSections = (sections) => (Array.isArray(sections) ? sect
 }));
 
 const listTemplates = async (req, res) => {
-  const filter = _isHR(req.user.role) && req.query.includeInactive === 'true' ? {} : { isActive: true };
-  const templates = await findMany('review_templates', filter, { sort: { createdAt: -1 } });
+  let query = knex('review_templates');
+  if (!(_isHR(req.user.role) && req.query.includeInactive === 'true')) query = query.where({ isActive: true });
+  const templates = await query.orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, templates);
 };
 
 const getTemplate = async (req, res) => {
-  const template = await findOne('review_templates', { _id: new ObjectId(req.params.id) });
+  const template = await knex('review_templates').where({ id: req.params.id }).first();
   if (!template) return returnFunction(res, 404, false, 'Template not found.');
   return returnFunction(res, 200, true, req.locale.success, template);
 };
@@ -509,17 +518,18 @@ const getTemplate = async (req, res) => {
 const createTemplate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name'])) return;
   const doc = {
+    id: newId(),
     name: req.body.name,
     description: req.body.description || '',
     cycleTypes: Array.isArray(req.body.cycleTypes) ? req.body.cycleTypes : [],
-    sections: _normalizeTemplateSections(req.body.sections),
+    sections: JSON.stringify(_normalizeTemplateSections(req.body.sections)),
     isActive: true,
-    createdBy: new ObjectId(req.user._id),
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
   const result = await insertOne('review_templates', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const updateTemplate = async (req, res) => {
@@ -527,30 +537,30 @@ const updateTemplate = async (req, res) => {
   if (req.body.name !== undefined) update.name = req.body.name;
   if (req.body.description !== undefined) update.description = req.body.description;
   if (req.body.cycleTypes !== undefined) update.cycleTypes = Array.isArray(req.body.cycleTypes) ? req.body.cycleTypes : [];
-  if (req.body.sections !== undefined) update.sections = _normalizeTemplateSections(req.body.sections);
+  if (req.body.sections !== undefined) update.sections = JSON.stringify(_normalizeTemplateSections(req.body.sections));
   if (req.body.isActive !== undefined) update.isActive = !!req.body.isActive;
-  await updateOne('review_templates', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('review_templates').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 // Templates may already be referenced by a cycle's templateId — deactivating (rather than
 // hard-deleting) keeps those cycles' past reviews interpretable instead of leaving a dangling id.
 const deleteTemplate = async (req, res) => {
-  await updateOne('review_templates', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('review_templates').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Template deactivated.');
 };
 
 // ── Review Cycles ─────────────────────────────────────────────────────────────
 
 const listCycles = async (req, res) => {
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
-  const cycles = await findMany('review_cycles', filter, { sort: { createdAt: -1 } });
+  let query = knex('review_cycles');
+  if (req.query.status) query = query.where({ status: req.query.status });
+  const cycles = await query.orderBy('createdAt', 'desc');
 
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds === null) return returnFunction(res, 200, true, req.locale.success, cycles);
 
-  const scopedSet = new Set(scopedIds.map((id) => String(id)));
+  const scopedSet = new Set(scopedIds);
   const narrowed = cycles.map((c) => {
     const participants = (c.participants || []).filter((p) => scopedSet.has(String(p.employeeId)));
     return { ...c, participants, total: participants.length, completed: participants.filter((p) => p.selfReviewStatus === 'submitted').length };
@@ -566,16 +576,17 @@ const createCycle = async (req, res) => {
   // forcing every launch to be company-wide.
   const audienceType = ['all', 'departments', 'employees'].includes(req.body.audienceType) ? req.body.audienceType : 'all';
   const doc = {
+    id: newId(),
     name: req.body.name,
     type: req.body.type,
-    templateId: req.body.templateId ? new ObjectId(req.body.templateId) : null,
-    audience: {
+    templateId: req.body.templateId ? String(req.body.templateId) : null,
+    audience: JSON.stringify({
       type: audienceType,
       departments: audienceType === 'departments' && Array.isArray(req.body.departments) ? req.body.departments : [],
-      employeeIds: audienceType === 'employees' && Array.isArray(req.body.employeeIds) ? req.body.employeeIds.map((id) => new ObjectId(id)) : [],
-    },
+      employeeIds: audienceType === 'employees' && Array.isArray(req.body.employeeIds) ? req.body.employeeIds.map(String) : [],
+    }),
     status: 'draft',
-    phases: {
+    phases: JSON.stringify({
       selfReview: {
         startDate: req.body.selfReviewStart ? new Date(req.body.selfReviewStart) : null,
         endDate: req.body.selfReviewEnd ? new Date(req.body.selfReviewEnd) : null,
@@ -594,25 +605,25 @@ const createCycle = async (req, res) => {
         date: req.body.resultsSharingDate ? new Date(req.body.resultsSharingDate) : null,
         isEnabled: req.body.resultsSharingEnabled !== false,
       },
-    },
-    participants: [],
-    createdBy: new ObjectId(req.user._id),
+    }),
+    participants: JSON.stringify([]),
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
   const result = await insertOne('review_cycles', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const getCycle = async (req, res) => {
-  const cycle = await findOne('review_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await knex('review_cycles').where({ id: req.params.id }).first();
   if (!cycle) return returnFunction(res, 404, false, 'Cycle not found.');
 
   const scopedIds = await getScopedEmployeeIds(req.user);
-  let participants = cycle.participants;
+  let participants = cycle.participants || [];
   if (scopedIds !== null) {
-    const scopedSet = new Set(scopedIds.map((id) => String(id)));
+    const scopedSet = new Set(scopedIds);
     participants = participants.filter((p) => scopedSet.has(String(p.employeeId)));
   }
 
@@ -625,28 +636,33 @@ const getCycle = async (req, res) => {
 const updateCycle = async (req, res) => {
   const update = { ...req.body };
   delete update._id;
-  if (update.templateId !== undefined) update.templateId = update.templateId ? new ObjectId(update.templateId) : null;
-  if (update.audience?.employeeIds) update.audience.employeeIds = update.audience.employeeIds.map((id) => new ObjectId(id));
+  if (update.templateId !== undefined) { update.templateId = update.templateId ? String(update.templateId) : null; }
+  if (update.audience) {
+    if (update.audience.employeeIds) update.audience.employeeIds = update.audience.employeeIds.map(String);
+    update.audience = JSON.stringify(update.audience);
+  }
+  if (update.phases) update.phases = JSON.stringify(update.phases);
+  if (update.participants) update.participants = JSON.stringify(update.participants);
   update.updatedAt = new Date();
-  await updateOne('review_cycles', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('review_cycles').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const launchCycle = async (req, res) => {
-  const cycle = await findOne('review_cycles', { _id: new ObjectId(req.params.id) });
+  const cycle = await knex('review_cycles').where({ id: req.params.id }).first();
   if (!cycle) return returnFunction(res, 404, false, 'Cycle not found.');
   if (cycle.status === 'active') return returnFunction(res, 400, false, 'Cycle is already active.');
 
   const audience = cycle.audience || { type: 'all' };
-  const employeeFilter = { status: 'active' };
+  let employeeQuery = knex('employees').where({ status: 'active' });
   if (audience.type === 'departments' && audience.departments?.length) {
-    employeeFilter.department = { $in: audience.departments };
+    employeeQuery = employeeQuery.whereIn('department', audience.departments);
   } else if (audience.type === 'employees' && audience.employeeIds?.length) {
-    employeeFilter._id = { $in: audience.employeeIds };
+    employeeQuery = employeeQuery.whereIn('id', audience.employeeIds);
   }
-  const employees = await findMany('employees', employeeFilter, { projection: { _id: 1, userId: 1 } });
+  const employees = await employeeQuery.select('id');
   const participants = employees.map(emp => ({
-    employeeId: emp._id,
+    employeeId: emp.id,
     selfReviewStatus: 'pending',
     managerReviewStatus: 'pending',
     selfReviewSubmittedAt: null,
@@ -655,8 +671,8 @@ const launchCycle = async (req, res) => {
     peersAssigned: [],
   }));
 
-  await updateOne('review_cycles', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'active', participants, updatedAt: new Date() },
+  await knex('review_cycles').where({ id: req.params.id }).update({
+    status: 'active', participants: JSON.stringify(participants), updatedAt: new Date(),
   });
 
   notifyByRoles(['hr_manager', 'super_admin', 'department_head', 'staff'], {
@@ -666,7 +682,7 @@ const launchCycle = async (req, res) => {
   });
 
   {
-    const allUsers = await findMany('users', { isActive: { $ne: false } }, { projection: { email: 1 } });
+    const allUsers = await knex('users').whereNot({ isActive: false }).select('email');
     const tokens = { cycleName: cycle.name };
     allUsers.filter(u => u.email).forEach(u => sendTemplatedEmail({
       trigger: 'reviewCycleLaunched', to: u.email, tokens,
@@ -683,40 +699,36 @@ const launchCycle = async (req, res) => {
 // resetting their status, so re-saving the same set (or adding one more peer) doesn't wipe
 // work someone already submitted.
 const assignPeerReviewers = async (req, res) => {
-  const cycleId = new ObjectId(req.params.id);
-  const employeeId = new ObjectId(req.params.employeeId);
+  const cycleId = req.params.id;
+  const employeeId = req.params.employeeId;
   const peerIds = Array.isArray(req.body.peerIds) ? req.body.peerIds : [];
 
-  const cycle = await findOne('review_cycles', { _id: cycleId });
+  const cycle = await knex('review_cycles').where({ id: cycleId }).first();
   if (!cycle) return returnFunction(res, 404, false, 'Cycle not found.');
-  const participant = (cycle.participants || []).find((p) => String(p.employeeId) === String(employeeId));
-  if (!participant) return returnFunction(res, 404, false, 'Employee is not a participant in this cycle.');
+  const participants = cycle.participants || [];
+  const participantIdx = participants.findIndex((p) => String(p.employeeId) === String(employeeId));
+  if (participantIdx === -1) return returnFunction(res, 404, false, 'Employee is not a participant in this cycle.');
 
-  const existingByPeer = new Map((participant.peersAssigned || []).map((pa) => [String(pa.peerId), pa]));
-  const peersAssigned = peerIds.map((id) => existingByPeer.get(String(id)) || { peerId: new ObjectId(id), status: 'pending', submittedAt: null });
+  const existingByPeer = new Map((participants[participantIdx].peersAssigned || []).map((pa) => [String(pa.peerId), pa]));
+  const peersAssigned = peerIds.map((id) => existingByPeer.get(String(id)) || { peerId: String(id), status: 'pending', submittedAt: null });
 
-  await updateOne(
-    'review_cycles',
-    { _id: cycleId, 'participants.employeeId': employeeId },
-    { $set: { 'participants.$.peersAssigned': peersAssigned, updatedAt: new Date() } },
-  );
+  participants[participantIdx] = { ...participants[participantIdx], peersAssigned };
+  await knex('review_cycles').where({ id: cycleId }).update({ participants: JSON.stringify(participants), updatedAt: new Date() });
 
   return returnFunction(res, 200, true, 'Peer reviewers updated.');
 };
 
 const closeCycle = async (req, res) => {
-  await updateOne('review_cycles', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'completed', updatedAt: new Date() },
-  });
+  await knex('review_cycles').where({ id: req.params.id }).update({ status: 'completed', updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Review cycle closed.');
 };
 
 // ── Reviews ───────────────────────────────────────────────────────────────────
 
 const listReviews = async (req, res) => {
-  const filter = {};
-  if (req.query.cycleId) filter.cycleId = new ObjectId(req.query.cycleId);
-  if (req.query.reviewerId) filter.reviewerId = new ObjectId(req.query.reviewerId);
+  let query = knex('reviews');
+  if (req.query.cycleId) query = query.where({ cycleId: req.query.cycleId });
+  if (req.query.reviewerId) query = query.where({ reviewerId: String(req.query.reviewerId) });
 
   // A caller-supplied ?employeeId= previously got applied to the filter unconditionally,
   // regardless of role — any department_head/manager could pass any employeeId and read
@@ -725,35 +737,35 @@ const listReviews = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   if (scopedIds !== null && !scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
   if (req.query.employeeId) {
-    const requested = new ObjectId(req.query.employeeId);
-    if (scopedIds !== null && !scopedIds.some((id) => String(id) === String(requested))) {
+    const requested = String(req.query.employeeId);
+    if (scopedIds !== null && !scopedIds.includes(requested)) {
       return returnFunction(res, 403, false, "You are not authorized to view this employee's reviews.");
     }
-    filter.employeeId = requested;
+    query = query.where({ employeeId: requested });
   } else if (scopedIds !== null) {
-    filter.employeeId = { $in: scopedIds };
+    query = query.whereIn('employeeId', scopedIds);
   }
 
-  const reviews = await findMany('reviews', filter, { sort: { createdAt: -1 } });
+  const reviews = await query.orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, reviews);
 };
 
 const getReview = async (req, res) => {
-  const review = await findOne('reviews', { _id: new ObjectId(req.params.id) });
+  const review = await knex('reviews').where({ id: req.params.id }).first();
   if (!review) return returnFunction(res, 404, false, 'Review not found.');
 
-  const isOwnerOrReviewer = String(review.reviewerId) === String(req.user._id) || String(review.employeeId) === String(req.user.employeeId);
+  const isOwnerOrReviewer = String(review.reviewerId) === String(req.user.id) || String(review.employeeId) === String(req.user.employeeId);
   if (!isOwnerOrReviewer && !(await isAuthorizedForReview(req, review.employeeId, review.reviewType, review.cycleId))) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
 
   const [employee, reviewer, cycle] = await Promise.all([
-    findOne('employees', { _id: review.employeeId }, { projection: { fullName: 1, designation: 1, department: 1 } }),
-    findOne('users', { _id: review.reviewerId }, { projection: { name: 1 } }),
-    findOne('review_cycles', { _id: review.cycleId }, { projection: { name: 1, type: 1, phases: 1, templateId: 1 } }),
+    knex('employees').where({ id: review.employeeId }).select('fullName', 'designation', 'department').first(),
+    knex('users').where({ id: review.reviewerId }).select('name').first(),
+    knex('review_cycles').where({ id: review.cycleId }).select('name', 'type', 'phases', 'templateId').first(),
   ]);
 
-  const template = cycle?.templateId ? await findOne('review_templates', { _id: cycle.templateId }) : null;
+  const template = cycle?.templateId ? await knex('review_templates').where({ id: cycle.templateId }).first() : null;
   // Only a manager (writing an evaluative review) benefits from attendance context — a
   // self-review doesn't need it, and showing it there would just be noise.
   const attendanceSummary = review.reviewType === 'manager' ? await getAttendanceSummaryForReview(review.employeeId) : null;
@@ -764,8 +776,8 @@ const getReview = async (req, res) => {
 // Trailing-90-day attendance snapshot (present/late/absent counts + rate) for the employee
 // being reviewed — gives a manager real, verifiable context (absences, lateness patterns)
 // instead of writing a review from memory alone. Reads the same 'attendance_records'
-// collection/status enum ('present'|'late'|'absent'|'half_day'|'remote') as the Attendance
-// module itself.
+// table/status enum ('present'|'late'|'absent'|'half_day'|'remote') as the Attendance
+// module itself (Phase 3b).
 const getAttendanceSummaryForReview = async (employeeId) => {
   const since = new Date();
   since.setDate(since.getDate() - 90);
@@ -798,10 +810,10 @@ const getAttendanceSummaryForReview = async (employeeId) => {
 const getMyReviewTasks = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
   const myEmployeeId = req.user.employeeId ? String(req.user.employeeId) : null;
-  const cycles = await findMany('review_cycles', { status: { $in: ['active', 'calibration'] } }, { sort: { createdAt: -1 } });
+  const cycles = await knex('review_cycles').whereIn('status', ['active', 'calibration']).orderBy('createdAt', 'desc');
   if (!cycles.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const scopedSet = scopedIds !== null ? new Set(scopedIds.map((id) => String(id))) : null;
+  const scopedSet = scopedIds !== null ? new Set(scopedIds) : null;
   const employeeIdsNeeded = new Set();
   const rawTasks = [];
 
@@ -833,28 +845,28 @@ const getMyReviewTasks = async (req, res) => {
 
   if (!rawTasks.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const idList = [...employeeIdsNeeded].map((id) => new ObjectId(id));
+  const idList = [...employeeIdsNeeded];
   const [employees, existingReviews] = await Promise.all([
-    findMany('employees', { _id: { $in: idList } }, { projection: { fullName: 1, designation: 1, department: 1 } }),
+    knex('employees').whereIn('id', idList).select('id', 'fullName', 'designation', 'department'),
     // Scoped to reviews authored by the current user — peer reviews can have several
     // draft/submitted docs for the same cycle+employee+type (one per peer reviewer), so
     // without this filter the lookup below could resolve to a different peer's review.
-    findMany('reviews', { cycleId: { $in: cycles.map((c) => c._id) }, employeeId: { $in: idList }, reviewerId: new ObjectId(req.user._id) }),
+    knex('reviews').whereIn('cycleId', cycles.map((c) => c.id)).whereIn('employeeId', idList).where({ reviewerId: req.user.id }),
   ]);
-  const empMap = new Map(employees.map((e) => [String(e._id), e]));
+  const empMap = new Map(employees.map((e) => [e.id, e]));
   const reviewMap = new Map(existingReviews.map((r) => [`${r.cycleId}_${r.employeeId}_${r.reviewType}`, r]));
 
   const tasks = rawTasks.map((t) => {
-    const existing = reviewMap.get(`${t.cycle._id}_${t.employeeId}_${t.reviewType}`);
+    const existing = reviewMap.get(`${t.cycle.id}_${t.employeeId}_${t.reviewType}`);
     return {
-      cycleId: t.cycle._id,
+      cycleId: t.cycle.id,
       cycleName: t.cycle.name,
       templateId: t.cycle.templateId || null,
       employeeId: t.employeeId,
       employee: empMap.get(String(t.employeeId)) || null,
       reviewType: t.reviewType,
       status: t.status,
-      reviewId: existing?._id || null,
+      reviewId: existing?.id || null,
     };
   });
 
@@ -873,36 +885,37 @@ const upsertReview = async (req, res) => {
   }
 
   const filter = {
-    cycleId: new ObjectId(cycleId),
-    employeeId: new ObjectId(employeeId),
+    cycleId: String(cycleId),
+    employeeId: String(employeeId),
     reviewType,
     // Peer reviews are many-to-one (several colleagues each write their own about the same
     // employee), so reviewerId must be part of the identity key — self/manager stay 1:1 per
     // cycle+employee, where reviewerId is implied by isAuthorizedForReview and never varies.
-    ...(reviewType === 'peer' ? { reviewerId: new ObjectId(req.user._id) } : {}),
+    ...(reviewType === 'peer' ? { reviewerId: req.user.id } : {}),
   };
 
-  const existing = await findOne('reviews', filter);
+  const existing = await knex('reviews').where(filter).first();
   // An existing review's reviewer is fixed at creation — editing someone else's draft
   // (even a legitimately-created one) isn't the same operation as authoring a new one.
-  if (existing && !_isHR(req.user.role) && String(existing.reviewerId) !== String(req.user._id)) {
+  if (existing && !_isHR(req.user.role) && String(existing.reviewerId) !== String(req.user.id)) {
     return returnFunction(res, 403, false, 'Only the assigned reviewer can edit this review.');
   }
 
   const data = {
-    responses: req.body.responses || [],
+    responses: JSON.stringify(req.body.responses || []),
     overallRating: req.body.overallRating ? Number(req.body.overallRating) : null,
     updatedAt: new Date(),
   };
 
   if (existing) {
-    await updateOne('reviews', { _id: existing._id }, { $set: data });
-    return returnFunction(res, 200, true, 'Review saved.', { _id: existing._id });
+    await knex('reviews').where({ id: existing.id }).update(data);
+    return returnFunction(res, 200, true, 'Review saved.', { _id: existing.id });
   }
 
   const doc = {
+    id: newId(),
     ...filter,
-    reviewerId: new ObjectId(req.user._id),
+    reviewerId: req.user.id,
     status: 'draft',
     ...data,
     recommendation: null,
@@ -912,29 +925,27 @@ const upsertReview = async (req, res) => {
     createdAt: new Date(),
   };
   const result = await insertOne('reviews', doc);
-  return returnFunction(res, 201, true, 'Review created.', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Review created.', { _id: result.id });
 };
 
 const submitReview = async (req, res) => {
-  const review = await findOne('reviews', { _id: new ObjectId(req.params.id) });
+  const review = await knex('reviews').where({ id: req.params.id }).first();
   if (!review) return returnFunction(res, 404, false, 'Review not found.');
   if (review.status === 'submitted') return returnFunction(res, 400, false, 'Review already submitted.');
   // HR can submit on a reviewer's behalf for administrative corrections; a department_head
   // has no business submitting a review they didn't author just by virtue of the role —
   // that bypass previously let any department_head submit any employee's review company-wide.
-  if (!_isHR(req.user.role) && String(review.reviewerId) !== String(req.user._id)) {
+  if (!_isHR(req.user.role) && String(review.reviewerId) !== String(req.user.id)) {
     return returnFunction(res, 403, false, 'Only the assigned reviewer can submit this review.');
   }
 
   const recommendation = req.body.recommendation || null;
-  await updateOne('reviews', { _id: new ObjectId(req.params.id) }, {
-    $set: {
-      status: 'submitted',
-      recommendation,
-      overallRating: req.body.overallRating ? Number(req.body.overallRating) : review.overallRating,
-      submittedAt: new Date(),
-      updatedAt: new Date(),
-    },
+  await knex('reviews').where({ id: req.params.id }).update({
+    status: 'submitted',
+    recommendation,
+    overallRating: req.body.overallRating ? Number(req.body.overallRating) : review.overallRating,
+    submittedAt: new Date(),
+    updatedAt: new Date(),
   });
 
   // A manager review's promote/PIP recommendation used to just sit on the review doc,
@@ -942,11 +953,10 @@ const submitReview = async (req, res) => {
   // the profile page to surface) and tells HR directly, so the recommendation actually
   // reaches someone who can act on it instead of being buried in a submitted review.
   if (['promote', 'pip'].includes(recommendation)) {
-    const flaggedEmployee = await findOne('employees', { _id: review.employeeId }, { projection: { fullName: 1 } });
-    await global.dbo.collection('employees').updateOne(
-      { _id: review.employeeId },
-      { $set: { pendingPerformanceFlag: { type: recommendation, reviewId: review._id, cycleId: review.cycleId, flaggedBy: new ObjectId(req.user._id), flaggedAt: new Date() } } },
-    );
+    const flaggedEmployee = await knex('employees').where({ id: review.employeeId }).select('fullName').first();
+    await knex('employees').where({ id: review.employeeId }).update({
+      pendingPerformanceFlag: JSON.stringify({ type: recommendation, reviewId: review.id, cycleId: review.cycleId, flaggedBy: req.user.id, flaggedAt: new Date() }),
+    });
     notifyByRoles(['hr_manager', 'super_admin'], {
       title: recommendation === 'promote' ? 'Promotion Recommended' : 'PIP Recommended',
       body: `${req.user.name || 'A manager'} recommended ${recommendation === 'promote' ? 'a promotion' : 'a performance improvement plan'} for ${flaggedEmployee?.fullName || 'an employee'}.`,
@@ -954,7 +964,7 @@ const submitReview = async (req, res) => {
       link: `/employees/${review.employeeId}`,
     }).catch(() => {});
 
-    const hrUsers = await findMany('users', { role: { $in: ['hr_manager', 'super_admin'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const hrUsers = await knex('users').whereIn('role', ['hr_manager', 'super_admin']).whereNot({ isActive: false }).select('email');
     const tokens = {
       managerName: req.user.name || 'A manager', recommendationLabel: recommendation === 'promote' ? 'a promotion' : 'a performance improvement plan',
       employeeName: flaggedEmployee?.fullName || 'an employee',
@@ -971,29 +981,38 @@ const submitReview = async (req, res) => {
   // cycle progress tracking was silently wrong for every manager review ever submitted.
   const now = new Date();
   if (review.reviewType === 'self') {
-    await global.dbo.collection('review_cycles').updateOne(
-      { _id: review.cycleId, 'participants.employeeId': review.employeeId },
-      { $set: { 'participants.$.selfReviewStatus': 'submitted', 'participants.$.selfReviewSubmittedAt': now } }
-    );
+    const cycle = await knex('review_cycles').where({ id: review.cycleId }).first();
+    if (cycle) {
+      const participants = (cycle.participants || []).map((p) => String(p.employeeId) === String(review.employeeId)
+        ? { ...p, selfReviewStatus: 'submitted', selfReviewSubmittedAt: now } : p);
+      await knex('review_cycles').where({ id: review.cycleId }).update({ participants: JSON.stringify(participants) });
+    }
   } else if (review.reviewType === 'manager') {
-    await global.dbo.collection('review_cycles').updateOne(
-      { _id: review.cycleId, 'participants.employeeId': review.employeeId },
-      { $set: { 'participants.$.managerReviewStatus': 'submitted', 'participants.$.managerReviewSubmittedAt': now } }
-    );
+    const cycle = await knex('review_cycles').where({ id: review.cycleId }).first();
+    if (cycle) {
+      const participants = (cycle.participants || []).map((p) => String(p.employeeId) === String(review.employeeId)
+        ? { ...p, managerReviewStatus: 'submitted', managerReviewSubmittedAt: now } : p);
+      await knex('review_cycles').where({ id: review.cycleId }).update({ participants: JSON.stringify(participants) });
+    }
   } else if (review.reviewType === 'peer') {
-    // Peer reviews are tracked per-reviewer inside participants.$.peersAssigned (several
+    // Peer reviews are tracked per-reviewer inside participants[].peersAssigned (several
     // colleagues each have their own entry for the same employee), so this targets the one
-    // matching this specific reviewer via arrayFilters rather than a single status field.
-    // peersAssigned.peerId is an *employee* id (assigned by HR from the employee list), but
-    // review.reviewerId is the reviewer's *user* id — they only coincide by accident, so the
-    // reviewer's employeeId must be resolved before it can be matched against peerId.
-    const reviewerUser = await findOne('users', { _id: review.reviewerId }, { projection: { employeeId: 1 } });
+    // matching this specific reviewer. peersAssigned.peerId is an *employee* id (assigned by
+    // HR from the employee list), but review.reviewerId is the reviewer's *user* id — they
+    // only coincide by accident, so the reviewer's employeeId must be resolved before it can
+    // be matched against peerId.
+    const reviewerUser = await knex('users').where({ id: review.reviewerId }).select('employeeId').first();
     if (reviewerUser?.employeeId) {
-      await global.dbo.collection('review_cycles').updateOne(
-        { _id: review.cycleId, 'participants.employeeId': review.employeeId },
-        { $set: { 'participants.$[p].peersAssigned.$[peer].status': 'submitted', 'participants.$[p].peersAssigned.$[peer].submittedAt': now } },
-        { arrayFilters: [{ 'p.employeeId': review.employeeId }, { 'peer.peerId': reviewerUser.employeeId }] }
-      );
+      const cycle = await knex('review_cycles').where({ id: review.cycleId }).first();
+      if (cycle) {
+        const participants = (cycle.participants || []).map((p) => {
+          if (String(p.employeeId) !== String(review.employeeId)) return p;
+          const peersAssigned = (p.peersAssigned || []).map((pa) => String(pa.peerId) === String(reviewerUser.employeeId)
+            ? { ...pa, status: 'submitted', submittedAt: now } : pa);
+          return { ...p, peersAssigned };
+        });
+        await knex('review_cycles').where({ id: review.cycleId }).update({ participants: JSON.stringify(participants) });
+      }
     }
   }
 
@@ -1005,7 +1024,7 @@ const submitReview = async (req, res) => {
   // onRoleChange in accountFunctions.js.
   const finalRating = req.body.overallRating ? Number(req.body.overallRating) : review.overallRating;
   if (review.reviewType === 'manager' && finalRating != null) {
-    findOne('users', { employeeId: review.employeeId })
+    knex('users').where({ employeeId: review.employeeId }).first()
       .then((targetUser) => {
         if (targetUser) return evaluateRulesForUser('onPerformanceScore', targetUser, { performanceScore: finalRating });
       })
@@ -1018,13 +1037,10 @@ const submitReview = async (req, res) => {
 // ── Calibration ───────────────────────────────────────────────────────────────
 
 const getCalibration = async (req, res) => {
-  const cycleId = new ObjectId(req.params.cycleId);
-  const reviews = await findMany('reviews', { cycleId, reviewType: 'manager', status: 'submitted' });
+  const reviews = await knex('reviews').where({ cycleId: req.params.cycleId, reviewType: 'manager', status: 'submitted' });
 
   const enriched = await Promise.all(reviews.map(async (r) => {
-    const emp = await findOne('employees', { _id: r.employeeId }, {
-      projection: { fullName: 1, designation: 1, department: 1 },
-    });
+    const emp = await knex('employees').where({ id: r.employeeId }).select('fullName', 'designation', 'department').first();
     return {
       employeeId: r.employeeId,
       employee: emp,
@@ -1039,13 +1055,9 @@ const getCalibration = async (req, res) => {
 };
 
 const updateCalibrationBox = async (req, res) => {
-  const cycleId = new ObjectId(req.params.cycleId);
-  const employeeId = new ObjectId(req.params.empId);
-
-  await updateOne('reviews',
-    { cycleId, employeeId, reviewType: 'manager' },
-    { $set: { calibrationBox: req.body.box, calibrationNotes: req.body.notes || '', updatedAt: new Date() } }
-  );
+  await knex('reviews')
+    .where({ cycleId: req.params.cycleId, employeeId: req.params.empId, reviewType: 'manager' })
+    .update({ calibrationBox: req.body.box, calibrationNotes: req.body.notes || '', updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Calibration updated.');
 };
 
@@ -1056,10 +1068,10 @@ const updateCalibrationBox = async (req, res) => {
 // wasn't checked anywhere before this fix).
 const enrichFeedback = async (feedback, { userId, empId, isHR }) => {
   return Promise.all(feedback.map(async (f) => {
-    const giver = await findOne('employees', { _id: f.giverId }, { projection: { fullName: 1 } })
-      || await findOne('users', { _id: f.giverId }, { projection: { name: 1 } });
-    const recipient = await findOne('employees', { _id: f.recipientId }, { projection: { fullName: 1 } })
-      || await findOne('users', { _id: f.recipientId }, { projection: { name: 1 } });
+    const giver = await knex('employees').where({ id: f.giverId }).select('fullName').first()
+      || await knex('users').where({ id: f.giverId }).select('name').first();
+    const recipient = await knex('employees').where({ id: f.recipientId }).select('fullName').first()
+      || await knex('users').where({ id: f.recipientId }).select('name').first();
     const isSelfGiver = String(f.giverId) === String(userId) || (empId && String(f.giverId) === String(empId));
     // HR always sees the real identity (oversight/abuse prevention) even for anonymous
     // feedback; a recipient or third party never does.
@@ -1073,32 +1085,37 @@ const enrichFeedback = async (feedback, { userId, empId, isHR }) => {
 };
 
 const listFeedback = async (req, res) => {
-  const userId = new ObjectId(req.user._id);
-  const emp = await findOne('employees', { userId }, { projection: { _id: 1 } });
-  const empId = emp?._id;
+  const userId = req.user.id;
+  // employees.userId has never existed in this schema (same dead-field lookup fixed in
+  // createGoal above) — req.user.employeeId (already resolved by AuthMiddleware) is the
+  // real link.
+  const empId = req.user.employeeId ? String(req.user.employeeId) : null;
 
   // Viewing a THIRD PARTY's feedback (e.g. from their profile page) is a distinct case from
   // "my feedback" — only HR or that employee's actual manager/department_head may do it, and
   // it's always scoped to what they received (never their private "given" history).
   if (req.query.employeeId) {
-    const targetId = new ObjectId(req.query.employeeId);
+    const targetId = String(req.query.employeeId);
     if (!(await isAuthorizedForReview(req, targetId, 'manager'))) {
       return returnFunction(res, 403, false, "You are not authorized to view this employee's feedback.");
     }
-    let feedback = await findMany('feedback', { recipientId: targetId }, { sort: { createdAt: -1 } });
+    let feedback = await knex('feedback').where({ recipientId: targetId }).orderBy('createdAt', 'desc');
     if (!_isHR(req.user.role)) feedback = feedback.filter((f) => f.isVisibleToEmployee !== false);
     const enriched = await enrichFeedback(feedback, { userId: targetId, empId: targetId, isHR: _isHR(req.user.role) });
     return returnFunction(res, 200, true, req.locale.success, enriched);
   }
 
-  const filter = empId
-    ? { $or: [{ giverId: userId }, { recipientId: userId }, { giverId: empId }, { recipientId: empId }] }
-    : { $or: [{ giverId: userId }, { recipientId: userId }] };
+  const idsToMatch = empId ? [userId, empId] : [userId];
+  let query = knex('feedback');
+  if (req.query.type === 'received') {
+    query = query.whereIn('recipientId', idsToMatch);
+  } else if (req.query.type === 'given') {
+    query = query.whereIn('giverId', idsToMatch);
+  } else {
+    query = query.where((qb) => qb.whereIn('giverId', idsToMatch).orWhereIn('recipientId', idsToMatch));
+  }
 
-  if (req.query.type === 'received') delete filter.$or, filter.recipientId = empId || userId;
-  if (req.query.type === 'given')    delete filter.$or, filter.giverId    = empId || userId;
-
-  let feedback = await findMany('feedback', filter, { sort: { createdAt: -1 } });
+  let feedback = await query.orderBy('createdAt', 'desc');
 
   // HR can hold feedback back from the employee it's about until reviewed — hide it from
   // a "received" view unless it's marked visible, but never hide it from the giver's own
@@ -1114,15 +1131,15 @@ const listFeedback = async (req, res) => {
 // HR-only: every feedback record org-wide, real identities always shown, regardless of
 // anonymity or visibility settings.
 const listAllFeedback = async (req, res) => {
-  const feedback = await findMany('feedback', {}, { sort: { createdAt: -1 } });
+  const feedback = await knex('feedback').orderBy('createdAt', 'desc');
   const enriched = await enrichFeedback(feedback, { userId: null, empId: null, isHR: true });
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
 const updateFeedbackVisibility = async (req, res) => {
   if (req.body.isVisibleToEmployee === undefined) return returnFunction(res, 400, false, 'isVisibleToEmployee is required.');
-  const result = await updateOne('feedback', { _id: new ObjectId(req.params.id) }, { $set: { isVisibleToEmployee: !!req.body.isVisibleToEmployee } });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const [updated] = await knex('feedback').where({ id: req.params.id }).update({ isVisibleToEmployee: !!req.body.isVisibleToEmployee }).returning('id');
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -1130,15 +1147,16 @@ const giveFeedback = async (req, res) => {
   if (!validateRequiredFields(req, res, ['recipientId', 'type', 'message'])) return;
 
   const doc = {
-    giverId: new ObjectId(req.user._id),
-    recipientId: new ObjectId(req.body.recipientId),
+    id: newId(),
+    giverId: req.user.id,
+    recipientId: String(req.body.recipientId),
     type: req.body.type,
     category: req.body.category || 'general',
     message: req.body.message.trim(),
     visibility: req.body.visibility || 'private',
     isAnonymous: req.body.isAnonymous === true,
     isVisibleToEmployee: true,
-    relatedCycleId: req.body.relatedCycleId ? new ObjectId(req.body.relatedCycleId) : null,
+    relatedCycleId: req.body.relatedCycleId ? String(req.body.relatedCycleId) : null,
     createdAt: new Date(),
   };
 
@@ -1154,13 +1172,20 @@ const giveFeedback = async (req, res) => {
     'You received new feedback',
     `<p>${doc.isAnonymous ? 'Someone left you anonymous feedback.' : `${req.user.name} gave you ${doc.type} feedback.`}</p>`);
 
-  return returnFunction(res, 201, true, 'Feedback sent.', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Feedback sent.', { _id: result.id });
 };
 
 // ── 1-on-1 Check-ins ────────────────────────────────────────────────────────────
-// Named 'oneOnOnes' (not 'checkIns') to avoid colliding with goals' existing embedded
-// checkIns progress-log field — this is a distinct, standalone collection for recurring
-// manager/direct-report meetings, unrelated to goal progress updates.
+// Named 'one_on_ones' (not 'checkIns') to avoid colliding with goals' existing
+// checkIns progress-log child table — this is a distinct, standalone table for
+// recurring manager/direct-report meetings, unrelated to goal progress updates.
+
+// Reconstructs the Mongo-shaped `agendaItems[]` array from its real child table.
+const attachAgendaItems = async (oneOnOne) => {
+  if (!oneOnOne) return oneOnOne;
+  const agendaItems = await knex('one_on_one_agenda_items').where({ oneOnOneId: oneOnOne.id }).orderBy('createdAt');
+  return { ...oneOnOne, agendaItems };
+};
 
 // Only the two people in the meeting (or HR) may see it — including a real manager
 // relationship check, not just role, so a department_head can't browse 1-on-1s for
@@ -1174,25 +1199,26 @@ const _isOneOnOneParticipant = async (req, oneOnOne) => {
 
 const listOneOnOnes = async (req, res) => {
   const myEmployeeId = req.user.employeeId ? String(req.user.employeeId) : null;
-  let filter = {};
+  let query = knex('one_on_ones');
   if (!_isHR(req.user.role)) {
     if (!myEmployeeId) return returnFunction(res, 200, true, req.locale.success, []);
-    filter = { $or: [{ managerId: new ObjectId(myEmployeeId) }, { employeeId: new ObjectId(myEmployeeId) }] };
+    query = query.where((qb) => qb.where({ managerId: myEmployeeId }).orWhere({ employeeId: myEmployeeId }));
   } else if (req.query.employeeId) {
-    filter = { $or: [{ managerId: new ObjectId(req.query.employeeId) }, { employeeId: new ObjectId(req.query.employeeId) }] };
+    const qid = String(req.query.employeeId);
+    query = query.where((qb) => qb.where({ managerId: qid }).orWhere({ employeeId: qid }));
   }
-  const oneOnOnes = await findMany('oneOnOnes', filter, { sort: { scheduledAt: -1 } });
+  const oneOnOnes = await query.orderBy('scheduledAt', 'desc');
 
-  const empIds = [...new Set(oneOnOnes.flatMap((o) => [String(o.managerId), String(o.employeeId)]))].map((id) => new ObjectId(id));
-  const employees = await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, designation: 1 } });
-  const empMap = new Map(employees.map((e) => [String(e._id), e]));
+  const empIds = [...new Set(oneOnOnes.flatMap((o) => [o.managerId, o.employeeId]))];
+  const employees = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'designation') : [];
+  const empMap = new Map(employees.map((e) => [e.id, e]));
 
   const enriched = oneOnOnes.map((o) => ({
     ...o,
-    manager: empMap.get(String(o.managerId)) || null,
-    employee: empMap.get(String(o.employeeId)) || null,
+    manager: empMap.get(o.managerId) || null,
+    employee: empMap.get(o.employeeId) || null,
     // A manager's private notes never leave the manager's own view of the meeting.
-    privateManagerNotes: String(o.managerId) === myEmployeeId || _isHR(req.user.role) ? o.privateManagerNotes : undefined,
+    privateManagerNotes: o.managerId === myEmployeeId || _isHR(req.user.role) ? o.privateManagerNotes : undefined,
   }));
 
   return returnFunction(res, 200, true, req.locale.success, enriched);
@@ -1200,33 +1226,33 @@ const listOneOnOnes = async (req, res) => {
 
 const createOneOnOne = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'scheduledAt'])) return;
-  const employeeId = new ObjectId(req.body.employeeId);
+  const employeeId = String(req.body.employeeId);
 
   // The requester must actually be this employee's manager (or HR) — otherwise anyone could
   // schedule a "1-on-1" with someone they have no management relationship to.
   if (!_isHR(req.user.role)) {
-    const employee = await findOne('employees', { _id: employeeId }, { projection: { managerId: 1 } });
+    const employee = await knex('employees').where({ id: employeeId }).select('managerId').first();
     if (!employee || !req.user.employeeId || String(employee.managerId || '') !== String(req.user.employeeId)) {
       return returnFunction(res, 403, false, 'You can only schedule 1-on-1s with your own direct reports.');
     }
   }
-  const managerId = req.body.managerId ? new ObjectId(req.body.managerId) : new ObjectId(req.user.employeeId);
+  const managerId = req.body.managerId ? String(req.body.managerId) : String(req.user.employeeId);
 
   const doc = {
+    id: newId(),
     managerId,
     employeeId,
     scheduledAt: new Date(req.body.scheduledAt),
     status: 'scheduled',
-    agendaItems: [],
     sharedNotes: '',
     privateManagerNotes: '',
-    createdBy: new ObjectId(req.user._id),
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('oneOnOnes', doc);
+  const result = await insertOne('one_on_ones', doc);
 
-  notifyEmployee(String(employeeId), {
+  notifyEmployee(employeeId, {
     title: '1-on-1 Scheduled',
     body: `A 1-on-1 meeting has been scheduled for ${doc.scheduledAt.toLocaleDateString()}.`,
     type: 'general',
@@ -1234,23 +1260,23 @@ const createOneOnOne = async (req, res) => {
   emailEmployeeByTrigger(employeeId, 'oneOnOneScheduled', { scheduledDate: doc.scheduledAt.toLocaleDateString() },
     '1-on-1 Scheduled', `<p>A 1-on-1 meeting has been scheduled for ${doc.scheduledAt.toLocaleDateString()}.</p>`);
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const getOneOnOne = async (req, res) => {
-  const oneOnOne = await findOne('oneOnOnes', { _id: new ObjectId(req.params.id) });
+  const oneOnOne = await knex('one_on_ones').where({ id: req.params.id }).first();
   if (!oneOnOne) return returnFunction(res, 404, false, 'One-on-one not found.');
   if (!(await _isOneOnOneParticipant(req, oneOnOne))) return returnFunction(res, 403, false, 'Forbidden.');
 
   const myEmployeeId = req.user.employeeId ? String(req.user.employeeId) : null;
   const [manager, employee] = await Promise.all([
-    findOne('employees', { _id: oneOnOne.managerId }, { projection: { fullName: 1, designation: 1 } }),
-    findOne('employees', { _id: oneOnOne.employeeId }, { projection: { fullName: 1, designation: 1 } }),
+    knex('employees').where({ id: oneOnOne.managerId }).select('fullName', 'designation').first(),
+    knex('employees').where({ id: oneOnOne.employeeId }).select('fullName', 'designation').first(),
   ]);
 
-  const isManagerOrHR = String(oneOnOne.managerId) === myEmployeeId || _isHR(req.user.role);
+  const isManagerOrHR = oneOnOne.managerId === myEmployeeId || _isHR(req.user.role);
   return returnFunction(res, 200, true, req.locale.success, {
-    ...oneOnOne,
+    ...(await attachAgendaItems(oneOnOne)),
     manager,
     employee,
     privateManagerNotes: isManagerOrHR ? oneOnOne.privateManagerNotes : undefined,
@@ -1258,12 +1284,12 @@ const getOneOnOne = async (req, res) => {
 };
 
 const updateOneOnOne = async (req, res) => {
-  const oneOnOne = await findOne('oneOnOnes', { _id: new ObjectId(req.params.id) });
+  const oneOnOne = await knex('one_on_ones').where({ id: req.params.id }).first();
   if (!oneOnOne) return returnFunction(res, 404, false, 'One-on-one not found.');
   if (!(await _isOneOnOneParticipant(req, oneOnOne))) return returnFunction(res, 403, false, 'Forbidden.');
 
   const myEmployeeId = req.user.employeeId ? String(req.user.employeeId) : null;
-  const isManagerOrHR = String(oneOnOne.managerId) === myEmployeeId || _isHR(req.user.role);
+  const isManagerOrHR = oneOnOne.managerId === myEmployeeId || _isHR(req.user.role);
 
   const update = { updatedAt: new Date() };
   if (req.body.scheduledAt !== undefined) update.scheduledAt = new Date(req.body.scheduledAt);
@@ -1273,47 +1299,52 @@ const updateOneOnOne = async (req, res) => {
   // regardless of what's in the request body.
   if (req.body.privateManagerNotes !== undefined && isManagerOrHR) update.privateManagerNotes = req.body.privateManagerNotes;
 
-  await updateOne('oneOnOnes', { _id: oneOnOne._id }, { $set: update });
+  await knex('one_on_ones').where({ id: oneOnOne.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const addOneOnOneAgendaItem = async (req, res) => {
-  const oneOnOne = await findOne('oneOnOnes', { _id: new ObjectId(req.params.id) });
+  const oneOnOne = await knex('one_on_ones').where({ id: req.params.id }).first();
   if (!oneOnOne) return returnFunction(res, 404, false, 'One-on-one not found.');
   if (!(await _isOneOnOneParticipant(req, oneOnOne))) return returnFunction(res, 403, false, 'Forbidden.');
   if (!req.body.text?.trim()) return returnFunction(res, 400, false, 'Agenda item text is required.');
 
-  const item = { id: randomUUID(), text: req.body.text.trim(), addedBy: new ObjectId(req.user._id), isDone: false, createdAt: new Date() };
-  await updateOne('oneOnOnes', { _id: oneOnOne._id }, { $push: { agendaItems: item }, $set: { updatedAt: new Date() } });
+  const item = { id: randomUUID(), oneOnOneId: oneOnOne.id, text: req.body.text.trim(), addedBy: req.user.id, isDone: false, createdAt: new Date() };
+  await knex('one_on_one_agenda_items').insert(item);
+  await knex('one_on_ones').where({ id: oneOnOne.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, item);
 };
 
 const toggleOneOnOneAgendaItem = async (req, res) => {
-  const oneOnOne = await findOne('oneOnOnes', { _id: new ObjectId(req.params.id) });
+  const oneOnOne = await knex('one_on_ones').where({ id: req.params.id }).first();
   if (!oneOnOne) return returnFunction(res, 404, false, 'One-on-one not found.');
   if (!(await _isOneOnOneParticipant(req, oneOnOne))) return returnFunction(res, 403, false, 'Forbidden.');
 
-  const item = (oneOnOne.agendaItems || []).find((a) => a.id === req.params.itemId);
+  const item = await knex('one_on_one_agenda_items').where({ id: req.params.itemId, oneOnOneId: oneOnOne.id }).first();
   if (!item) return returnFunction(res, 404, false, 'Agenda item not found.');
 
-  await updateOne(
-    'oneOnOnes',
-    { _id: oneOnOne._id, 'agendaItems.id': req.params.itemId },
-    { $set: { 'agendaItems.$.isDone': !item.isDone, updatedAt: new Date() } },
-  );
+  await knex('one_on_one_agenda_items').where({ id: item.id }).update({ isDone: !item.isDone });
+  await knex('one_on_ones').where({ id: oneOnOne.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const completeOneOnOne = async (req, res) => {
-  const oneOnOne = await findOne('oneOnOnes', { _id: new ObjectId(req.params.id) });
+  const oneOnOne = await knex('one_on_ones').where({ id: req.params.id }).first();
   if (!oneOnOne) return returnFunction(res, 404, false, 'One-on-one not found.');
   if (!(await _isOneOnOneParticipant(req, oneOnOne))) return returnFunction(res, 403, false, 'Forbidden.');
 
-  await updateOne('oneOnOnes', { _id: oneOnOne._id }, { $set: { status: 'completed', completedAt: new Date(), updatedAt: new Date() } });
+  await knex('one_on_ones').where({ id: oneOnOne.id }).update({ status: 'completed', completedAt: new Date(), updatedAt: new Date() });
   return returnFunction(res, 200, true, 'One-on-one marked complete.');
 };
 
 // ── Performance Improvement Plans ────────────────────────────────────────────
+
+// Reconstructs the Mongo-shaped `checkIns[]` array from its real child table.
+const attachPipCheckIns = async (pip) => {
+  if (!pip) return pip;
+  const checkIns = await knex('pip_check_ins').where({ pipId: pip.id }).orderBy('createdAt');
+  return { ...pip, checkIns };
+};
 
 // Same three-way access as reviews/goals: HR always, the employee themself (a PIP is only
 // meaningful if the employee can see it), their actual manager (via managerId), or their
@@ -1323,7 +1354,7 @@ const _canAccessPIP = async (req, pip) => {
   if (req.user.employeeId && String(req.user.employeeId) === String(pip.employeeId)) return true;
   if (req.user.employeeId && String(req.user.employeeId) === String(pip.managerId)) return true;
   if (req.user.role === 'department_head' && req.user.department) {
-    const employee = await findOne('employees', { _id: pip.employeeId }, { projection: { department: 1 } });
+    const employee = await knex('employees').where({ id: pip.employeeId }).select('department').first();
     return !!employee && employee.department === req.user.department;
   }
   return false;
@@ -1331,31 +1362,31 @@ const _canAccessPIP = async (req, pip) => {
 
 const listPIPs = async (req, res) => {
   const scopedIds = await getScopedEmployeeIds(req.user);
-  let filter = {};
+  let query = knex('performance_improvement_plans');
   if (scopedIds !== null) {
     if (!scopedIds.length) return returnFunction(res, 200, true, req.locale.success, []);
-    filter = { employeeId: { $in: scopedIds } };
+    query = query.whereIn('employeeId', scopedIds);
   } else if (req.query.employeeId) {
-    filter = { employeeId: new ObjectId(req.query.employeeId) };
+    query = query.where({ employeeId: String(req.query.employeeId) });
   }
-  const pips = await findMany('performanceImprovementPlans', filter, { sort: { createdAt: -1 } });
+  const pips = await query.orderBy('createdAt', 'desc');
 
-  const empIds = [...new Set(pips.map((p) => String(p.employeeId)))].map((id) => new ObjectId(id));
-  const employees = await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, designation: 1, department: 1 } });
-  const empMap = new Map(employees.map((e) => [String(e._id), e]));
-  const enriched = pips.map((p) => ({ ...p, employee: empMap.get(String(p.employeeId)) || null }));
+  const empIds = [...new Set(pips.map((p) => p.employeeId))];
+  const employees = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'designation', 'department') : [];
+  const empMap = new Map(employees.map((e) => [e.id, e]));
+  const enriched = pips.map((p) => ({ ...p, employee: empMap.get(p.employeeId) || null }));
 
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
 
 const createPIP = async (req, res) => {
   if (!validateRequiredFields(req, res, ['employeeId', 'reason', 'startDate', 'endDate'])) return;
-  const employeeId = new ObjectId(req.body.employeeId);
+  const employeeId = String(req.body.employeeId);
 
   // A PIP is a serious, targeted intervention — only started by HR or the employee's actual
   // manager/department_head, never by an unrelated manager just because they hold the role.
   if (!_isHR(req.user.role)) {
-    const employee = await findOne('employees', { _id: employeeId }, { projection: { managerId: 1, department: 1 } });
+    const employee = await knex('employees').where({ id: employeeId }).select('managerId', 'department').first();
     if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
     const isManager = !!req.user.employeeId && String(employee.managerId || '') === String(req.user.employeeId);
     const isDeptHead = req.user.role === 'department_head' && !!req.user.department && employee.department === req.user.department;
@@ -1370,30 +1401,27 @@ const createPIP = async (req, res) => {
   }));
 
   const doc = {
+    id: newId(),
     employeeId,
-    managerId: req.body.managerId ? new ObjectId(req.body.managerId) : (req.user.employeeId ? new ObjectId(req.user.employeeId) : null),
-    createdBy: new ObjectId(req.user._id),
+    managerId: req.body.managerId ? String(req.body.managerId) : (req.user.employeeId ? String(req.user.employeeId) : null),
+    createdBy: req.user.id,
     reason: req.body.reason,
     startDate: new Date(req.body.startDate),
     endDate: new Date(req.body.endDate),
     status: 'active',
-    goals,
-    checkIns: [],
+    goals: JSON.stringify(goals),
     outcome: null,
-    relatedReviewId: req.body.relatedReviewId ? new ObjectId(req.body.relatedReviewId) : null,
+    relatedReviewId: req.body.relatedReviewId ? String(req.body.relatedReviewId) : null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('performanceImprovementPlans', doc);
+  const result = await insertOne('performance_improvement_plans', doc);
 
   // Starting the PIP IS acting on a prior 'pip' recommendation flag (if there was one) —
   // clear it so it doesn't keep showing as an outstanding recommendation on the profile.
-  await global.dbo.collection('employees').updateOne(
-    { _id: employeeId, 'pendingPerformanceFlag.type': 'pip' },
-    { $unset: { pendingPerformanceFlag: '' } },
-  );
+  await knex('employees').where({ id: employeeId }).whereRaw("\"pendingPerformanceFlag\"->>'type' = 'pip'").update({ pendingPerformanceFlag: null });
 
-  notifyEmployee(String(employeeId), {
+  notifyEmployee(employeeId, {
     title: 'Performance Improvement Plan Started',
     body: 'A performance improvement plan has been created for you. Please speak with your manager.',
     type: 'general',
@@ -1407,20 +1435,20 @@ const createPIP = async (req, res) => {
     type: 'general',
   });
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });
 };
 
 const getPIP = async (req, res) => {
-  const pip = await findOne('performanceImprovementPlans', { _id: new ObjectId(req.params.id) });
+  const pip = await knex('performance_improvement_plans').where({ id: req.params.id }).first();
   if (!pip) return returnFunction(res, 404, false, 'PIP not found.');
   if (!(await _canAccessPIP(req, pip))) return returnFunction(res, 403, false, 'Forbidden.');
 
-  const employee = await findOne('employees', { _id: pip.employeeId }, { projection: { fullName: 1, designation: 1, department: 1 } });
-  return returnFunction(res, 200, true, req.locale.success, { ...pip, employee });
+  const employee = await knex('employees').where({ id: pip.employeeId }).select('fullName', 'designation', 'department').first();
+  return returnFunction(res, 200, true, req.locale.success, { ...(await attachPipCheckIns(pip)), employee });
 };
 
 const updatePIP = async (req, res) => {
-  const pip = await findOne('performanceImprovementPlans', { _id: new ObjectId(req.params.id) });
+  const pip = await knex('performance_improvement_plans').where({ id: req.params.id }).first();
   if (!pip) return returnFunction(res, 404, false, 'PIP not found.');
   if (!(await _canAccessPIP(req, pip))) return returnFunction(res, 403, false, 'Forbidden.');
   // The employee can see their own plan, but only their manager/HR can actually edit its
@@ -1433,30 +1461,31 @@ const updatePIP = async (req, res) => {
   if (req.body.reason !== undefined) update.reason = req.body.reason;
   if (req.body.endDate !== undefined) update.endDate = new Date(req.body.endDate);
   if (req.body.goals !== undefined) {
-    update.goals = req.body.goals.map((g) => ({
+    update.goals = JSON.stringify(req.body.goals.map((g) => ({
       id: g.id || randomUUID(),
       description: g.description || '',
       targetDate: g.targetDate ? new Date(g.targetDate) : null,
       status: ['pending', 'met', 'not_met'].includes(g.status) ? g.status : 'pending',
-    }));
+    })));
   }
-  await updateOne('performanceImprovementPlans', { _id: pip._id }, { $set: update });
+  await knex('performance_improvement_plans').where({ id: pip.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const addPIPCheckIn = async (req, res) => {
-  const pip = await findOne('performanceImprovementPlans', { _id: new ObjectId(req.params.id) });
+  const pip = await knex('performance_improvement_plans').where({ id: req.params.id }).first();
   if (!pip) return returnFunction(res, 404, false, 'PIP not found.');
   if (!(await _canAccessPIP(req, pip))) return returnFunction(res, 403, false, 'Forbidden.');
   if (!req.body.note?.trim()) return returnFunction(res, 400, false, 'Check-in note is required.');
 
-  const entry = { id: randomUUID(), note: req.body.note.trim(), addedBy: new ObjectId(req.user._id), createdAt: new Date() };
-  await updateOne('performanceImprovementPlans', { _id: pip._id }, { $push: { checkIns: entry }, $set: { updatedAt: new Date() } });
+  const entry = { id: randomUUID(), pipId: pip.id, note: req.body.note.trim(), addedBy: req.user.id, createdAt: new Date() };
+  await knex('pip_check_ins').insert(entry);
+  await knex('performance_improvement_plans').where({ id: pip.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, entry);
 };
 
 const closePIP = async (req, res) => {
-  const pip = await findOne('performanceImprovementPlans', { _id: new ObjectId(req.params.id) });
+  const pip = await knex('performance_improvement_plans').where({ id: req.params.id }).first();
   if (!pip) return returnFunction(res, 404, false, 'PIP not found.');
   if (!(await _canAccessPIP(req, pip))) return returnFunction(res, 403, false, 'Forbidden.');
   if (!_isHR(req.user.role) && req.user.employeeId && String(req.user.employeeId) === String(pip.employeeId)) {
@@ -1465,11 +1494,11 @@ const closePIP = async (req, res) => {
   const outcome = ['passed', 'failed'].includes(req.body.outcome) ? req.body.outcome : null;
   if (!outcome) return returnFunction(res, 400, false, 'Outcome must be "passed" or "failed".');
 
-  await updateOne('performanceImprovementPlans', { _id: pip._id }, {
-    $set: { status: 'completed', outcome, closedAt: new Date(), updatedAt: new Date() },
+  await knex('performance_improvement_plans').where({ id: pip.id }).update({
+    status: 'completed', outcome, closedAt: new Date(), updatedAt: new Date(),
   });
 
-  notifyEmployee(String(pip.employeeId), {
+  notifyEmployee(pip.employeeId, {
     title: 'Performance Improvement Plan Closed',
     body: `Your performance improvement plan has been closed. Outcome: ${outcome === 'passed' ? 'Passed' : 'Not Met'}.`,
     type: 'general',
@@ -1491,25 +1520,31 @@ const closePIP = async (req, res) => {
 // status + the most recent calibrated rating, in one call, instead of the frontend having
 // to fetch full cycles/reviews lists and filter them down client-side.
 const getEmployeePerformanceSnapshot = async (req, res) => {
-  const employeeId = new ObjectId(req.params.employeeId);
+  const employeeId = String(req.params.employeeId);
   const isSelf = !!req.user.employeeId && String(req.user.employeeId) === String(employeeId);
   if (!isSelf && !(await isAuthorizedForReview(req, employeeId, 'manager'))) {
     return returnFunction(res, 403, false, "You are not authorized to view this employee's performance summary.");
   }
 
-  const [activeCycles, lastManagerReview] = await Promise.all([
-    findMany('review_cycles', { status: { $in: ['active', 'calibration'] }, 'participants.employeeId': employeeId }, { sort: { createdAt: -1 } }),
-    findOne('reviews', { employeeId, reviewType: 'manager', status: 'submitted' }, { sort: { submittedAt: -1 } }),
+  const [candidateCycles, lastManagerReview] = await Promise.all([
+    knex('review_cycles').whereIn('status', ['active', 'calibration']).orderBy('createdAt', 'desc'),
+    knex('reviews').where({ employeeId, reviewType: 'manager', status: 'submitted' }).orderBy('submittedAt', 'desc').first(),
   ]);
+  // Filtered in JS rather than a JSONB @> containment query — participants[] elements
+  // carry many more fields than just employeeId, and array-of-object @> containment in
+  // Postgres doesn't reliably do the "any element with this one field" partial match a
+  // naive query would assume; a plain JS filter over a small, already-fetched result set
+  // is simpler and unambiguously correct.
+  const activeCycles = candidateCycles.filter((c) => (c.participants || []).some((p) => String(p.employeeId) === employeeId));
 
   const cycleSummaries = activeCycles.map((c) => {
     const p = (c.participants || []).find((pp) => String(pp.employeeId) === String(employeeId));
-    return { cycleId: c._id, cycleName: c.name, selfReviewStatus: p?.selfReviewStatus || null, managerReviewStatus: p?.managerReviewStatus || null };
+    return { cycleId: c.id, cycleName: c.name, selfReviewStatus: p?.selfReviewStatus || null, managerReviewStatus: p?.managerReviewStatus || null };
   });
 
   let lastRating = null;
   if (lastManagerReview) {
-    const cycle = await findOne('review_cycles', { _id: lastManagerReview.cycleId }, { projection: { name: 1 } });
+    const cycle = await knex('review_cycles').where({ id: lastManagerReview.cycleId }).select('name').first();
     lastRating = {
       overallRating: lastManagerReview.overallRating,
       calibrationBox: lastManagerReview.calibrationBox || null,
@@ -1532,60 +1567,76 @@ const getAnalytics = async (req, res) => {
       activeCycles: 0, goalsByStatus: [], ratingDistribution: [], departmentPerformance: [],
     });
   }
-  const empFilter = scoped ? { employeeId: { $in: scopedIds } } : {};
+
+  const scopeGoals = (q) => (scoped ? q.whereIn('employeeId', scopedIds) : q);
+  const scopeReviews = (q) => (scoped ? q.whereIn('employeeId', scopedIds) : q);
+  const scopeAppraisals = (q) => (scoped ? q.whereIn('employeeId', scopedIds) : q);
 
   const [
-    goalsTotal,
-    goalsCompleted,
-    goalsAtRisk,
-    reviewsTotal,
-    reviewsSubmitted,
+    [{ count: goalsTotal }],
+    [{ count: goalsCompleted }],
+    [{ count: reviewsTotal }],
+    [{ count: reviewsSubmitted }],
     cycles,
     recentAppraisals,
+    goalsForStatus,
   ] = await Promise.all([
-    global.dbo.collection('goals').countDocuments({ ...empFilter }),
-    global.dbo.collection('goals').countDocuments({ ...empFilter, status: 'completed' }),
-    global.dbo.collection('goals').countDocuments({ ...empFilter, status: 'at_risk' }),
-    global.dbo.collection('reviews').countDocuments({ ...empFilter }),
-    global.dbo.collection('reviews').countDocuments({ ...empFilter, status: 'submitted' }),
-    findMany('review_cycles', { status: 'active' }, { sort: { createdAt: -1 } }),
-    global.dbo.collection('appraisal_records').aggregate([
-      ...(scoped ? [{ $match: { employeeId: { $in: scopedIds } } }] : []),
-      { $group: { _id: '$rating', count: { $sum: 1 } } },
-      { $sort: { _id: 1 } },
-    ]).toArray(),
+    scopeGoals(knex('goals')).count('* as count'),
+    scopeGoals(knex('goals')).where({ status: 'completed' }).count('* as count'),
+    scopeReviews(knex('reviews')).count('* as count'),
+    scopeReviews(knex('reviews')).where({ status: 'submitted' }).count('* as count'),
+    knex('review_cycles').where({ status: 'active' }).orderBy('createdAt', 'desc'),
+    scopeAppraisals(knex('appraisal_records')).select('rating'),
+    scopeGoals(knex('goals')).select('status'),
   ]);
 
-  const goalsByStatus = await aggregate('goals', [
-    ...(scoped ? [{ $match: { employeeId: { $in: scopedIds } } }] : []),
-    { $group: { _id: '$status', count: { $sum: 1 } } },
-  ]);
+  // Ported from Mongo $group pipelines to plain JS reductions.
+  const goalsByStatusMap = {};
+  for (const g of goalsForStatus) goalsByStatusMap[g.status] = (goalsByStatusMap[g.status] || 0) + 1;
+  const goalsByStatus = Object.entries(goalsByStatusMap).map(([_id, count]) => ({ _id, count }));
 
-  const appraisalByDept = await global.dbo.collection('appraisal_records').aggregate([
-    ...(scoped ? [{ $match: { employeeId: { $in: scopedIds } } }] : []),
-    { $lookup: { from: 'employees', localField: 'employeeId', foreignField: '_id', as: 'emp' } },
-    { $unwind: '$emp' },
-    { $group: { _id: '$emp.department', avgRating: { $avg: '$rating' }, count: { $sum: 1 } } },
-    { $sort: { avgRating: -1 } },
-    { $limit: 8 },
-  ]).toArray();
+  const ratingCounts = {};
+  for (const a of recentAppraisals) ratingCounts[a.rating] = (ratingCounts[a.rating] || 0) + 1;
+  const ratingDistribution = Object.entries(ratingCounts).map(([rating, count]) => ({ _id: Number(rating), count })).sort((a, b) => a._id - b._id);
+
+  // Ported from a Mongo $lookup+$unwind+$group pipeline (join appraisal_records to
+  // employees on department, average rating per department).
+  const empIdsForAppraisals = [...new Set(recentAppraisals.map((a) => a.employeeId).filter(Boolean))];
+  // recentAppraisals above only selected `rating` — re-fetch with employeeId for the join.
+  const appraisalsForDept = await scopeAppraisals(knex('appraisal_records')).select('employeeId', 'rating');
+  const deptIds = [...new Set(appraisalsForDept.map((a) => a.employeeId))];
+  const deptByEmployee = deptIds.length
+    ? Object.fromEntries((await knex('employees').whereIn('id', deptIds).select('id', 'department')).map((e) => [e.id, e.department]))
+    : {};
+  const deptAgg = {};
+  for (const a of appraisalsForDept) {
+    const dept = deptByEmployee[a.employeeId];
+    if (!dept) continue;
+    if (!deptAgg[dept]) deptAgg[dept] = { total: 0, count: 0 };
+    deptAgg[dept].total += a.rating;
+    deptAgg[dept].count += 1;
+  }
+  const appraisalByDept = Object.entries(deptAgg)
+    .map(([_id, v]) => ({ _id, avgRating: v.total / v.count, count: v.count }))
+    .sort((a, b) => b.avgRating - a.avgRating)
+    .slice(0, 8);
+  void empIdsForAppraisals;
 
   let activeCycles = cycles;
   if (scoped) {
-    const scopedSet = new Set(scopedIds.map((id) => String(id)));
+    const scopedSet = new Set(scopedIds);
     activeCycles = cycles.filter((c) => (c.participants || []).some((p) => scopedSet.has(String(p.employeeId))));
   }
 
-  const avgScore = recentAppraisals.reduce((s, r) => s + r._id * r.count, 0) /
-    Math.max(1, recentAppraisals.reduce((s, r) => s + r.count, 0));
+  const avgScore = recentAppraisals.reduce((s, r) => s + r.rating, 0) / Math.max(1, recentAppraisals.length);
 
   return returnFunction(res, 200, true, req.locale.success, {
-    goalsCompletionRate: goalsTotal ? Math.round((goalsCompleted / goalsTotal) * 100) : 0,
+    goalsCompletionRate: Number(goalsTotal) ? Math.round((Number(goalsCompleted) / Number(goalsTotal)) * 100) : 0,
     averagePerformanceScore: avgScore ? Math.round(avgScore * 10) / 10 : 0,
-    reviewParticipationRate: reviewsTotal ? Math.round((reviewsSubmitted / reviewsTotal) * 100) : 0,
+    reviewParticipationRate: Number(reviewsTotal) ? Math.round((Number(reviewsSubmitted) / Number(reviewsTotal)) * 100) : 0,
     activeCycles: activeCycles.length,
     goalsByStatus,
-    ratingDistribution: recentAppraisals,
+    ratingDistribution,
     departmentPerformance: appraisalByDept,
   });
 };

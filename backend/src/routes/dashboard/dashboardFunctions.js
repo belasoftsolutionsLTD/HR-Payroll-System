@@ -3,10 +3,10 @@ const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany, countDocuments } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users (Phase 1), leave_balances/leave_requests/leave_types/public_holidays
-// (Phase 3a), and attendance_records/shifts (Phase 3b) now live in Postgres. Everything
-// this file still touches that HASN'T been migrated yet (expense_claims, goals,
-// job_postings, payroll_runs, communication_posts, scheduled_events, inbox_items) stays
-// on the Mongo helpers above.
+// (Phase 3a), attendance_records/shifts (Phase 3b), and goals (Phase 5) now live in
+// Postgres. Everything this file still touches that HASN'T been migrated yet
+// (expense_claims, job_postings, payroll_runs, communication_posts, scheduled_events,
+// inbox_items) stays on the Mongo helpers above.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 
 const today = () => new Date().toISOString().split('T')[0];
@@ -24,7 +24,7 @@ const getDashboardSummary = async (req, res) => {
     const [balances, pendingExpenses, goals] = await Promise.all([
       empId ? pgDB.findMany('leave_balances', { employeeId: empId, year }) : [],
       empId ? countDocuments('expense_claims', { employeeId: new ObjectId(empId), status: 'submitted' }) : 0,
-      empId ? countDocuments('goals', { employeeId: new ObjectId(empId), status: { $in: ['at_risk', 'behind'] } }) : 0,
+      empId ? pgDB.knex('goals').where({ employeeId: empId }).whereIn('status', ['at_risk', 'behind']).count('* as count').then(([r]) => Number(r.count)) : 0,
     ]);
 
     const totalLeaveBalance = balances.reduce((sum, b) => sum + Math.max(0, Number(b.closingBalance)), 0);
@@ -259,7 +259,7 @@ const getTodaySchedule = async (req, res) => {
 const getGoalsSummary = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 200, true, 'ok', null);
 
-  const goals = await findMany('goals', { employeeId: req.user.employeeId }, { projection: { title: 1, status: 1, progress: 1 } });
+  const goals = await pgDB.knex('goals').where({ employeeId: String(req.user.employeeId) }).select('title', 'status', 'progress');
   const total = goals.length;
   const onTrack = goals.filter(g => g.status === 'on_track' || g.status === 'completed').length;
   const overallProgress = total > 0
