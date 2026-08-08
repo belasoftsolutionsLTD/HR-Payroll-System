@@ -1,8 +1,16 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 10) — this is the file every earlier phase's own
+// notes deliberately deferred ("reportFunctions.js again deliberately
+// excluded... its own future phase"), because it reads from ~20 collections
+// across nearly every module — it could only be safely rewritten once
+// everything it touches was already Postgres. That's true as of this phase.
+// customReports is the one genuinely new table here (built in Phase 10);
+// `feedback`/`one_on_ones` were already Postgres since Phase 5 but this file
+// had never been updated to read them via knex, so it had been silently
+// reading frozen, stale Mongo data for both since that phase shipped.
 const PDFDocument = require('pdfkit');
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { sendEmail } = require('../../services/emailService');
 
 // Reused directly from the module that already computes it — see the audit this build
@@ -35,6 +43,13 @@ module.exports.getExpenseClaimsAnalytics = getExpenseClaimsAnalytics;
 module.exports.getProcurementSpend = getProcurementSpend;
 module.exports.getVendorAnalytics = getVendorAnalytics;
 
+const countRows = async (table, cb) => {
+  let q = knex(table);
+  if (cb) q = cb(q);
+  const [{ count }] = await q.count('* as count');
+  return Number(count);
+};
+
 // ── Executive Dashboard ───────────────────────────────────────────────────────
 
 const getExecutiveDashboard = async (req, res) => {
@@ -53,67 +68,63 @@ const getExecutiveDashboard = async (req, res) => {
     thisMonthCycles, lastMonthCyclesArr,
     weekAttendance,
     lastCompletedCycle,
-    enrollmentTotals,
+    totalEnrollments, completedEnrollments,
     pendingLeave, pendingExpenses, pendingTimesheets, pendingPRs,
     probationCount, certExpiryCount, contractEndCount, pipCount,
   ] = await Promise.all([
-    countDocuments('employees', {}),
-    countDocuments('employees', { status: 'active' }),
-    countDocuments('employees', { status: 'on_leave' }),
-    countDocuments('offboarding_records', { status: { $nin: ['completed'] } }),
-    countDocuments('employees', { status: 'terminated', terminationDate: { $gte: startOfMonth } }),
-    countDocuments('jobRequisitions', { status: 'open' }),
-    findMany('payroll_cycles', { 'period.month': month, 'period.year': year }, {}),
-    findMany('payroll_cycles', { 'period.month': lastMonth, 'period.year': lastMonthYear }, {}),
-    global.dbo.collection('attendance_records').aggregate([
-      { $match: { date: { $gte: weekStr } } },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]).toArray(),
-    findOne('review_cycles', { status: 'completed' }, { sort: { updatedAt: -1 }, projection: { _id: 1 } }),
-    Promise.all([countDocuments('enrollments', {}), countDocuments('enrollments', { status: 'completed' })]),
-    countDocuments('leave_requests', { status: 'pending' }),
-    countDocuments('expense_claims', { status: 'submitted' }),
-    countDocuments('timesheets', { status: 'submitted' }),
-    countDocuments('purchase_requests', { status: 'pending' }),
-    countDocuments('employees', { status: 'active', probationEndDate: { $gte: now, $lte: in30 } }),
-    countDocuments('certificates', { expiresAt: { $gte: now, $lte: in30 } }),
-    countDocuments('employees', { status: 'active', contractEndDate: { $gte: now, $lte: in30 } }),
-    countDocuments('performanceImprovementPlans', { status: 'active' }),
+    countRows('employees'),
+    countRows('employees', (q) => q.where({ status: 'active' })),
+    countRows('employees', (q) => q.where({ status: 'on_leave' })),
+    countRows('offboarding_records', (q) => q.whereNot({ status: 'completed' })),
+    countRows('employees', (q) => q.where({ status: 'terminated' }).where('terminationDate', '>=', startOfMonth)),
+    countRows('job_requisitions', (q) => q.where({ status: 'open' })),
+    knex('payroll_cycles').where({ periodMonth: month, periodYear: year }),
+    knex('payroll_cycles').where({ periodMonth: lastMonth, periodYear: lastMonthYear }),
+    knex('attendance_records').where('date', '>=', weekStr).select('status').count('* as count').groupBy('status'),
+    knex('review_cycles').where({ status: 'completed' }).orderBy('updatedAt', 'desc').first(),
+    countRows('enrollments'),
+    countRows('enrollments', (q) => q.where({ status: 'completed' })),
+    countRows('leave_requests', (q) => q.where({ status: 'pending' })),
+    countRows('expense_claims', (q) => q.where({ status: 'submitted' })),
+    countRows('timesheets', (q) => q.where({ status: 'submitted' })),
+    countRows('purchase_requests', (q) => q.where({ status: 'pending' })),
+    countRows('employees', (q) => q.where({ status: 'active' }).where('probationEndDate', '>=', now).where('probationEndDate', '<=', in30)),
+    countRows('certificates', (q) => q.where('expiresAt', '>=', now).where('expiresAt', '<=', in30)),
+    countRows('employees', (q) => q.where({ status: 'active' }).where('contractEndDate', '>=', now).where('contractEndDate', '<=', in30)),
+    countRows('performance_improvement_plans', (q) => q.where({ status: 'active' })),
   ]);
 
-  const [totalEnrollments, completedEnrollments] = enrollmentTotals;
-
   const sumPayroll = async (cycles) => {
-    const cycleIds = cycles.map((c) => c._id);
+    const cycleIds = cycles.map((c) => c.id);
     if (!cycleIds.length) return { gross: 0, net: 0 };
-    const results = await findMany('payroll_results', { cycleId: { $in: cycleIds } }, {});
+    const results = await knex('payroll_results').whereIn('cycleId', cycleIds);
     return {
-      gross: results.reduce((s, r) => s + (r.grossPay || 0), 0),
-      net: results.reduce((s, r) => s + (r.netPay || 0), 0),
+      gross: results.reduce((s, r) => s + (Number(r.grossPay) || 0), 0),
+      net: results.reduce((s, r) => s + (Number(r.netPay) || 0), 0),
     };
   };
   const [thisMonthPayroll, lastMonthPayroll] = await Promise.all([sumPayroll(thisMonthCycles), sumPayroll(lastMonthCyclesArr)]);
 
-  const presentCount = weekAttendance.filter((a) => ['present', 'remote', 'late'].includes(a._id)).reduce((s, a) => s + a.count, 0);
-  const totalAttRecords = weekAttendance.reduce((s, a) => s + a.count, 0);
+  const presentCount = weekAttendance.filter((a) => ['present', 'remote', 'late'].includes(a.status)).reduce((s, a) => s + Number(a.count), 0);
+  const totalAttRecords = weekAttendance.reduce((s, a) => s + Number(a.count), 0);
   const attendanceRateThisWeek = totalAttRecords > 0 ? Math.round((presentCount / totalAttRecords) * 100) : 0;
 
   let avgPerformanceRating = null;
   if (lastCompletedCycle) {
-    const reviews = await findMany('reviews', { cycleId: lastCompletedCycle._id, reviewType: 'manager', status: 'submitted', overallRating: { $ne: null } }, {});
-    if (reviews.length) avgPerformanceRating = Math.round((reviews.reduce((s, r) => s + r.overallRating, 0) / reviews.length) * 10) / 10;
+    const reviews = await knex('reviews').where({ cycleId: lastCompletedCycle.id, reviewType: 'manager', status: 'submitted' }).whereNotNull('overallRating');
+    if (reviews.length) avgPerformanceRating = Math.round((reviews.reduce((s, r) => s + Number(r.overallRating), 0) / reviews.length) * 10) / 10;
   }
 
   // Leave liability: sum of each employee's unused (positive) leave balance days × their
   // own daily rate (grossPay / 22 — same standard-working-days convention the payroll
   // engine itself uses for overtime/proration, see payrollCyclesFunctions.js).
-  const balances = await findMany('leave_balances', { year, closingBalance: { $gt: 0 } }, {});
-  const empIds = [...new Set(balances.map((b) => String(b.employeeId)))].map((id) => new ObjectId(id));
-  const emps = empIds.length ? await findMany('employees', { _id: { $in: empIds } }, { projection: { grossPay: 1 } }) : [];
-  const grossPayMap = new Map(emps.map((e) => [String(e._id), e.grossPay || 0]));
+  const balances = await knex('leave_balances').where({ year }).where('closingBalance', '>', 0);
+  const empIds = [...new Set(balances.map((b) => b.employeeId))];
+  const emps = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'grossPay') : [];
+  const grossPayMap = new Map(emps.map((e) => [e.id, Number(e.grossPay) || 0]));
   const leaveLiability = balances.reduce((sum, b) => {
-    const dailyRate = (grossPayMap.get(String(b.employeeId)) || 0) / 22;
-    return sum + b.closingBalance * dailyRate;
+    const dailyRate = (grossPayMap.get(b.employeeId) || 0) / 22;
+    return sum + Number(b.closingBalance) * dailyRate;
   }, 0);
 
   return returnFunction(res, 200, true, req.locale.success, {
@@ -141,50 +152,46 @@ const getExecutiveTrends = async (req, res) => {
   for (let i = 11; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const nextD = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
-    const count = await countDocuments('employees', { dateOfHire: { $lt: nextD }, $or: [{ terminationDate: null }, { terminationDate: { $gte: d } }] });
+    const count = await countRows('employees', (q) => q.where('dateOfHire', '<', nextD)
+      .where((qb) => qb.whereNull('terminationDate').orWhere('terminationDate', '>=', d)));
     headcountTrend.push({ month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, count });
   }
 
   const payrollTrend = [];
   for (let i = 11; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    const cycles = await findMany('payroll_cycles', { 'period.month': d.getMonth() + 1, 'period.year': d.getFullYear() }, {});
-    const cycleIds = cycles.map((c) => c._id);
-    const results = cycleIds.length ? await findMany('payroll_results', { cycleId: { $in: cycleIds } }, {}) : [];
-    payrollTrend.push({ month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, cost: results.reduce((s, r) => s + (r.grossPay || 0), 0) });
+    const cycles = await knex('payroll_cycles').where({ periodMonth: d.getMonth() + 1, periodYear: d.getFullYear() });
+    const cycleIds = cycles.map((c) => c.id);
+    const results = cycleIds.length ? await knex('payroll_results').whereIn('cycleId', cycleIds) : [];
+    payrollTrend.push({ month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, cost: results.reduce((s, r) => s + (Number(r.grossPay) || 0), 0) });
   }
 
   const attendanceTrend = [];
   for (let i = 11; i >= 0; i--) {
     const weekStart = new Date(now); weekStart.setDate(now.getDate() - now.getDay() - i * 7);
     const weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate() + 6);
-    const records = await global.dbo.collection('attendance_records').aggregate([
-      { $match: { date: { $gte: weekStart.toISOString().slice(0, 10), $lte: weekEnd.toISOString().slice(0, 10) } } },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]).toArray();
-    const present = records.filter((r) => ['present', 'remote', 'late'].includes(r._id)).reduce((s, r) => s + r.count, 0);
-    const total = records.reduce((s, r) => s + r.count, 0);
+    const records = await knex('attendance_records')
+      .where('date', '>=', weekStart.toISOString().slice(0, 10)).where('date', '<=', weekEnd.toISOString().slice(0, 10))
+      .select('status').count('* as count').groupBy('status');
+    const present = records.filter((r) => ['present', 'remote', 'late'].includes(r.status)).reduce((s, r) => s + Number(r.count), 0);
+    const total = records.reduce((s, r) => s + Number(r.count), 0);
     attendanceTrend.push({ weekStart: weekStart.toISOString().slice(0, 10), rate: total > 0 ? Math.round((present / total) * 100) : 0 });
   }
 
-  const headcountByDept = await global.dbo.collection('employees').aggregate([
-    { $match: { status: 'active' } },
-    { $group: { _id: '$department', count: { $sum: 1 } } },
-    { $sort: { count: -1 } },
-  ]).toArray();
+  const headcountByDept = await knex('employees').where({ status: 'active' }).select('department').count('* as count').groupBy('department').orderBy('count', 'desc');
 
   const now2 = new Date();
-  const leaveByType = await global.dbo.collection('leave_requests').aggregate([
-    { $match: { status: 'approved', startDate: { $gte: new Date(now2.getFullYear(), now2.getMonth(), 1) } } },
-    { $lookup: { from: 'leave_types', localField: 'leaveTypeId', foreignField: '_id', as: 'lt' } },
-    { $unwind: { path: '$lt', preserveNullAndEmptyArrays: true } },
-    { $group: { _id: { $ifNull: ['$lt.name', 'Unknown'] }, days: { $sum: '$totalDays' } } },
-  ]).toArray();
+  const startOfThisMonth = new Date(now2.getFullYear(), now2.getMonth(), 1);
+  const leaveByTypeRaw = await knex('leave_requests').where({ status: 'approved' }).where('startDate', '>=', startOfThisMonth)
+    .select('leaveTypeId').sum('totalDays as days').groupBy('leaveTypeId');
+  const leaveTypeIds = leaveByTypeRaw.map((l) => l.leaveTypeId).filter(Boolean);
+  const leaveTypes = leaveTypeIds.length ? await knex('leave_types').whereIn('id', leaveTypeIds).select('id', 'name') : [];
+  const leaveTypeNameMap = new Map(leaveTypes.map((lt) => [lt.id, lt.name]));
 
   return returnFunction(res, 200, true, req.locale.success, {
     headcountTrend, payrollTrend, attendanceTrend,
-    headcountByDepartment: headcountByDept.map((d) => ({ department: d._id || 'Unassigned', count: d.count })),
-    leaveByTypeThisMonth: leaveByType.map((l) => ({ type: l._id, days: l.days })),
+    headcountByDepartment: headcountByDept.map((d) => ({ department: d.department || 'Unassigned', count: Number(d.count) })),
+    leaveByTypeThisMonth: leaveByTypeRaw.map((l) => ({ type: leaveTypeNameMap.get(l.leaveTypeId) || 'Unknown', days: Number(l.days) || 0 })),
   });
 };
 
@@ -196,10 +203,11 @@ const getWorkforceMovement = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
   const start = new Date(year, 0, 1), end = new Date(year + 1, 0, 1);
 
-  const entries = await findMany('job_history', { effectiveDate: { $gte: start, $lt: end }, changeType: { $in: ['titleChange', 'departmentChange', 'salaryChange'] } }, { sort: { effectiveDate: -1 } });
-  const empIds = [...new Set(entries.map((e) => String(e.employeeId)))].map((id) => new ObjectId(id));
-  const emps = empIds.length ? await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, department: 1 } }) : [];
-  const empMap = new Map(emps.map((e) => [String(e._id), e]));
+  const entries = await knex('job_history').where('effectiveDate', '>=', start).where('effectiveDate', '<', end)
+    .whereIn('changeType', ['titleChange', 'departmentChange', 'salaryChange']).orderBy('effectiveDate', 'desc');
+  const empIds = [...new Set(entries.map((e) => e.employeeId))];
+  const emps = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'department') : [];
+  const empMap = new Map(emps.map((e) => [e.id, e]));
 
   const promotions = entries.filter((e) => e.changeType === 'titleChange');
   const transfers = entries.filter((e) => e.changeType === 'departmentChange');
@@ -208,15 +216,15 @@ const getWorkforceMovement = async (req, res) => {
   const byDept = (list) => {
     const counts = {};
     for (const e of list) {
-      const dept = empMap.get(String(e.employeeId))?.department || 'Unassigned';
+      const dept = empMap.get(e.employeeId)?.department || 'Unassigned';
       counts[dept] = (counts[dept] || 0) + 1;
     }
     return Object.entries(counts).map(([department, count]) => ({ department, count }));
   };
 
   const enrich = (list) => list.map((e) => ({
-    employeeId: e.employeeId, employeeName: empMap.get(String(e.employeeId))?.fullName || 'Unknown',
-    department: empMap.get(String(e.employeeId))?.department || '—',
+    employeeId: e.employeeId, employeeName: empMap.get(e.employeeId)?.fullName || 'Unknown',
+    department: empMap.get(e.employeeId)?.department || '—',
     effectiveDate: e.effectiveDate, previousValues: e.previousValues, newValues: e.newValues, reason: e.reason,
   }));
 
@@ -234,18 +242,21 @@ const getPayrollBreakdown = async (req, res) => {
   const month = parseInt(req.query.month) || (now.getMonth() + 1);
   const year = parseInt(req.query.year) || now.getFullYear();
 
-  const cycles = await findMany('payroll_cycles', { 'period.month': month, 'period.year': year }, {});
-  const cycleIds = cycles.map((c) => c._id);
-  const results = cycleIds.length ? await findMany('payroll_results', { cycleId: { $in: cycleIds } }, {}) : [];
+  const cycles = await knex('payroll_cycles').where({ periodMonth: month, periodYear: year });
+  const cycleIds = cycles.map((c) => c.id);
+  const results = cycleIds.length ? await knex('payroll_results').whereIn('cycleId', cycleIds) : [];
 
   const totals = results.reduce((acc, r) => {
-    acc.gross += r.grossPay || 0;
-    acc.paye += r.statutoryDeductions?.paye || 0;
-    acc.sha += r.statutoryDeductions?.sha || 0;
-    acc.nssf += r.statutoryDeductions?.nssf || 0;
-    acc.ahl += r.statutoryDeductions?.ahl || 0;
-    acc.otherDeductions += r.otherDeductions || 0;
-    acc.net += r.netPay || 0;
+    acc.gross += Number(r.grossPay) || 0;
+    acc.paye += Number(r.statutoryPaye) || 0;
+    acc.sha += Number(r.statutorySha) || 0;
+    acc.nssf += Number(r.statutoryNssf) || 0;
+    acc.ahl += Number(r.statutoryAhl) || 0;
+    // "otherDeductions" = totalDeductions minus the statutory portion — statutory
+    // deductions are folded into totalDeductions in the Postgres schema, unlike the
+    // original Mongo shape which kept otherDeductions as an explicitly separate field.
+    acc.otherDeductions += (Number(r.totalDeductions) || 0) - (Number(r.statutoryTotal) || 0);
+    acc.net += Number(r.netPay) || 0;
     return acc;
   }, { gross: 0, paye: 0, sha: 0, nssf: 0, ahl: 0, otherDeductions: 0, net: 0 });
 
@@ -259,24 +270,24 @@ const getPayrollOvertimeCost = async (req, res) => {
   const trend = [];
   for (let i = months - 1; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    const cycles = await findMany('payroll_cycles', { 'period.month': d.getMonth() + 1, 'period.year': d.getFullYear() }, {});
-    const cycleIds = cycles.map((c) => c._id);
-    const results = cycleIds.length ? await findMany('payroll_results', { cycleId: { $in: cycleIds } }, { projection: { overtimeAmount: 1, employeeId: 1 } }) : [];
-    trend.push({ month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, cost: results.reduce((s, r) => s + (r.overtimeAmount || 0), 0) });
+    const cycles = await knex('payroll_cycles').where({ periodMonth: d.getMonth() + 1, periodYear: d.getFullYear() });
+    const cycleIds = cycles.map((c) => c.id);
+    const results = cycleIds.length ? await knex('payroll_results').whereIn('cycleId', cycleIds).select('overtimeAmount', 'employeeId') : [];
+    trend.push({ month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, cost: results.reduce((s, r) => s + (Number(r.overtimeAmount) || 0), 0) });
   }
 
   // Current month by department
   const d = new Date(now.getFullYear(), now.getMonth(), 1);
-  const cycles = await findMany('payroll_cycles', { 'period.month': d.getMonth() + 1, 'period.year': d.getFullYear() }, {});
-  const cycleIds = cycles.map((c) => c._id);
-  const results = cycleIds.length ? await findMany('payroll_results', { cycleId: { $in: cycleIds } }, { projection: { overtimeAmount: 1, employeeId: 1 } }) : [];
-  const empIds = [...new Set(results.map((r) => String(r.employeeId)))].map((id) => new ObjectId(id));
-  const emps = empIds.length ? await findMany('employees', { _id: { $in: empIds } }, { projection: { department: 1 } }) : [];
-  const deptMap = new Map(emps.map((e) => [String(e._id), e.department]));
+  const cycles = await knex('payroll_cycles').where({ periodMonth: d.getMonth() + 1, periodYear: d.getFullYear() });
+  const cycleIds = cycles.map((c) => c.id);
+  const results = cycleIds.length ? await knex('payroll_results').whereIn('cycleId', cycleIds).select('overtimeAmount', 'employeeId') : [];
+  const empIds = [...new Set(results.map((r) => r.employeeId))];
+  const emps = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'department') : [];
+  const deptMap = new Map(emps.map((e) => [e.id, e.department]));
   const byDept = {};
   for (const r of results) {
-    const dept = deptMap.get(String(r.employeeId)) || 'Unassigned';
-    byDept[dept] = (byDept[dept] || 0) + (r.overtimeAmount || 0);
+    const dept = deptMap.get(r.employeeId) || 'Unassigned';
+    byDept[dept] = (byDept[dept] || 0) + (Number(r.overtimeAmount) || 0);
   }
 
   return returnFunction(res, 200, true, req.locale.success, {
@@ -288,22 +299,22 @@ const getPayrollOvertimeCost = async (req, res) => {
 // ── Leave: Liability (dedicated, standalone view of the exec-dashboard figure) ─
 const getLeaveLiabilityReport = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
-  const balances = await findMany('leave_balances', { year, closingBalance: { $gt: 0 } }, {});
-  const empIds = [...new Set(balances.map((b) => String(b.employeeId)))].map((id) => new ObjectId(id));
-  const emps = empIds.length ? await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, department: 1, grossPay: 1 } }) : [];
-  const empMap = new Map(emps.map((e) => [String(e._id), e]));
+  const balances = await knex('leave_balances').where({ year }).where('closingBalance', '>', 0);
+  const empIds = [...new Set(balances.map((b) => b.employeeId))];
+  const emps = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'department', 'grossPay') : [];
+  const empMap = new Map(emps.map((e) => [e.id, e]));
 
   const byDept = {};
   const perEmployee = [];
   for (const b of balances) {
-    const emp = empMap.get(String(b.employeeId));
-    const dailyRate = (emp?.grossPay || 0) / 22;
-    const value = b.closingBalance * dailyRate;
+    const emp = empMap.get(b.employeeId);
+    const dailyRate = (Number(emp?.grossPay) || 0) / 22;
+    const value = Number(b.closingBalance) * dailyRate;
     const dept = emp?.department || 'Unassigned';
     if (!byDept[dept]) byDept[dept] = { department: dept, totalDays: 0, value: 0 };
-    byDept[dept].totalDays += b.closingBalance;
+    byDept[dept].totalDays += Number(b.closingBalance);
     byDept[dept].value += value;
-    perEmployee.push({ employeeId: b.employeeId, employeeName: emp?.fullName || 'Unknown', department: dept, unusedDays: b.closingBalance, value: Math.round(value) });
+    perEmployee.push({ employeeId: b.employeeId, employeeName: emp?.fullName || 'Unknown', department: dept, unusedDays: Number(b.closingBalance), value: Math.round(value) });
   }
   perEmployee.sort((a, b) => b.value - a.value);
 
@@ -318,17 +329,16 @@ const getLeaveLiabilityReport = async (req, res) => {
 // ── Leave: Patterns (day-of-week heatmap) ─────────────────────────────────────
 const getLeavePatterns = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
-  const requests = await findMany('leave_requests', {
-    status: 'approved',
-    startDate: { $gte: new Date(`${year}-01-01`), $lte: new Date(`${year}-12-31T23:59:59`) },
-  }, { projection: { startDate: 1, endDate: 1, totalDays: 1 } });
+  const requests = await knex('leave_requests').where({ status: 'approved' })
+    .where('startDate', '>=', new Date(`${year}-01-01`)).where('startDate', '<=', new Date(`${year}-12-31T23:59:59`))
+    .select('startDate', 'endDate', 'totalDays');
 
   const dayOfWeekCounts = [0, 0, 0, 0, 0, 0, 0]; // Sun..Sat
   const monthCounts = Array(12).fill(0);
   for (const r of requests) {
     const start = new Date(r.startDate);
     dayOfWeekCounts[start.getDay()] += 1;
-    monthCounts[start.getMonth()] += r.totalDays || 1;
+    monthCounts[start.getMonth()] += Number(r.totalDays) || 1;
   }
   const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -342,8 +352,9 @@ const getLeavePatterns = async (req, res) => {
 // ── Performance: Goals by department + type ───────────────────────────────────
 const getPerformanceGoalsReport = async (req, res) => {
   const period = req.query.period;
-  const filter = period ? { period } : {};
-  const goals = await findMany('goals', filter, { projection: { department: 1, category: 1, status: 1, progress: 1 } });
+  let query = knex('goals').select('department', 'category', 'status', 'progress');
+  if (period) query = query.where({ period });
+  const goals = await query;
 
   const byDept = {};
   const byCategory = {};
@@ -364,11 +375,13 @@ const getPerformanceGoalsReport = async (req, res) => {
 };
 
 // ── Performance: Feedback volume trend ────────────────────────────────────────
+// feedback is Postgres since Phase 5 — this handler had never been updated to read
+// it via knex (see file header); it had been silently reading frozen Mongo data.
 const getPerformanceFeedbackReport = async (req, res) => {
   const months = Math.min(parseInt(req.query.months) || 6, 12);
   const now = new Date();
   const since = new Date(now.getFullYear(), now.getMonth() - months + 1, 1);
-  const feedback = await findMany('feedback', { createdAt: { $gte: since } }, { projection: { createdAt: 1, type: 1 } });
+  const feedback = await knex('feedback').where('createdAt', '>=', since).select('createdAt', 'type');
 
   const trend = [];
   for (let i = months - 1; i >= 0; i--) {
@@ -387,15 +400,13 @@ const getPerformanceFeedbackReport = async (req, res) => {
 
 // ── Performance: Active PIPs and outcomes ─────────────────────────────────────
 const getPipReport = async (req, res) => {
-  const pips = await findMany('performanceImprovementPlans', {}, { sort: { createdAt: -1 } });
-  const empIds = [...new Set(pips.map((p) => String(p.employeeId)))].map((id) => new ObjectId(id));
-  const mgrIds = [...new Set(pips.filter((p) => p.managerId).map((p) => String(p.managerId)))].map((id) => new ObjectId(id));
-  const allIds = [...new Set([...empIds, ...mgrIds])].map((id) => new ObjectId(id));
-  const emps = allIds.length ? await findMany('employees', { _id: { $in: allIds } }, { projection: { fullName: 1 } }) : [];
-  const empMap = new Map(emps.map((e) => [String(e._id), e.fullName]));
+  const pips = await knex('performance_improvement_plans').orderBy('createdAt', 'desc');
+  const allIds = [...new Set([...pips.map((p) => p.employeeId), ...pips.filter((p) => p.managerId).map((p) => p.managerId)])];
+  const emps = allIds.length ? await knex('employees').whereIn('id', allIds).select('id', 'fullName') : [];
+  const empMap = new Map(emps.map((e) => [e.id, e.fullName]));
 
   const enriched = pips.map((p) => ({
-    _id: p._id, employeeName: empMap.get(String(p.employeeId)) || 'Unknown', managerName: p.managerId ? (empMap.get(String(p.managerId)) || 'Unknown') : '—',
+    id: p.id, employeeName: empMap.get(p.employeeId) || 'Unknown', managerName: p.managerId ? (empMap.get(p.managerId) || 'Unknown') : '—',
     startDate: p.startDate, endDate: p.endDate, status: p.status, outcome: p.outcome,
   }));
 
@@ -408,23 +419,23 @@ const getPipReport = async (req, res) => {
 
 // ── Recruitment: Org-wide pipeline + funnel (existing getRequisitionFunnel is per-req) ─
 const getRecruitmentPipeline = async (req, res) => {
-  const requisitions = await findMany('jobRequisitions', { status: { $in: ['open', 'pendingApproval'] } }, {});
-  const requisitionIds = requisitions.map((r) => r._id);
-  const applications = requisitionIds.length ? await findMany('applications', { requisitionId: { $in: requisitionIds } }, {}) : [];
+  const requisitions = await knex('job_requisitions').whereIn('status', ['open', 'pendingApproval']);
+  const requisitionIds = requisitions.map((r) => r.id);
+  const applications = requisitionIds.length ? await knex('applications').whereIn('requisitionId', requisitionIds) : [];
 
   const byDept = {};
   for (const r of requisitions) {
     const dept = r.department || 'Unassigned';
-    const apps = applications.filter((a) => String(a.requisitionId) === String(r._id));
+    const apps = applications.filter((a) => a.requisitionId === r.id);
     if (!byDept[dept]) byDept[dept] = { department: dept, openPositions: 0, applicants: 0 };
     byDept[dept].openPositions++;
     byDept[dept].applicants += apps.length;
   }
 
-  const hired = await findMany('applications', { status: 'hired' }, { projection: { requisitionId: 1, updatedAt: 1 } });
-  const reqMap = new Map(requisitions.map((r) => [String(r._id), r]));
+  const hired = await knex('applications').where({ status: 'hired' }).select('requisitionId', 'updatedAt');
+  const reqMap = new Map(requisitions.map((r) => [r.id, r]));
   const fillTimes = hired.map((a) => {
-    const req_ = reqMap.get(String(a.requisitionId));
+    const req_ = reqMap.get(a.requisitionId);
     if (!req_) return null;
     return (new Date(a.updatedAt) - new Date(req_.createdAt)) / 86400000;
   }).filter((d) => d != null && d >= 0);
@@ -439,8 +450,8 @@ const getRecruitmentPipeline = async (req, res) => {
 };
 
 const getRecruitmentFunnel = async (req, res) => {
-  const requisitions = await findMany('jobRequisitions', {}, { projection: { pipelineStages: 1 } });
-  const applications = await findMany('applications', {}, { projection: { stageHistory: 1, status: 1 } });
+  const requisitions = await knex('job_requisitions').select('pipelineStages');
+  const applications = await knex('applications').select('stageHistory', 'status');
 
   const stageNames = new Map();
   requisitions.forEach((r) => (r.pipelineStages || []).forEach((s) => stageNames.set(s.id, s.name)));
@@ -462,15 +473,18 @@ const getRecruitmentFunnel = async (req, res) => {
 };
 
 // ── Training: Completion by department ────────────────────────────────────────
+// enrollment.employeeId is actually users._id (the established training-module
+// convention — see the training module build notes), so department comes from
+// `users`, not `employees`.
 const getTrainingCompletionByDept = async (req, res) => {
-  const enrollments = await findMany('enrollments', {}, { projection: { employeeId: 1, status: 1 } });
-  const userIds = [...new Set(enrollments.map((e) => String(e.employeeId)))].map((id) => new ObjectId(id));
-  const users = userIds.length ? await findMany('users', { _id: { $in: userIds } }, { projection: { department: 1 } }) : [];
-  const deptMap = new Map(users.map((u) => [String(u._id), u.department]));
+  const enrollments = await knex('enrollments').select('employeeId', 'status');
+  const userIds = [...new Set(enrollments.map((e) => e.employeeId))];
+  const users = userIds.length ? await knex('users').whereIn('id', userIds).select('id', 'department') : [];
+  const deptMap = new Map(users.map((u) => [u.id, u.department]));
 
   const byDept = {};
   for (const e of enrollments) {
-    const dept = deptMap.get(String(e.employeeId)) || 'Unassigned';
+    const dept = deptMap.get(e.employeeId) || 'Unassigned';
     if (!byDept[dept]) byDept[dept] = { department: dept, total: 0, completed: 0 };
     byDept[dept].total++;
     if (e.status === 'completed') byDept[dept].completed++;
@@ -481,14 +495,14 @@ const getTrainingCompletionByDept = async (req, res) => {
 
 // ── Training: Engagement (most enrolled courses, completion trend) ────────────
 const getTrainingEngagement = async (req, res) => {
-  const enrollments = await findMany('enrollments', { courseId: { $ne: null } }, { projection: { courseId: 1, status: 1, createdAt: 1 } });
-  const courseIds = [...new Set(enrollments.map((e) => String(e.courseId)))].map((id) => new ObjectId(id));
-  const courses = courseIds.length ? await findMany('courses', { _id: { $in: courseIds } }, { projection: { title: 1 } }) : [];
-  const titleMap = new Map(courses.map((c) => [String(c._id), c.title]));
+  const enrollments = await knex('enrollments').whereNotNull('courseId').select('courseId', 'status', 'createdAt');
+  const courseIds = [...new Set(enrollments.map((e) => e.courseId))];
+  const courses = courseIds.length ? await knex('courses').whereIn('id', courseIds).select('id', 'title') : [];
+  const titleMap = new Map(courses.map((c) => [c.id, c.title]));
 
   const byCourse = {};
   for (const e of enrollments) {
-    const k = String(e.courseId);
+    const k = e.courseId;
     if (!byCourse[k]) byCourse[k] = { courseId: e.courseId, title: titleMap.get(k) || 'Unknown', enrollments: 0, completed: 0 };
     byCourse[k].enrollments++;
     if (e.status === 'completed') byCourse[k].completed++;
@@ -510,18 +524,15 @@ const getTrainingEngagement = async (req, res) => {
 
 // ── Spend: Pending (across expense claims + procurement) ─────────────────────
 const getSpendPending = async (req, res) => {
-  const [pendingExpenseClaims, pendingExpenseAmount, pendingPRs, pendingInvoices] = await Promise.all([
-    countDocuments('expense_claims', { status: 'submitted' }),
-    global.dbo.collection('expense_claims').aggregate([
-      { $match: { status: 'submitted' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } },
-    ]).toArray(),
-    countDocuments('purchase_requests', { status: 'pending' }),
-    countDocuments('vendor_invoices', { status: { $in: ['received', 'underReview', 'matched'] } }),
+  const [pendingExpenseClaims, [{ total: pendingExpenseAmount }], pendingPRs, pendingInvoices] = await Promise.all([
+    countRows('expense_claims', (q) => q.where({ status: 'submitted' })),
+    knex('expense_claims').where({ status: 'submitted' }).sum('amount as total'),
+    countRows('purchase_requests', (q) => q.where({ status: 'pending' })),
+    countRows('vendor_invoices', (q) => q.whereIn('status', ['received', 'underReview', 'matched'])),
   ]);
 
   return returnFunction(res, 200, true, req.locale.success, {
-    pendingExpenseClaims: { count: pendingExpenseClaims, amount: pendingExpenseAmount[0]?.total || 0 },
+    pendingExpenseClaims: { count: pendingExpenseClaims, amount: Number(pendingExpenseAmount) || 0 },
     pendingPurchaseRequests: pendingPRs,
     pendingInvoiceApprovals: pendingInvoices,
   });
@@ -531,7 +542,7 @@ const getSpendPending = async (req, res) => {
 
 const getAwardsReport = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
-  const awards = await findMany('employee_awards', { year }, {});
+  const awards = await knex('employee_awards').where({ year });
 
   const byType = {}; const byDept = {}; const byEmp = {};
   for (const a of awards) {
@@ -539,7 +550,7 @@ const getAwardsReport = async (req, res) => {
     const d = a.department || 'Unknown';
     byType[t] = (byType[t] || 0) + 1;
     byDept[d] = (byDept[d] || 0) + 1;
-    const ek = String(a.employeeId);
+    const ek = a.employeeId;
     if (!byEmp[ek]) byEmp[ek] = { employeeName: a.employeeName, staffNumber: a.staffNumber || '—', department: d, count: 0, awards: [] };
     byEmp[ek].count++;
     byEmp[ek].awards.push(t);
@@ -550,8 +561,8 @@ const getAwardsReport = async (req, res) => {
 
 const getITAssetsReport = async (req, res) => {
   const [devices, software] = await Promise.all([
-    findMany('devices', {}, {}),
-    findMany('software_apps', {}, {}),
+    knex('devices'),
+    knex('software_apps'),
   ]);
 
   const byCategory = {}; const byStatus = {};
@@ -568,8 +579,8 @@ const getITAssetsReport = async (req, res) => {
   const deviceList = await Promise.all(devices.map(async (d) => {
     let assigneeName = 'Unassigned', assigneeDept = '—';
     if (d.assignedTo) {
-      const k = String(d.assignedTo);
-      if (!empCache[k]) empCache[k] = await findOne('employees', { _id: d.assignedTo }, { projection: { fullName: 1, department: 1 } });
+      const k = d.assignedTo;
+      if (!(k in empCache)) empCache[k] = await knex('employees').where({ id: d.assignedTo }).select('fullName', 'department').first();
       assigneeName = empCache[k]?.fullName || 'Unknown';
       assigneeDept = empCache[k]?.department || '—';
     }
@@ -592,19 +603,18 @@ const getAttritionRiskInsight = async (req, res) => {
   const since90 = new Date(now.getTime() - 90 * 86400000);
   const since90Str = since90.toISOString().slice(0, 10);
 
-  const employees = await findMany('employees', { status: 'active' }, { projection: { fullName: 1, department: 1, managerId: 1 } });
+  const employees = await knex('employees').where({ status: 'active' }).select('id', 'fullName', 'department', 'managerId');
 
   const [reviews, attendanceRecords, recentFeedback, recentOneOnOnes] = await Promise.all([
-    findMany('reviews', { reviewType: 'manager', status: 'submitted', overallRating: { $ne: null } }, { sort: { submittedAt: -1 }, projection: { employeeId: 1, overallRating: 1 } }),
-    findMany('attendance_records', { date: { $gte: since90Str } }, { projection: { employeeId: 1, status: 1 } }),
-    findMany('feedback', { createdAt: { $gte: since60 } }, { projection: { recipientId: 1 } }),
-    findMany('oneOnOnes', {}, { sort: { scheduledAt: -1 }, projection: { employeeId: 1, scheduledAt: 1 } }),
+    knex('reviews').where({ reviewType: 'manager', status: 'submitted' }).whereNotNull('overallRating').orderBy('submittedAt', 'desc').select('employeeId', 'overallRating'),
+    knex('attendance_records').where('date', '>=', since90Str).select('employeeId', 'status'),
+    knex('feedback').where('createdAt', '>=', since60).select('recipientId'),
+    knex('one_on_ones').orderBy('scheduledAt', 'desc').select('employeeId', 'scheduledAt'),
   ]);
 
   const latestRatingByEmp = new Map();
   for (const r of reviews) {
-    const k = String(r.employeeId);
-    if (!latestRatingByEmp.has(k)) latestRatingByEmp.set(k, r.overallRating);
+    if (!latestRatingByEmp.has(r.employeeId)) latestRatingByEmp.set(r.employeeId, Number(r.overallRating));
   }
   const orgAvgRating = latestRatingByEmp.size
     ? [...latestRatingByEmp.values()].reduce((a, b) => a + b, 0) / latestRatingByEmp.size
@@ -612,30 +622,28 @@ const getAttritionRiskInsight = async (req, res) => {
 
   const attendanceByEmp = new Map();
   for (const r of attendanceRecords) {
-    const k = String(r.employeeId);
-    if (!attendanceByEmp.has(k)) attendanceByEmp.set(k, { total: 0, absent: 0 });
-    const entry = attendanceByEmp.get(k);
+    if (!attendanceByEmp.has(r.employeeId)) attendanceByEmp.set(r.employeeId, { total: 0, absent: 0 });
+    const entry = attendanceByEmp.get(r.employeeId);
     entry.total++;
     if (r.status === 'absent') entry.absent++;
   }
   const absenceRates = [...attendanceByEmp.values()].map((e) => (e.total ? e.absent / e.total : 0));
   const orgAvgAbsenceRate = absenceRates.length ? absenceRates.reduce((a, b) => a + b, 0) / absenceRates.length : 0;
 
-  const feedbackRecipientSet = new Set(recentFeedback.map((f) => String(f.recipientId)));
+  const feedbackRecipientSet = new Set(recentFeedback.map((f) => f.recipientId));
 
   const lastCheckInByEmp = new Map();
   for (const o of recentOneOnOnes) {
-    const k = String(o.employeeId);
-    if (!lastCheckInByEmp.has(k)) lastCheckInByEmp.set(k, o.scheduledAt);
+    if (!lastCheckInByEmp.has(o.employeeId)) lastCheckInByEmp.set(o.employeeId, o.scheduledAt);
   }
 
-  const managerIds = [...new Set(employees.filter((e) => e.managerId).map((e) => String(e.managerId)))];
-  const managers = managerIds.length ? await findMany('employees', { _id: { $in: managerIds.map((id) => new ObjectId(id)) } }, { projection: { fullName: 1 } }) : [];
-  const managerNameMap = new Map(managers.map((m) => [String(m._id), m.fullName]));
+  const managerIds = [...new Set(employees.filter((e) => e.managerId).map((e) => e.managerId))];
+  const managers = managerIds.length ? await knex('employees').whereIn('id', managerIds).select('id', 'fullName') : [];
+  const managerNameMap = new Map(managers.map((m) => [m.id, m.fullName]));
 
   const flagged = [];
   for (const emp of employees) {
-    const k = String(emp._id);
+    const k = emp.id;
     const rating = latestRatingByEmp.get(k);
     const attendance = attendanceByEmp.get(k);
     const absenceRate = attendance && attendance.total ? attendance.absent / attendance.total : 0;
@@ -649,8 +657,8 @@ const getAttritionRiskInsight = async (req, res) => {
     if (signals.length >= 3) {
       const lastCheckIn = lastCheckInByEmp.get(k);
       flagged.push({
-        employeeId: emp._id, employeeName: emp.fullName, department: emp.department || '—',
-        managerName: emp.managerId ? (managerNameMap.get(String(emp.managerId)) || 'Unknown') : '—',
+        employeeId: emp.id, employeeName: emp.fullName, department: emp.department || '—',
+        managerName: emp.managerId ? (managerNameMap.get(emp.managerId) || 'Unknown') : '—',
         riskSignals: signals,
         daysSinceLastCheckIn: lastCheckIn ? Math.floor((now - new Date(lastCheckIn)) / 86400000) : null,
       });
@@ -663,55 +671,57 @@ const getAttritionRiskInsight = async (req, res) => {
 const getCostPerEmployeeInsight = async (req, res) => {
   const now = new Date();
   const since3mo = new Date(now.getFullYear(), now.getMonth() - 3, 1);
-  const filter = { status: 'active' };
-  if (req.query.department) filter.department = req.query.department;
+  let query = knex('employees').where({ status: 'active' });
+  if (req.query.department) query = query.where({ department: req.query.department });
 
-  const employees = await findMany('employees', filter, { projection: { fullName: 1, department: 1, grossPay: 1, userId: 1 } });
-  const empIds = employees.map((e) => e._id);
+  const employees = await query.select('id', 'fullName', 'department', 'grossPay');
+  const empIds = employees.map((e) => e.id);
 
-  const recentCycles = await findMany('payroll_cycles', { 'period.year': { $gte: since3mo.getFullYear() } }, { projection: { _id: 1 } });
-  const cycleIds = recentCycles.map((c) => c._id);
-  const payrollResults = cycleIds.length
-    ? await findMany('payroll_results', { cycleId: { $in: cycleIds }, employeeId: { $in: empIds } }, { projection: { employeeId: 1, overtimeAmount: 1 } })
+  const recentCycles = await knex('payroll_cycles').where('periodYear', '>=', since3mo.getFullYear()).select('id');
+  const cycleIds = recentCycles.map((c) => c.id);
+  const payrollResults = (cycleIds.length && empIds.length)
+    ? await knex('payroll_results').whereIn('cycleId', cycleIds).whereIn('employeeId', empIds).select('employeeId', 'overtimeAmount')
     : [];
   const overtimeByEmp = new Map();
   for (const r of payrollResults) {
-    const k = String(r.employeeId);
-    overtimeByEmp.set(k, (overtimeByEmp.get(k) || 0) + (r.overtimeAmount || 0));
+    overtimeByEmp.set(r.employeeId, (overtimeByEmp.get(r.employeeId) || 0) + (Number(r.overtimeAmount) || 0));
   }
 
-  const expenseClaims = await findMany('expense_claims', { employeeId: { $in: empIds }, status: { $in: ['approved', 'reimbursed'] }, createdAt: { $gte: since3mo } }, { projection: { employeeId: 1, amount: 1 } });
+  const expenseClaims = empIds.length
+    ? await knex('expense_claims').whereIn('employeeId', empIds).whereIn('status', ['approved', 'reimbursed']).where('createdAt', '>=', since3mo).select('employeeId', 'amount')
+    : [];
   const expensesByEmp = new Map();
   for (const c of expenseClaims) {
-    const k = String(c.employeeId);
-    expensesByEmp.set(k, (expensesByEmp.get(k) || 0) + (c.amount || 0));
+    expensesByEmp.set(c.employeeId, (expensesByEmp.get(c.employeeId) || 0) + (Number(c.amount) || 0));
   }
 
   // Training completion is tracked against users._id, not employees._id — see the
   // established enrollment.employeeId=users._id convention from the training module.
-  const userIds = employees.filter((e) => e.userId).map((e) => e.userId);
+  const users = empIds.length ? await knex('users').whereIn('employeeId', empIds).select('id', 'employeeId') : [];
+  const userIdByEmployee = new Map(users.map((u) => [u.employeeId, u.id]));
+  const userIds = users.map((u) => u.id);
   const completedEnrollments = userIds.length
-    ? await findMany('enrollments', { employeeId: { $in: userIds }, status: 'completed' }, { projection: { employeeId: 1 } })
+    ? await knex('enrollments').whereIn('employeeId', userIds).where({ status: 'completed' }).select('employeeId')
     : [];
   const coursesCompletedByUser = new Map();
   for (const e of completedEnrollments) {
-    const k = String(e.employeeId);
-    coursesCompletedByUser.set(k, (coursesCompletedByUser.get(k) || 0) + 1);
+    coursesCompletedByUser.set(e.employeeId, (coursesCompletedByUser.get(e.employeeId) || 0) + 1);
   }
 
   const rows = employees.map((e) => {
-    const overtimeCost = overtimeByEmp.get(String(e._id)) || 0;
-    const expenseCost = expensesByEmp.get(String(e._id)) || 0;
-    const coursesCompleted = e.userId ? (coursesCompletedByUser.get(String(e.userId)) || 0) : 0;
+    const overtimeCost = overtimeByEmp.get(e.id) || 0;
+    const expenseCost = expensesByEmp.get(e.id) || 0;
+    const userId = userIdByEmployee.get(e.id);
+    const coursesCompleted = userId ? (coursesCompletedByUser.get(userId) || 0) : 0;
     return {
-      employeeId: e._id, employeeName: e.fullName, department: e.department || '—',
-      baseSalary: e.grossPay || 0, overtimeCost3mo: Math.round(overtimeCost), expenseReimbursements3mo: Math.round(expenseCost),
+      employeeId: e.id, employeeName: e.fullName, department: e.department || '—',
+      baseSalary: Number(e.grossPay) || 0, overtimeCost3mo: Math.round(overtimeCost), expenseReimbursements3mo: Math.round(expenseCost),
       coursesCompleted3mo: coursesCompleted,
       // No per-course cost exists anywhere in the training module's data model — reporting
       // a fabricated constant here would misrepresent real spend, so this is left null
       // rather than invented.
       trainingCost3mo: null,
-      totalCost: Math.round((e.grossPay || 0) + overtimeCost + expenseCost),
+      totalCost: Math.round((Number(e.grossPay) || 0) + overtimeCost + expenseCost),
     };
   });
   rows.sort((a, b) => b.totalCost - a.totalCost);
@@ -724,43 +734,42 @@ const getDepartmentHealthInsight = async (req, res) => {
   const startOfWeek = new Date(now); startOfWeek.setDate(now.getDate() - now.getDay());
   const weekStr = startOfWeek.toISOString().slice(0, 10);
 
-  const employees = await findMany('employees', { status: 'active' }, { projection: { department: 1 } });
+  const employees = await knex('employees').where({ status: 'active' }).select('id', 'department');
   const depts = [...new Set(employees.map((e) => e.department || 'Unassigned'))];
 
   const [attendanceThisWeek, reviews, openReqs, activePips, balances, allEmpsWithPay] = await Promise.all([
-    findMany('attendance_records', { date: { $gte: weekStr } }, { projection: { employeeId: 1, status: 1 } }),
-    findMany('reviews', { reviewType: 'manager', status: 'submitted', overallRating: { $ne: null } }, { sort: { submittedAt: -1 }, projection: { employeeId: 1, overallRating: 1 } }),
-    findMany('jobRequisitions', { status: 'open' }, { projection: { department: 1 } }),
-    findMany('performanceImprovementPlans', { status: 'active' }, { projection: { employeeId: 1 } }),
-    findMany('leave_balances', { year: now.getFullYear(), closingBalance: { $gt: 0 } }, { projection: { employeeId: 1, closingBalance: 1 } }),
-    findMany('employees', { status: 'active' }, { projection: { department: 1, grossPay: 1 } }),
+    knex('attendance_records').where('date', '>=', weekStr).select('employeeId', 'status'),
+    knex('reviews').where({ reviewType: 'manager', status: 'submitted' }).whereNotNull('overallRating').orderBy('submittedAt', 'desc').select('employeeId', 'overallRating'),
+    knex('job_requisitions').where({ status: 'open' }).select('department'),
+    knex('performance_improvement_plans').where({ status: 'active' }).select('employeeId'),
+    knex('leave_balances').where({ year: now.getFullYear() }).where('closingBalance', '>', 0).select('employeeId', 'closingBalance'),
+    knex('employees').where({ status: 'active' }).select('id', 'department', 'grossPay'),
   ]);
 
-  const empDeptMap = new Map(employees.map((e) => [String(e._id), e.department || 'Unassigned']));
-  const grossPayMap = new Map(allEmpsWithPay.map((e) => [String(e._id), e.grossPay || 0]));
+  const empDeptMap = new Map(employees.map((e) => [e.id, e.department || 'Unassigned']));
+  const grossPayMap = new Map(allEmpsWithPay.map((e) => [e.id, Number(e.grossPay) || 0]));
 
   const latestRatingByEmp = new Map();
   for (const r of reviews) {
-    const k = String(r.employeeId);
-    if (!latestRatingByEmp.has(k)) latestRatingByEmp.set(k, r.overallRating);
+    if (!latestRatingByEmp.has(r.employeeId)) latestRatingByEmp.set(r.employeeId, Number(r.overallRating));
   }
 
   const scorecard = depts.map((dept) => {
-    const deptEmpIds = employees.filter((e) => (e.department || 'Unassigned') === dept).map((e) => String(e._id));
+    const deptEmpIds = employees.filter((e) => (e.department || 'Unassigned') === dept).map((e) => e.id);
     const deptEmpSet = new Set(deptEmpIds);
 
-    const deptAttendance = attendanceThisWeek.filter((a) => deptEmpSet.has(String(a.employeeId)));
+    const deptAttendance = attendanceThisWeek.filter((a) => deptEmpSet.has(a.employeeId));
     const present = deptAttendance.filter((a) => ['present', 'remote', 'late'].includes(a.status)).length;
     const attendanceRate = deptAttendance.length ? Math.round((present / deptAttendance.length) * 100) : null;
 
     const deptRatings = deptEmpIds.map((id) => latestRatingByEmp.get(id)).filter((r) => r != null);
     const avgRating = deptRatings.length ? Math.round((deptRatings.reduce((a, b) => a + b, 0) / deptRatings.length) * 10) / 10 : null;
 
-    const deptBalances = balances.filter((b) => empDeptMap.get(String(b.employeeId)) === dept);
-    const leaveLiability = Math.round(deptBalances.reduce((sum, b) => sum + b.closingBalance * ((grossPayMap.get(String(b.employeeId)) || 0) / 22), 0));
+    const deptBalances = balances.filter((b) => empDeptMap.get(b.employeeId) === dept);
+    const leaveLiability = Math.round(deptBalances.reduce((sum, b) => sum + Number(b.closingBalance) * ((grossPayMap.get(b.employeeId) || 0) / 22), 0));
 
     const openRoles = openReqs.filter((r) => r.department === dept).length;
-    const activePipCount = activePips.filter((p) => deptEmpSet.has(String(p.employeeId))).length;
+    const activePipCount = activePips.filter((p) => deptEmpSet.has(p.employeeId)).length;
 
     return { department: dept, headcount: deptEmpIds.length, attendanceRate, avgPerformanceRating: avgRating, leaveLiability, openRoles, activePips: activePipCount };
   });
@@ -774,40 +783,39 @@ const getManagerEffectivenessInsight = async (req, res) => {
   const weekStr = startOfWeek.toISOString().slice(0, 10);
   const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 12, now.getDate());
 
-  const allEmployees = await findMany('employees', {}, { projection: { fullName: 1, managerId: 1, status: 1 } });
-  const managerIds = [...new Set(allEmployees.filter((e) => e.managerId).map((e) => String(e.managerId)))];
+  const allEmployees = await knex('employees').select('id', 'fullName', 'managerId', 'status');
+  const managerIds = [...new Set(allEmployees.filter((e) => e.managerId).map((e) => e.managerId))];
   if (!managerIds.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const managers = await findMany('employees', { _id: { $in: managerIds.map((id) => new ObjectId(id)) } }, { projection: { fullName: 1 } });
-  const managerMap = new Map(managers.map((m) => [String(m._id), m.fullName]));
+  const managers = await knex('employees').whereIn('id', managerIds).select('id', 'fullName');
+  const managerMap = new Map(managers.map((m) => [m.id, m.fullName]));
 
-  const [attendanceThisWeek, reviews, oneOnOnesLast90Days, terminationsLast12mo] = await Promise.all([
-    findMany('attendance_records', { date: { $gte: weekStr } }, { projection: { employeeId: 1, status: 1 } }),
-    findMany('reviews', { reviewType: 'manager', status: 'submitted', overallRating: { $ne: null } }, { sort: { submittedAt: -1 }, projection: { employeeId: 1, overallRating: 1 } }),
-    findMany('oneOnOnes', { scheduledAt: { $gte: new Date(now.getFullYear(), now.getMonth() - 1, now.getDate()) } }, { projection: { managerId: 1 } }),
-    findMany('employees', { status: 'terminated', terminationDate: { $gte: twelveMonthsAgo } }, { projection: { managerId: 1 } }),
+  const [attendanceThisWeek, reviews, oneOnOnesLast30Days, terminationsLast12mo] = await Promise.all([
+    knex('attendance_records').where('date', '>=', weekStr).select('employeeId', 'status'),
+    knex('reviews').where({ reviewType: 'manager', status: 'submitted' }).whereNotNull('overallRating').orderBy('submittedAt', 'desc').select('employeeId', 'overallRating'),
+    knex('one_on_ones').where('scheduledAt', '>=', new Date(now.getFullYear(), now.getMonth() - 1, now.getDate())).select('managerId'),
+    knex('employees').where({ status: 'terminated' }).where('terminationDate', '>=', twelveMonthsAgo).select('managerId'),
   ]);
 
   const latestRatingByEmp = new Map();
   for (const r of reviews) {
-    const k = String(r.employeeId);
-    if (!latestRatingByEmp.has(k)) latestRatingByEmp.set(k, r.overallRating);
+    if (!latestRatingByEmp.has(r.employeeId)) latestRatingByEmp.set(r.employeeId, Number(r.overallRating));
   }
 
   const result = managerIds.map((mgrId) => {
-    const teamIds = allEmployees.filter((e) => String(e.managerId) === mgrId).map((e) => String(e._id));
+    const teamIds = allEmployees.filter((e) => e.managerId === mgrId).map((e) => e.id);
     const teamSet = new Set(teamIds);
-    const activeTeamCount = allEmployees.filter((e) => String(e.managerId) === mgrId && e.status === 'active').length;
+    const activeTeamCount = allEmployees.filter((e) => e.managerId === mgrId && e.status === 'active').length;
 
-    const teamAttendance = attendanceThisWeek.filter((a) => teamSet.has(String(a.employeeId)));
+    const teamAttendance = attendanceThisWeek.filter((a) => teamSet.has(a.employeeId));
     const present = teamAttendance.filter((a) => ['present', 'remote', 'late'].includes(a.status)).length;
     const teamAttendanceRate = teamAttendance.length ? Math.round((present / teamAttendance.length) * 100) : null;
 
     const teamRatings = teamIds.map((id) => latestRatingByEmp.get(id)).filter((r) => r != null);
     const teamAvgRating = teamRatings.length ? Math.round((teamRatings.reduce((a, b) => a + b, 0) / teamRatings.length) * 10) / 10 : null;
 
-    const checkInsLastMonth = oneOnOnesLast90Days.filter((o) => String(o.managerId) === mgrId).length;
-    const teamTurnoverCount = terminationsLast12mo.filter((t) => String(t.managerId) === mgrId).length;
+    const checkInsLastMonth = oneOnOnesLast30Days.filter((o) => o.managerId === mgrId).length;
+    const teamTurnoverCount = terminationsLast12mo.filter((t) => t.managerId === mgrId).length;
     const teamTurnoverRate = activeTeamCount + teamTurnoverCount > 0 ? Math.round((teamTurnoverCount / (activeTeamCount + teamTurnoverCount)) * 100) : 0;
 
     return {
@@ -845,46 +853,58 @@ module.exports.getITAssetsReport = getITAssetsReport;
 
 // ── Custom Report Builder ──────────────────────────────────────────────────────
 // Deliberately restricted to a fixed allowlist of sources/fields/date-fields per source —
-// this runs arbitrary HR-supplied filters against real collections, so it must never
-// accept a raw field name straight into a Mongo query.
+// this runs arbitrary HR-supplied filters against real tables, so it must never accept a
+// raw field name straight into a knex query (identifier interpolation is exactly the
+// class of bug SQL-injection-via-column-name lives in, so every field that reaches a
+// query below is checked against `allowedFields` first).
 
 const SOURCE_CONFIG = {
   employees: {
-    collection: 'employees',
+    table: 'employees',
     dateField: 'dateOfHire',
     fields: ['fullName', 'department', 'designation', 'employmentType', 'status', 'dateOfHire', 'grossPay', 'gender', 'nationality'],
   },
   attendance: {
-    collection: 'attendance_records',
+    table: 'attendance_records',
     dateField: 'date',
     fields: ['employeeId', 'date', 'status', 'checkInTime', 'checkOutTime'],
   },
   leave: {
-    collection: 'leave_requests',
+    table: 'leave_requests',
     dateField: 'startDate',
     fields: ['employeeId', 'leaveTypeId', 'startDate', 'endDate', 'totalDays', 'status'],
   },
   payroll: {
-    collection: 'payroll_results',
+    table: 'payroll_results',
     dateField: 'createdAt',
     fields: ['employeeId', 'grossPay', 'netPay', 'overtimeAmount', 'cycleId'],
   },
   performance: {
-    collection: 'reviews',
+    table: 'reviews',
     dateField: 'submittedAt',
     fields: ['employeeId', 'overallRating', 'reviewType', 'status', 'submittedAt'],
   },
   expenses: {
-    collection: 'expense_claims',
+    table: 'expense_claims',
     dateField: 'date',
     fields: ['employeeId', 'category', 'amount', 'currency', 'date', 'status'],
   },
 };
 
-const OPERATORS = {
-  eq: (v) => v, ne: (v) => ({ $ne: v }), gt: (v) => ({ $gt: v }), gte: (v) => ({ $gte: v }),
-  lt: (v) => ({ $lt: v }), lte: (v) => ({ $lte: v }), in: (v) => ({ $in: Array.isArray(v) ? v : [v] }),
-  contains: (v) => ({ $regex: String(v), $options: 'i' }),
+// Applies one filter condition to a knex query builder — the knex equivalent of the
+// old per-operator Mongo fragment builder.
+const applyOperator = (query, field, operator, value) => {
+  switch (operator) {
+    case 'eq':       return query.where({ [field]: value });
+    case 'ne':       return query.whereNot({ [field]: value });
+    case 'gt':       return query.where(field, '>', value);
+    case 'gte':      return query.where(field, '>=', value);
+    case 'lt':       return query.where(field, '<', value);
+    case 'lte':      return query.where(field, '<=', value);
+    case 'in':       return query.whereIn(field, Array.isArray(value) ? value : [value]);
+    case 'contains': return query.whereILike(field, `%${value}%`);
+    default:         return query;
+  }
 };
 
 // Runs the report definition against its primary data source and returns raw rows —
@@ -895,7 +915,8 @@ const runCustomReportDefinition = async (def) => {
   if (!config) throw new Error(`Unknown data source: ${primarySource}`);
 
   const allowedFields = new Set(config.fields);
-  const filter = {};
+  let query = knex(config.table);
+
   for (const f of def.filters || []) {
     // 'department' lives on employees, not on attendance/leave/payroll/performance/expenses —
     // a filter on it against one of those sources is resolved by first finding which
@@ -903,36 +924,29 @@ const runCustomReportDefinition = async (def) => {
     // makes "employee + attendance fields, filtered by department" actually work instead
     // of silently dropping the filter because 'department' isn't in that source's allowlist.
     if (f.field === 'department' && primarySource !== 'employees' && allowedFields.has('employeeId')) {
-      const matching = await findMany('employees', { department: OPERATORS[f.operator] ? OPERATORS[f.operator](f.value) : f.value }, { projection: { _id: 1 } });
-      const ids = matching.map((e) => e._id);
-      filter.employeeId = filter.employeeId ? { $in: ids.filter((id) => (filter.employeeId.$in || []).some((i) => String(i) === String(id))) } : { $in: ids };
+      const matching = await applyOperator(knex('employees'), 'department', f.operator, f.value).select('id');
+      query = query.whereIn('employeeId', matching.map((e) => e.id));
       continue;
     }
-    if (!allowedFields.has(f.field) || !OPERATORS[f.operator]) continue;
-    filter[f.field] = OPERATORS[f.operator](f.value);
+    if (!allowedFields.has(f.field) || !['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'contains'].includes(f.operator)) continue;
+    query = applyOperator(query, f.field, f.operator, f.value);
   }
-  if (def.dateRange?.start || def.dateRange?.end) {
-    filter[config.dateField] = {
-      ...(def.dateRange.start ? { $gte: new Date(def.dateRange.start) } : {}),
-      ...(def.dateRange.end ? { $lte: new Date(def.dateRange.end) } : {}),
-    };
-  }
+  if (def.dateRange?.start) query = query.where(config.dateField, '>=', new Date(def.dateRange.start));
+  if (def.dateRange?.end) query = query.where(config.dateField, '<=', new Date(def.dateRange.end));
 
   const requestedFields = (def.fields || []).filter((f) => allowedFields.has(f));
-  const projection = requestedFields.length
-    ? Object.fromEntries(requestedFields.map((f) => [f, 1]))
-    : undefined;
+  if (requestedFields.length) query = query.select(requestedFields); // otherwise select(*) via knex's default
 
-  let rows = await findMany(config.collection, filter, projection ? { projection, limit: 5000 } : { limit: 5000 });
+  let rows = await query.limit(5000);
 
   // employeeId-bearing sources get department/name enrichment when 'employees' is
   // also selected — the closest thing to a join this builder supports, since a full
-  // arbitrary multi-collection join engine is out of scope for what HR actually needs here.
+  // arbitrary multi-table join engine is out of scope for what HR actually needs here.
   if (primarySource !== 'employees' && def.dataSources.includes('employees') && rows.some((r) => r.employeeId)) {
-    const empIds = [...new Set(rows.map((r) => String(r.employeeId)).filter(Boolean))].map((id) => new ObjectId(id));
-    const emps = empIds.length ? await findMany('employees', { _id: { $in: empIds } }, { projection: { fullName: 1, department: 1 } }) : [];
-    const empMap = new Map(emps.map((e) => [String(e._id), e]));
-    rows = rows.map((r) => ({ ...r, employeeName: empMap.get(String(r.employeeId))?.fullName, department: empMap.get(String(r.employeeId))?.department }));
+    const empIds = [...new Set(rows.map((r) => r.employeeId).filter(Boolean))];
+    const emps = empIds.length ? await knex('employees').whereIn('id', empIds).select('id', 'fullName', 'department') : [];
+    const empMap = new Map(emps.map((e) => [e.id, e]));
+    rows = rows.map((r) => ({ ...r, employeeName: empMap.get(r.employeeId)?.fullName, department: empMap.get(r.employeeId)?.department }));
   }
 
   if (def.groupBy && (allowedFields.has(def.groupBy) || def.groupBy === 'department')) {
@@ -963,21 +977,25 @@ const buildCustomReport = async (req, res) => {
   const result = await runCustomReportDefinition(def);
 
   if (req.body.save) {
-    const doc = { ...def, schedule: null, createdBy: new ObjectId(req.user._id), createdAt: new Date(), updatedAt: new Date() };
-    const inserted = await insertOne('customReports', doc);
-    return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: inserted.insertedId, ...result });
+    const doc = {
+      id: newId(), name: def.name, dataSources: JSON.stringify(def.dataSources), fields: JSON.stringify(def.fields),
+      filters: JSON.stringify(def.filters), groupBy: def.groupBy, dateRange: JSON.stringify(def.dateRange), format: def.format,
+      schedule: null, createdBy: req.user?.id ?? null, createdAt: new Date(), updatedAt: new Date(),
+    };
+    const [saved] = await knex('customReports').insert(doc).returning('*');
+    return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id, ...result });
   }
 
   return returnFunction(res, 200, true, req.locale.success, result);
 };
 
 const listCustomReports = async (req, res) => {
-  const reports = await findMany('customReports', {}, { sort: { createdAt: -1 } });
+  const reports = await knex('customReports').orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, reports);
 };
 
 const runSavedCustomReport = async (req, res) => {
-  const report = await findOne('customReports', { _id: new ObjectId(req.params.id) });
+  const report = await knex('customReports').where({ id: req.params.id }).first();
   if (!report) return returnFunction(res, 404, false, req.locale.notFound);
   const result = await runCustomReportDefinition(report);
   return returnFunction(res, 200, true, req.locale.success, result);
@@ -987,20 +1005,21 @@ const scheduleCustomReport = async (req, res) => {
   if (!validateRequiredFields(req, res, ['frequency', 'recipients'])) return;
   if (!['weekly', 'monthly'].includes(req.body.frequency)) return returnFunction(res, 400, false, 'Frequency must be "weekly" or "monthly".');
 
-  const report = await findOne('customReports', { _id: new ObjectId(req.params.id) });
+  const report = await knex('customReports').where({ id: req.params.id }).first();
   if (!report) return returnFunction(res, 404, false, req.locale.notFound);
 
   const nextRunAt = new Date();
   nextRunAt.setDate(nextRunAt.getDate() + (req.body.frequency === 'weekly' ? 7 : 30));
 
-  await updateOne('customReports', { _id: report._id }, {
-    $set: { schedule: { frequency: req.body.frequency, recipients: req.body.recipients, lastRunAt: null, nextRunAt } },
+  await knex('customReports').where({ id: report.id }).update({
+    schedule: JSON.stringify({ frequency: req.body.frequency, recipients: req.body.recipients, lastRunAt: null, nextRunAt }),
+    updatedAt: new Date(),
   });
   return returnFunction(res, 200, true, 'Report scheduled.');
 };
 
 const deleteCustomReport = async (req, res) => {
-  await deleteOne('customReports', { _id: new ObjectId(req.params.id) });
+  await knex('customReports').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Report deleted.');
 };
 
@@ -1090,7 +1109,7 @@ const exportReport = async (req, res) => {
 
 // Invoked by the daily cron (cronTasks.js) — checks for due schedules and emails the CSV.
 const runDueScheduledReports = async () => {
-  const due = await findMany('customReports', { 'schedule.nextRunAt': { $lte: new Date() } }, {});
+  const due = await knex('customReports').whereRaw(`"schedule"->>'nextRunAt' <= ?`, [new Date().toISOString()]);
   for (const report of due) {
     try {
       const { rows } = await runCustomReportDefinition(report);
@@ -1105,9 +1124,12 @@ const runDueScheduledReports = async () => {
         attachments: [{ filename: `${report.name}.csv`, content: csv, contentType: 'text/csv' }],
       })));
 
-      await updateOne('customReports', { _id: report._id }, { $set: { 'schedule.lastRunAt': new Date(), 'schedule.nextRunAt': nextRunAt } });
+      await knex('customReports').where({ id: report.id }).update({
+        schedule: JSON.stringify({ ...report.schedule, lastRunAt: new Date(), nextRunAt }),
+        updatedAt: new Date(),
+      });
     } catch (err) {
-      console.error(`[CRON] scheduled report ${report._id} failed:`, err);
+      console.error(`[CRON] scheduled report ${report.id} failed:`, err);
     }
   }
 };

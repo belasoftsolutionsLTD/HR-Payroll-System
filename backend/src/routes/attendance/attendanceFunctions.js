@@ -1,12 +1,11 @@
-const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 3b) —
 // attendance_records (+ attendance_breaks), timesheets, shifts (+ shift_task_templates/
 // shift_tasks/shift_notes/shift_applications), work_schedules, employeeShiftAssignments,
 // attendance_settings, employees, users, leave_requests, public_holidays all now live in
-// Postgres. company_settings/overtime_config are unmigrated and stay on the Mongo helpers
-// above.
+// Postgres. company_settings/overtime_config joined them in Phase 10 — this file is
+// fully migrated, no more Mongo helpers.
 // NOTE: insertOne here MUST come from pgDBFunctions, not commonDBFunctions (Mongo) — an
 // earlier version of this file imported it from the Mongo helper by mistake, which meant
 // every insert in this module (clock-in, timesheets, shifts, ...) silently wrote to Mongo
@@ -397,8 +396,8 @@ const clockIn = async (req, res) => {
     return returnFunction(res, 400, false, 'Location access is required to clock in. Please enable GPS and try again.');
   }
 
-  // company_settings is unmigrated — stays Mongo.
-  const settings = await global.dbo.collection('company_settings').findOne({});
+  // company_settings is Postgres now (Phase 10).
+  const settings = await knex('company_settings').first();
   const officeLat    = parseFloat(settings?.officeLatitude);
   const officeLng    = parseFloat(settings?.officeLongitude);
   const radiusMeters = parseFloat(settings?.officeRadiusMeters) || 200;
@@ -519,8 +518,8 @@ const clockOut = async (req, res) => {
   // Split overtime minutes into weekday/weekend × day/night buckets so payroll can apply
   // HR's own custom multiplier per bucket instead of one flat rate for all overtime.
   // Overtime is the tail end of the shift, i.e. the last `overtimeMinutes` minutes
-  // before checkout. overtime_config is unmigrated — stays Mongo.
-  const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
+  // before checkout. overtime_config is Postgres now (Phase 10).
+  const overtimeConfig = await knex('overtime_config').first();
   const isWeekend = [0, 6].includes(new Date(today + 'T00:00:00').getDay());
   let weekdayDayMins = 0, weekdayNightMins = 0, weekendDayMins = 0, weekendNightMins = 0;
   if (overtimeMinutes > 0) {
@@ -823,8 +822,8 @@ const submitTimesheet = async (req, res) => {
       type: 'timesheet', subType: 'timesheet_submission',
       title: `Timesheet submitted by ${emp?.fullName || 'An employee'}`,
       subtitle: `Week ${sheet.weekStart || ''} – ${sheet.weekEnd || ''} · ${sheet.totalHours || ''}h`,
-      referenceId: new ObjectId(sheet.id), referenceModel: 'timesheets',
-      requiresAction: true, triggeredBy: req.user._id,
+      referenceId: sheet.id, referenceModel: 'timesheets',
+      requiresAction: true, triggeredBy: req.user.id,
     };
     await notifyManager(req.user.employeeId, inboxItem);
     await notifyHR(inboxItem);
@@ -1149,8 +1148,8 @@ const createShiftNote = async (req, res) => {
       type: 'shift', subType: 'shift_incident',
       title: `Incident logged by ${doc.authorName}`,
       subtitle: `Shift ${shift.date} ${shift.startTime}–${shift.endTime}: ${doc.text.slice(0, 80)}`,
-      referenceId: new ObjectId(result.id), referenceModel: 'shift_notes',
-      requiresAction: true, triggeredBy: req.user._id,
+      referenceId: result.id, referenceModel: 'shift_notes',
+      requiresAction: true, triggeredBy: req.user.id,
     };
     await notifyManager(shift.employeeId, inboxItem).catch(() => {});
     await notifyHR(inboxItem).catch(() => {});
@@ -1187,7 +1186,7 @@ const getShiftHandoverNotes = async (req, res) => {
   ]);
 
   return returnFunction(res, 200, true, req.locale.success, {
-    previousShift: { _id: new ObjectId(previousShift.id), date: previousShift.date, employeeName: prevEmp?.fullName || 'A previous staff member' },
+    previousShift: { _id: previousShift.id, date: previousShift.date, employeeName: prevEmp?.fullName || 'A previous staff member' },
     notes,
   });
 };
@@ -1529,8 +1528,8 @@ const applyForShift = async (req, res) => {
     type: 'shift', subType: 'shift_application',
     title: `Shift application from ${emp?.fullName || 'An employee'}`,
     subtitle: `Shift ${shift.date || ''} ${shift.startTime || ''}–${shift.endTime || ''}`.trim(),
-    referenceId: new ObjectId(result.id), referenceModel: 'shift_applications',
-    requiresAction: true, triggeredBy: req.user._id,
+    referenceId: result.id, referenceModel: 'shift_applications',
+    requiresAction: true, triggeredBy: req.user.id,
   };
   await notifyManager(empId, inboxItem);
   await notifyHR(inboxItem);

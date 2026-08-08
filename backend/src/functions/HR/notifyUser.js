@@ -1,32 +1,27 @@
-const { ObjectId } = require('mongodb');
-const { findOne, insertOne } = require('../Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// `users`/`employees` now live in Postgres; `notifications` itself is unmigrated (Phase
-// 10), so every notification document below is still written straight to Mongo — only
-// the "who do I notify" lookups move to Postgres. pgUsers's rows carry a `_id` alias
-// (see pgDBFunctions.js) so `u._id` below is still a real ObjectId, safe to write
-// straight into notifications.recipientId/userId exactly as before.
-const pgUsers = require('../Database/pgDBFunctions');
+// Postgres migration (Phase 10) — notifications is Postgres now, with the
+// recipientId/userId dual key normalized to a single recipientId column (see
+// migrations/20260808130000_phase10_notifications_config_reports_schema.js's
+// header for the live-data check that made this safe). employees/users have
+// been Postgres since Phase 1.
+const { knex, newId } = require('../Database/pgDBFunctions');
 
 /**
  * Creates a notification for a specific user.
- * @param {string|ObjectId} userId  - The _id of the user to notify
+ * @param {string} userId  - the id of the user to notify
  * @param {{ title: string, body: string, type: string, link?: string }} payload
  */
 const notifyUser = async (userId, { title, body, type, link = null }) => {
   try {
-    const user = await pgUsers.findOne('users', { id: String(userId) });
+    const id = String(userId);
+    const user = await knex('users').where({ id }).first();
     if (user?.notificationsEnabled === false) return;
-    await insertOne('notifications', {
-      recipientId: new ObjectId(userId),
-      userId: new ObjectId(userId),
+    await knex('notifications').insert({
+      id: newId(),
+      recipientId: id,
       title,
-      subtitle: body,
       body,
       type,   // 'payroll' | 'leave' | 'announcement' | 'onboarding' | 'general'
-      link,
       navigateTo: link,
-      read: false,
       isRead: false,
       createdAt: new Date(),
     });
@@ -39,16 +34,16 @@ const notifyUser = async (userId, { title, body, type, link = null }) => {
  * Finds the user account linked to an employeeId and sends them a notification.
  */
 const notifyEmployee = async (employeeId, payload) => {
-  const user = await pgUsers.findOne('users', { employeeId: String(employeeId) });
-  if (user) await notifyUser(user._id, payload);
+  const user = await knex('users').where({ employeeId: String(employeeId) }).first();
+  if (user) await notifyUser(user.id, payload);
 };
 
 /**
  * Notifies all users with any of the given roles.
  */
 const notifyByRoles = async (roles = [], payload) => {
-  const users = await pgUsers.knex('users').whereIn('role', roles);
-  await Promise.all(users.map(u => notifyUser(u.id, payload)));
+  const users = await knex('users').whereIn('role', roles);
+  await Promise.all(users.map((u) => notifyUser(u.id, payload)));
 };
 
 /**
@@ -58,15 +53,15 @@ const notifyByRoles = async (roles = [], payload) => {
  */
 const notifyStaffByAudience = async (audience, department, payload) => {
   try {
-    let employeeQuery = pgUsers.knex('employees');
+    let employeeQuery = knex('employees');
     if (audience === 'department' && department) employeeQuery = employeeQuery.where({ department });
     const employees = await employeeQuery.select('id');
-    const employeeIds = employees.map(e => e.id);
+    const employeeIds = employees.map((e) => e.id);
     if (!employeeIds.length) return;
 
-    const users = await pgUsers.knex('users').whereIn('employeeId', employeeIds).select('id');
+    const users = await knex('users').whereIn('employeeId', employeeIds).select('id');
 
-    await Promise.all(users.map(u => notifyUser(u.id, payload)));
+    await Promise.all(users.map((u) => notifyUser(u.id, payload)));
   } catch {
     // Non-critical
   }

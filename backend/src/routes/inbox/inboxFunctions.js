@@ -1,10 +1,8 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 10) — inbox_items is Postgres now. employees/users
+// have been Postgres since Phase 1; every referenceModel this file ever
+// enriches against is Postgres too now (this was the last module phase).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, findMany, insertOne, updateOne, deleteOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// `employees`/`users` now live in Postgres; `inbox_items` itself is unmigrated, so it's
-// aliased rather than imported under the same names as the Mongo helpers above.
-const pgDB = require('../../functions/Database/pgDBFunctions');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 
 // ── Internal helper — called by other modules when events occur ────────────────
@@ -23,12 +21,13 @@ const createInboxItem = async ({
 }) => {
   if (!recipientId || !type || !title) return null;
   const doc = {
-    recipientId: new ObjectId(recipientId),
+    id: newId(),
+    recipientId: String(recipientId),
     type,
     subType: subType || type,
     title,
     subtitle: subtitle || '',
-    referenceId: referenceId ? new ObjectId(referenceId) : null,
+    referenceId: referenceId ? String(referenceId) : null,
     referenceModel: referenceModel || null,
     priority,
     requiresAction,
@@ -36,13 +35,14 @@ const createInboxItem = async ({
     actionTaken: null,
     actionedAt: null,
     actionedBy: null,
-    triggeredBy: triggeredBy ? new ObjectId(triggeredBy) : null,
+    triggeredBy: triggeredBy ? String(triggeredBy) : null,
     expiresAt: expiresAt || null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
   try {
-    return await global.dbo.collection('inbox_items').insertOne(doc);
+    const [saved] = await knex('inbox_items').insert(doc).returning('*');
+    return saved;
   } catch {
     return null;
   }
@@ -50,19 +50,19 @@ const createInboxItem = async ({
 
 // ── Notify all HR users ────────────────────────────────────────────────────────
 const notifyHR = async (itemData) => {
-  const hrUsers = await pgDB.knex('users').whereIn('role', ['super_admin', 'hr_manager']).select('id');
+  const hrUsers = await knex('users').whereIn('role', ['super_admin', 'hr_manager']).select('id');
   for (const u of hrUsers) {
-    await createInboxItem({ ...itemData, recipientId: new ObjectId(u.id) });
+    await createInboxItem({ ...itemData, recipientId: u.id });
   }
 };
 
 // ── Notify employee's manager ──────────────────────────────────────────────────
 const notifyManager = async (employeeId, itemData) => {
   if (!employeeId) return;
-  const emp = await pgDB.findOne('employees', { id: String(employeeId) });
+  const emp = await knex('employees').where({ id: String(employeeId) }).first();
   if (!emp?.managerId) return;
-  const mgr = await pgDB.findOne('users', { employeeId: emp.managerId });
-  if (mgr) await createInboxItem({ ...itemData, recipientId: mgr._id });
+  const mgr = await knex('users').where({ employeeId: emp.managerId }).first();
+  if (mgr) await createInboxItem({ ...itemData, recipientId: mgr.id });
 };
 
 // ── List inbox items ──────────────────────────────────────────────────────────
@@ -70,74 +70,71 @@ const listInbox = async (req, res) => {
   const { tab, type: typeFilter, sort } = req.query;
   const { page, limit, skip } = getPagination(req.query);
 
-  const filter = { recipientId: req.user._id };
+  let query = knex('inbox_items').where({ recipientId: req.user.id });
 
   // Tab filter
   if (tab === 'pending') {
-    filter.requiresAction = true;
-    filter.status = { $in: ['unread', 'read'] };
+    query = query.where({ requiresAction: true }).whereIn('status', ['unread', 'read']);
   } else if (tab === 'notifications') {
-    filter.requiresAction = false;
+    query = query.where({ requiresAction: false });
   } else if (tab === 'done') {
-    filter.status = { $in: ['actioned', 'dismissed'] };
+    query = query.whereIn('status', ['actioned', 'dismissed']);
   }
 
-  if (typeFilter && typeFilter !== 'all') filter.type = typeFilter;
+  if (typeFilter && typeFilter !== 'all') query = query.where({ type: typeFilter });
 
-  const sortDir = sort === 'oldest' ? 1 : -1;
+  const sortDir = sort === 'oldest' ? 'asc' : 'desc';
 
-  const [total, items] = await Promise.all([
-    countDocuments('inbox_items', filter),
-    findMany('inbox_items', filter, { skip, limit, sort: { createdAt: sortDir } }),
-  ]);
+  const [{ count: total }] = await query.clone().count('* as count');
+  const items = await query.clone().orderBy('createdAt', sortDir).limit(limit).offset(skip);
 
   // Enrich with triggeredBy user info
   const enriched = await Promise.all(items.map(async (item) => {
     let triggeredByUser = null;
     if (item.triggeredBy) {
-      const u = await pgDB.findOne('users', { id: String(item.triggeredBy) });
-      const emp = u ? await pgDB.findOne('employees', { id: String(item.triggeredBy) }) : null;
+      const u = await knex('users').where({ id: item.triggeredBy }).first();
+      const emp = u?.employeeId ? await knex('employees').where({ id: u.employeeId }).first() : null;
       triggeredByUser = { name: u?.name || '', designation: emp?.designation || '', department: emp?.department || '' };
     }
     return { ...item, triggeredByUser };
   }));
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(total), page, limit));
 };
 
 // ── Get inbox counts ──────────────────────────────────────────────────────────
 const getInboxCount = async (req, res) => {
-  const [unread, pending] = await Promise.all([
-    countDocuments('inbox_items', { recipientId: req.user._id, status: 'unread' }),
-    countDocuments('inbox_items', { recipientId: req.user._id, requiresAction: true, status: { $in: ['unread', 'read'] } }),
+  const [[{ count: unread }], [{ count: pending }]] = await Promise.all([
+    knex('inbox_items').where({ recipientId: req.user.id, status: 'unread' }).count('* as count'),
+    knex('inbox_items').where({ recipientId: req.user.id, requiresAction: true }).whereIn('status', ['unread', 'read']).count('* as count'),
   ]);
-  return returnFunction(res, 200, true, req.locale.success, { unread, pending });
+  return returnFunction(res, 200, true, req.locale.success, { unread: Number(unread), pending: Number(pending) });
 };
 
 // ── Get single inbox item ─────────────────────────────────────────────────────
 const getInboxItem = async (req, res) => {
-  const item = await findOne('inbox_items', { _id: new ObjectId(req.params.id), recipientId: req.user._id });
+  const item = await knex('inbox_items').where({ id: req.params.id, recipientId: req.user.id }).first();
   if (!item) return returnFunction(res, 404, false, req.locale.notFound);
 
   // Auto-mark as read when opened
   if (item.status === 'unread') {
-    await updateOne('inbox_items', { _id: item._id }, { $set: { status: 'read', updatedAt: new Date() } });
+    await knex('inbox_items').where({ id: item.id }).update({ status: 'read', updatedAt: new Date() });
   }
 
-  // Enrich with reference data. referenceModel is a collection name picked at write
-  // time by whatever module created this item — 'employees'/'users' (Phase 1),
-  // 'leave_requests' (Phase 3a), and 'timesheets'/'shift_notes'/'shift_applications'
-  // (Phase 3b) now live in Postgres, everything else is still Mongo.
-  const PG_REFERENCE_MODELS = ['employees', 'users', 'leave_requests', 'timesheets', 'shift_notes', 'shift_applications'];
+  // Enrich with reference data. referenceModel is a table name picked at write
+  // time by whatever module created this item — every one of them is Postgres
+  // now (this was the last module phase), so this is always a knex lookup.
   let referenceData = null;
   if (item.referenceId && item.referenceModel) {
-    referenceData = PG_REFERENCE_MODELS.includes(item.referenceModel)
-      ? await pgDB.findOne(item.referenceModel, { id: String(item.referenceId) })
-      : await findOne(item.referenceModel, { _id: item.referenceId });
+    try {
+      referenceData = await knex(item.referenceModel).where({ id: item.referenceId }).first();
+    } catch {
+      referenceData = null; // referenceModel names a table that no longer exists / was renamed
+    }
 
     // Enrich with employee data if available
     if (referenceData?.employeeId) {
-      const emp = await pgDB.findOne('employees', { id: String(referenceData.employeeId) });
+      const emp = await knex('employees').where({ id: String(referenceData.employeeId) }).first();
       referenceData = { ...referenceData, employee: emp || null };
     }
 
@@ -147,7 +144,7 @@ const getInboxItem = async (req, res) => {
     // leaveFunctions.js but scoped to just the two mismatched field names.
     if (item.type === 'leave' && item.referenceModel === 'leave_requests' && referenceData) {
       const leaveType = referenceData.leaveTypeId
-        ? await pgDB.findOne('leave_types', { id: referenceData.leaveTypeId })
+        ? await knex('leave_types').where({ id: referenceData.leaveTypeId }).first()
         : null;
       referenceData = { ...referenceData, leaveType: leaveType?.name ?? null, numberOfDays: referenceData.totalDays };
     }
@@ -158,9 +155,9 @@ const getInboxItem = async (req, res) => {
 
 // ── Mark item as read ─────────────────────────────────────────────────────────
 const markRead = async (req, res) => {
-  const item = await findOne('inbox_items', { _id: new ObjectId(req.params.id), recipientId: req.user._id });
+  const item = await knex('inbox_items').where({ id: req.params.id, recipientId: req.user.id }).first();
   if (!item) return returnFunction(res, 404, false, req.locale.notFound);
-  await updateOne('inbox_items', { _id: item._id }, { $set: { status: 'read', updatedAt: new Date() } });
+  await knex('inbox_items').where({ id: item.id }).update({ status: 'read', updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.success);
 };
 
@@ -169,7 +166,7 @@ const takeAction = async (req, res) => {
   const { action, reason } = req.body;
   if (!action) return returnFunction(res, 400, false, 'Action is required.');
 
-  const item = await findOne('inbox_items', { _id: new ObjectId(req.params.id), recipientId: req.user._id });
+  const item = await knex('inbox_items').where({ id: req.params.id, recipientId: req.user.id }).first();
   if (!item) return returnFunction(res, 404, false, req.locale.notFound);
   if (item.status === 'actioned') return returnFunction(res, 400, false, 'Action already taken.');
 
@@ -224,8 +221,8 @@ const takeAction = async (req, res) => {
     }
   }
 
-  await updateOne('inbox_items', { _id: item._id }, {
-    $set: { status: 'actioned', actionTaken: action, actionedAt: now, actionedBy: req.user._id, updatedAt: now },
+  await knex('inbox_items').where({ id: item.id }).update({
+    status: 'actioned', actionTaken: action, actionedAt: now, actionedBy: req.user.id, updatedAt: now,
   });
 
   return returnFunction(res, 200, true, 'Action recorded.', { action });
@@ -233,18 +230,15 @@ const takeAction = async (req, res) => {
 
 // ── Mark all as read ──────────────────────────────────────────────────────────
 const markAllRead = async (req, res) => {
-  await global.dbo.collection('inbox_items').updateMany(
-    { recipientId: req.user._id, status: 'unread' },
-    { $set: { status: 'read', updatedAt: new Date() } },
-  );
+  await knex('inbox_items').where({ recipientId: req.user.id, status: 'unread' }).update({ status: 'read', updatedAt: new Date() });
   return returnFunction(res, 200, true, 'All items marked as read.');
 };
 
 // ── Dismiss item ──────────────────────────────────────────────────────────────
 const dismissItem = async (req, res) => {
-  const item = await findOne('inbox_items', { _id: new ObjectId(req.params.id), recipientId: req.user._id });
+  const item = await knex('inbox_items').where({ id: req.params.id, recipientId: req.user.id }).first();
   if (!item) return returnFunction(res, 404, false, req.locale.notFound);
-  await updateOne('inbox_items', { _id: item._id }, { $set: { status: 'dismissed', updatedAt: new Date() } });
+  await knex('inbox_items').where({ id: item.id }).update({ status: 'dismissed', updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Item dismissed.');
 };
 
@@ -253,19 +247,12 @@ const bulkAction = async (req, res) => {
   const { ids, action } = req.body;
   if (!ids?.length || !action) return returnFunction(res, 400, false, 'ids and action required.');
 
-  const objectIds = ids.map(id => new ObjectId(id));
   const now = new Date();
 
   if (action === 'mark_read') {
-    await global.dbo.collection('inbox_items').updateMany(
-      { _id: { $in: objectIds }, recipientId: req.user._id },
-      { $set: { status: 'read', updatedAt: now } },
-    );
+    await knex('inbox_items').whereIn('id', ids).where({ recipientId: req.user.id }).update({ status: 'read', updatedAt: now });
   } else if (action === 'dismiss') {
-    await global.dbo.collection('inbox_items').updateMany(
-      { _id: { $in: objectIds }, recipientId: req.user._id },
-      { $set: { status: 'dismissed', updatedAt: now } },
-    );
+    await knex('inbox_items').whereIn('id', ids).where({ recipientId: req.user.id }).update({ status: 'dismissed', updatedAt: now });
   }
 
   return returnFunction(res, 200, true, 'Bulk action applied.');

@@ -1,60 +1,29 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 10) — notifications is Postgres now, with its
+// recipientId/userId dual key (and the link/navigateTo, read/isRead,
+// subtitle/body duplicate pairs) normalized to single columns — see the
+// migration file header for the live-data check that made this safe.
+// employees/users have been Postgres since Phase 1.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { STAFF } = require('../../constants/roles');
 
-// ── Internal helper — called by all modules when events occur ─────────────────
-const createNotification = async ({
-  recipientId,
-  type,
-  title,
-  subtitle,
-  referenceId,
-  referenceModel,
-  navigateTo,
-}) => {
-  if (!recipientId || !type || !title) return null;
-  const doc = {
-    recipientId: new ObjectId(recipientId),
-    type,
-    title,
-    subtitle: subtitle || '',
-    body: subtitle || '',
-    referenceId: referenceId ? new ObjectId(referenceId) : null,
-    referenceModel: referenceModel || null,
-    navigateTo: navigateTo || null,
-    isRead: false,
-    read: false,
-    readAt: null,
-    emailSent: false,
-    emailSentAt: null,
-    createdAt: new Date(),
-  };
-  try {
-    return await global.dbo.collection('notifications').insertOne(doc);
-  } catch {
-    return null;
-  }
-};
+// createNotification/notifyHRNotification (this module's own would-be write
+// path) were found to have ZERO callers anywhere in the codebase during this
+// phase's investigation — every real notification is written through
+// functions/HR/notifyUser.js's notifyUser/notifyEmployee/notifyByRoles/
+// notifyStaffByAudience instead. Not reimplemented here; that shared helper
+// is the one real write path, now targeting Postgres directly.
 
-// ── Notify all HR users ───────────────────────────────────────────────────────
-const notifyHRNotification = async (data) => {
-  const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] } }, { projection: { _id: 1 } });
-  for (const u of hrUsers) {
-    await createNotification({ ...data, recipientId: u._id });
-  }
-};
-
-// Most notify*() call sites across the codebase (notifyUser/notifyByRoles/notifyEmployee/
-// notifyStaffByAudience in functions/HR/notifyUser.js) never pass a `link`, so `navigateTo`
-// is null on most notifications — the bell shows them as inert text with nothing to click.
-// Rather than hand-adding a link at every one of those call sites (they're spread across
-// nearly every module), this maps a notification's `type` to its module's base route as a
-// read-time fallback — "takes you to the respective module" is exactly what was asked for,
-// and unlike per-call-site links this covers every existing notification immediately, with
-// no backfill migration. A per-record deep link (e.g. straight to one leave request) can
-// still be set explicitly via `link`/`navigateTo` on individual notify() calls — that always
+// Most notify*() call sites across the codebase (functions/HR/notifyUser.js) never
+// pass a `link`, so `navigateTo` is null on most notifications — the bell shows them
+// as inert text with nothing to click. Rather than hand-adding a link at every one of
+// those call sites (they're spread across nearly every module), this maps a
+// notification's `type` to its module's base route as a read-time fallback — "takes
+// you to the respective module" is exactly what was asked for, and unlike per-call-site
+// links this covers every existing notification immediately, with no backfill
+// migration. A per-record deep link (e.g. straight to one leave request) can still be
+// set explicitly via `link`/`navigateTo` on individual notify() calls — that always
 // wins over this fallback.
 const MODULE_ROUTE_BY_TYPE = {
   announcement:     '/communications',
@@ -93,83 +62,51 @@ const STAFF_MODULE_ROUTE_BY_TYPE = {
 };
 
 const withNavigateFallback = (item, role) => {
-  if (item.navigateTo) return item;
-  const map = role === STAFF ? STAFF_MODULE_ROUTE_BY_TYPE : MODULE_ROUTE_BY_TYPE;
-  return { ...item, navigateTo: map[item.type] || null };
+  const navigateTo = item.navigateTo || (role === STAFF ? STAFF_MODULE_ROUTE_BY_TYPE : MODULE_ROUTE_BY_TYPE)[item.type] || null;
+  // Frontend/older clients may still read either name of each normalized pair —
+  // serve both, computed from the single canonical column, rather than assuming
+  // every caller has been updated to the new single-column shape.
+  return { ...item, navigateTo, link: navigateTo, read: item.isRead, subtitle: item.body };
 };
 
 // ── List notifications ────────────────────────────────────────────────────────
 const listNotifications = async (req, res) => {
-  const filter = {
-    $or: [{ recipientId: req.user._id }, { userId: req.user._id }],
-  };
-  if (req.query.unread === 'true') {
-    filter.$and = [{
-      $or: [
-        { isRead: false },
-        { read: false },
-        { isRead: { $exists: false }, read: { $exists: false } },
-      ],
-    }];
-  }
-  if (req.query.type && req.query.type !== 'all') filter.type = req.query.type;
+  let query = knex('notifications').where({ recipientId: req.user.id });
+  if (req.query.unread === 'true') query = query.where({ isRead: false });
+  if (req.query.type && req.query.type !== 'all') query = query.where({ type: req.query.type });
 
   const { page, limit, skip } = getPagination(req.query);
-  const [total, items] = await Promise.all([
-    countDocuments('notifications', filter),
-    findMany('notifications', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count: total }] = await query.clone().count('* as count');
+  const items = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items.map((item) => withNavigateFallback(item, req.user.role)), total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items.map((item) => withNavigateFallback(item, req.user.role)), Number(total), page, limit));
 };
 
 // ── Get unread count ──────────────────────────────────────────────────────────
 const getNotificationCount = async (req, res) => {
-  const count = await countDocuments('notifications', {
-    $and: [
-      { $or: [{ recipientId: req.user._id }, { userId: req.user._id }] },
-      {
-        $or: [
-          { isRead: false },
-          { read: false },
-          { isRead: { $exists: false }, read: { $exists: false } },
-        ],
-      },
-    ],
-  });
-  return returnFunction(res, 200, true, req.locale.success, { count });
+  const [{ count }] = await knex('notifications').where({ recipientId: req.user.id, isRead: false }).count('* as count');
+  return returnFunction(res, 200, true, req.locale.success, { count: Number(count) });
 };
 
 // ── Mark one as read ──────────────────────────────────────────────────────────
 const markRead = async (req, res) => {
-  await global.dbo.collection('notifications').updateOne(
-    { _id: new ObjectId(req.params.id), $or: [{ recipientId: req.user._id }, { userId: req.user._id }] },
-    { $set: { isRead: true, read: true, readAt: new Date() } },
-  );
+  await knex('notifications').where({ id: req.params.id, recipientId: req.user.id }).update({ isRead: true, readAt: new Date() });
   return returnFunction(res, 200, true, req.locale.success);
 };
 
 // ── Mark all as read ──────────────────────────────────────────────────────────
 const markAllRead = async (req, res) => {
-  await global.dbo.collection('notifications').updateMany(
-    { $or: [{ recipientId: req.user._id }, { userId: req.user._id }] },
-    { $set: { isRead: true, read: true, readAt: new Date() } },
-  );
+  await knex('notifications').where({ recipientId: req.user.id }).update({ isRead: true, readAt: new Date() });
   return returnFunction(res, 200, true, 'All marked as read.');
 };
 
 // ── Dismiss notification ──────────────────────────────────────────────────────
 const dismissNotification = async (req, res) => {
-  await global.dbo.collection('notifications').deleteOne({
-    _id: new ObjectId(req.params.id),
-    $or: [{ recipientId: req.user._id }, { userId: req.user._id }],
-  });
+  await knex('notifications').where({ id: req.params.id, recipientId: req.user.id }).delete();
   return returnFunction(res, 200, true, 'Dismissed.');
 };
 
 module.exports = {
-  createNotification,
-  notifyHRNotification,
   listNotifications,
   getNotificationCount,
   markRead,

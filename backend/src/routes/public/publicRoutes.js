@@ -1,20 +1,18 @@
 const express = require('express');
 const multer  = require('multer');
 const PDFDocument = require('pdfkit');
-const { ObjectId } = require('mongodb'); // still needed for notifyHR's referenceId (inbox stays Mongo)
 const router = express.Router();
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const crypto = require('crypto');
-// company_settings is unmigrated and stays on the Mongo helpers below.
-// project_invites is Postgres now (Phase 9) — see findInviteByToken/
-// acceptInviteCore/declineInviteCore in projectsFunctions.js.
-const { findOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
 // Phase 4) — jobRequisitions/candidates/applications now live in Postgres. `users`
 // has been Postgres since Phase 1 — the unsubscribe routes below were still reading
 // it off the Mongo helper, silently broken (writes went to a collection nothing
 // syncs anymore) since that phase; fixed here while this file was open for Phase 4.
+// project_invites is Postgres too (Phase 9) — see findInviteByToken/
+// acceptInviteCore/declineInviteCore in projectsFunctions.js. company_settings
+// joined them in Phase 10 — this file is fully migrated, no more Mongo helpers.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { knex, newId, insertOne } = pgDB;
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -55,7 +53,7 @@ router.get('/company-logo', AsyncHandler(serveCompanyLogo));
 // GET /api/public/theme — branding colors (no auth, used by ThemeLoader)
 router.get('/theme', async (req, res) => {
   try {
-    const s = await findOne('company_settings', {});
+    const s = await knex('company_settings').first();
     return returnFunction(res, 200, true, 'OK', {
       primaryColor:    s?.primaryColor    || '#0A1931',
       gradientEndColor: s?.gradientEndColor || '#C9A84C',
@@ -73,7 +71,7 @@ router.get('/theme', async (req, res) => {
 // GET /api/public/company-info — name, contact, socials (no auth, used by footer)
 router.get('/company-info', async (req, res) => {
   try {
-    const s = await findOne('company_settings', {});
+    const s = await knex('company_settings').first();
     return returnFunction(res, 200, true, 'OK', {
       companyName: s?.companyName || '',
       address:     s?.address     || '',
@@ -227,7 +225,7 @@ router.post('/jobs/:id/apply', upload.single('resume'), async (req, res) => {
         type: 'recruitment', subType: 'new_application',
         title: 'New Application Received',
         subtitle: `${fullName} applied for ${requisition.title} via the careers site.`,
-        referenceId: new ObjectId(result.id), referenceModel: 'applications',
+        referenceId: result.id, referenceModel: 'applications',
         requiresAction: true, triggeredBy: null,
       }).catch(() => {});
       notifyByRoles(['super_admin', 'hr_manager'], {
@@ -256,7 +254,7 @@ router.get('/jobs/:id/pdf', async (req, res) => {
     const job = await knex('job_requisitions').where({ id: req.params.id }).first();
     if (!job) return returnFunction(res, 404, false, 'Job not found');
 
-    const settings = await findOne('company_settings', {});
+    const settings = await knex('company_settings').first();
     const companyName = settings?.companyName || 'Workfola';
     const primaryHex  = settings?.primaryColor || '#0A1931';
 

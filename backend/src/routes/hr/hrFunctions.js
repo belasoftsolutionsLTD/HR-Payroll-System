@@ -1,9 +1,12 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// employees now live in Postgres; notifications is unmigrated (Phase 10), so it stays
-// on the Mongo helpers above.
+// employees now live in Postgres. This file's own getNotifications/markNotificationRead/
+// markAllNotificationsRead (Mongo, against `notifications`) were dropped during the
+// Phase 10 cross-cutting sweep: confirmed via a frontend grep for '/api/hr/notifications'
+// that nothing calls these routes — the real, live notification system is
+// /api/notifications + /api/inbox (notificationFunctions.js/inboxFunctions.js), which is
+// what every actual notification bell in the app talks to.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 
 // Job requisitions now live in the recruitment module (jobRequisitions collection) —
@@ -95,33 +98,6 @@ const getAllDocuments = async (req, res) => {
   return returnFunction(res, 200, true, req.locale.success, { documents, total: documents.length });
 };
 
-// ── Notifications ─────────────────────────────────────────────────────────────
-
-const getNotifications = async (req, res) => {
-  const notifications = await findMany('notifications',
-    { userId: new ObjectId(req.user.id), read: false },
-    { sort: { createdAt: -1 }, limit: 50 }
-  );
-  return returnFunction(res, 200, true, req.locale.success, notifications);
-};
-
-const markNotificationRead = async (req, res) => {
-  await updateOne('notifications',
-    { _id: new ObjectId(req.params.id), userId: new ObjectId(req.user.id) },
-    { $set: { read: true } }
-  );
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
-};
-
-const markAllNotificationsRead = async (req, res) => {
-  await global.dbo.collection('notifications').updateMany(
-    { userId: new ObjectId(req.user.id), read: false },
-    { $set: { read: true } }
-  );
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
-};
-
 module.exports = {
   getOrgChart, getAllDocuments,
-  getNotifications, markNotificationRead, markAllNotificationsRead,
 };

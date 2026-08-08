@@ -1,37 +1,42 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 10 cross-cutting sweep) — this whole file was still reading
+// Mongo via commonDBFunctions/global.dbo even though employees (Phase 1), payroll_cycles
+// (Phase 2), and employee_compensations (Phase 2) have all been Postgres for many phases —
+// every /api/finance/workspace/* endpoint had been silently serving stale, frozen Mongo
+// data (a pre-existing bug of the same class reportFunctions.js's `feedback` staleness
+// was, just never caught until this sweep). Rewritten against the real schema: employees
+// has no `jobTitle`/`exitDate` columns (uses `designation`/`terminationDate` instead —
+// the original Mongo field names never actually existed on this collection either, so
+// those two fields were always undefined even before Postgres). payroll_cycles' `totals`
+// object was flattened into totalGross/totalDeductions/totalNet/totalEmployerCost columns
+// back in Phase 2, and `headcountProcessed` is `employeeCount`.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 
 // ── Compensation by Group ─────────────────────────────────────────────────────
 const getCompensationByGroup = async (req, res) => {
-  const groupBy = req.query.groupBy || 'department'; // department | location | costCenter
+  const groupBy = ['department', 'location', 'costCenter'].includes(req.query.groupBy) ? req.query.groupBy : 'department';
 
-  const employees = await findMany('employees', { status: 'active' }, {
-    projection: { _id: 1, fullName: 1, department: 1, location: 1, costCenter: 1 },
-  });
+  const employees = await knex('employees').where({ status: 'active' }).select('id', 'fullName', 'department', 'location', 'costCenter');
+  const empIds = employees.map(e => e.id);
 
-  const empIds = employees.map(e => e._id);
-
-  const compensations = await findMany('employee_compensations', {
-    employeeId: { $in: empIds },
-    isActive: true,
-    category: { $in: ['earnings', 'benefits', 'employer_contributions'] },
-  });
+  const compensations = empIds.length
+    ? await knex('employee_compensations').whereIn('employeeId', empIds).where({ isActive: true })
+        .whereIn('category', ['earnings', 'benefits', 'employer_contributions'])
+    : [];
 
   const compMap = {};
   compensations.forEach(c => {
-    const key = String(c.employeeId);
-    if (!compMap[key]) compMap[key] = { earnings: 0, benefits: 0, employer: 0 };
-    if (c.category === 'earnings') compMap[key].earnings += c.amount || 0;
-    if (c.category === 'benefits') compMap[key].benefits += c.amount || 0;
-    if (c.category === 'employer_contributions') compMap[key].employer += c.amount || 0;
+    if (!compMap[c.employeeId]) compMap[c.employeeId] = { earnings: 0, benefits: 0, employer: 0 };
+    if (c.category === 'earnings') compMap[c.employeeId].earnings += Number(c.amount) || 0;
+    if (c.category === 'benefits') compMap[c.employeeId].benefits += Number(c.amount) || 0;
+    if (c.category === 'employer_contributions') compMap[c.employeeId].employer += Number(c.amount) || 0;
   });
 
   const groups = {};
   employees.forEach(emp => {
     const gKey = emp[groupBy] || 'Unassigned';
     if (!groups[gKey]) groups[gKey] = { name: gKey, headcount: 0, earnings: 0, benefits: 0, employer: 0, total: 0 };
-    const c = compMap[String(emp._id)] || { earnings: 0, benefits: 0, employer: 0 };
+    const c = compMap[emp.id] || { earnings: 0, benefits: 0, employer: 0 };
     groups[gKey].headcount += 1;
     groups[gKey].earnings  += c.earnings;
     groups[gKey].benefits  += c.benefits;
@@ -45,20 +50,16 @@ const getCompensationByGroup = async (req, res) => {
 
 // ── Cost Centers ──────────────────────────────────────────────────────────────
 const getCostCenters = async (req, res) => {
-  const employees = await findMany('employees', { status: 'active' }, {
-    projection: { _id: 1, fullName: 1, department: 1, costCenter: 1, jobTitle: 1 },
-  });
+  const employees = await knex('employees').where({ status: 'active' }).select('id', 'fullName', 'department', 'costCenter', 'designation');
+  const empIds = employees.map(e => e.id);
 
-  const empIds = employees.map(e => e._id);
-  const compensations = await findMany('employee_compensations', {
-    employeeId: { $in: empIds },
-    isActive: true,
-    category: 'earnings',
-  });
+  const compensations = empIds.length
+    ? await knex('employee_compensations').whereIn('employeeId', empIds).where({ isActive: true, category: 'earnings' })
+    : [];
 
   const costMap = {};
   compensations.forEach(c => {
-    costMap[String(c.employeeId)] = (costMap[String(c.employeeId)] || 0) + (c.amount || 0);
+    costMap[c.employeeId] = (costMap[c.employeeId] || 0) + (Number(c.amount) || 0);
   });
 
   const centers = {};
@@ -66,9 +67,9 @@ const getCostCenters = async (req, res) => {
     const cc = emp.costCenter || 'Unassigned';
     if (!centers[cc]) centers[cc] = { name: cc, headcount: 0, totalCost: 0, departments: new Set(), employees: [] };
     centers[cc].headcount += 1;
-    centers[cc].totalCost += costMap[String(emp._id)] || 0;
+    centers[cc].totalCost += costMap[emp.id] || 0;
     if (emp.department) centers[cc].departments.add(emp.department);
-    centers[cc].employees.push({ _id: emp._id, fullName: emp.fullName, department: emp.department, jobTitle: emp.jobTitle });
+    centers[cc].employees.push({ _id: emp.id, fullName: emp.fullName, department: emp.department, jobTitle: emp.designation });
   });
 
   const result = Object.values(centers).map(c => ({
@@ -87,30 +88,24 @@ const getWorkforceHistory = async (req, res) => {
   const type   = req.query.type; // 'hire' | 'termination' | 'resignation'
 
   const [hires, exits] = await Promise.all([
-    findMany('employees', {}, {
-      projection: { _id: 1, fullName: 1, department: 1, designation: 1, dateOfHire: 1, staffNumber: 1 },
-      sort: { dateOfHire: -1 },
-      limit: 200,
-    }),
-    findMany('employees', { status: { $in: ['terminated', 'resigned'] } }, {
-      projection: { _id: 1, fullName: 1, department: 1, designation: 1, exitDate: 1, updatedAt: 1, staffNumber: 1, status: 1 },
-      sort: { updatedAt: -1 },
-      limit: 200,
-    }),
+    knex('employees').whereNotNull('dateOfHire').select('id', 'fullName', 'department', 'designation', 'dateOfHire', 'staffNumber')
+      .orderBy('dateOfHire', 'desc').limit(200),
+    knex('employees').whereIn('status', ['terminated', 'resigned']).select('id', 'fullName', 'department', 'designation', 'terminationDate', 'updatedAt', 'staffNumber', 'status')
+      .orderBy('updatedAt', 'desc').limit(200),
   ]);
 
   let events = [
-    ...hires.filter(e => e.dateOfHire).map(e => ({
+    ...hires.map(e => ({
       type: 'hire',
       date: e.dateOfHire,
-      employee: { _id: e._id, fullName: e.fullName, staffNumber: e.staffNumber },
+      employee: { _id: e.id, fullName: e.fullName, staffNumber: e.staffNumber },
       department: e.department,
       jobTitle: e.designation,
     })),
     ...exits.map(e => ({
       type: e.status === 'terminated' ? 'termination' : 'resignation',
-      date: e.exitDate || e.updatedAt,
-      employee: { _id: e._id, fullName: e.fullName, staffNumber: e.staffNumber },
+      date: e.terminationDate || e.updatedAt,
+      employee: { _id: e.id, fullName: e.fullName, staffNumber: e.staffNumber },
       department: e.department,
       jobTitle: e.designation,
     })),
@@ -125,26 +120,21 @@ const getWorkforceHistory = async (req, res) => {
 const getTrends = async (req, res) => {
   const months = parseInt(req.query.months) || 12;
 
-  const cycles = await findMany('payroll_cycles', { status: 'closed' }, {
-    sort: { 'period.startDate': -1 },
-    limit: months,
-    projection: {
-      _id: 1, name: 1, period: 1, status: 1,
-      totals: 1, headcountProcessed: 1, closedAt: 1,
-    },
-  });
+  const cycles = await knex('payroll_cycles').where({ status: 'closed' })
+    .orderBy('periodStartDate', 'desc').limit(months)
+    .select('id', 'name', 'periodMonth', 'periodYear', 'periodStartDate', 'status', 'totalGross', 'totalNet', 'totalDeductions', 'totalEmployerCost', 'employeeCount', 'closedAt');
 
-  cycles.sort((a, b) => new Date(a.period?.startDate) - new Date(b.period?.startDate));
+  cycles.sort((a, b) => new Date(a.periodStartDate) - new Date(b.periodStartDate));
 
   const trend = cycles.map(c => ({
-    cycleId:      c._id,
+    cycleId:      c.id,
     name:         c.name,
-    period:       c.period,
-    grossPay:     c.totals?.totalGross    ?? 0,
-    netPay:       c.totals?.totalNet      ?? 0,
-    deductions:   c.totals?.totalDeductions ?? 0,
-    employerCost: c.totals?.totalEmployerCost ?? 0,
-    headcount:    c.headcountProcessed    ?? 0,
+    period:       { month: c.periodMonth, year: c.periodYear },
+    grossPay:     Number(c.totalGross) || 0,
+    netPay:       Number(c.totalNet) || 0,
+    deductions:   Number(c.totalDeductions) || 0,
+    employerCost: Number(c.totalEmployerCost) || 0,
+    headcount:    c.employeeCount || 0,
   }));
 
   const avgGross    = trend.length ? trend.reduce((s, t) => s + t.grossPay, 0) / trend.length : 0;
@@ -158,41 +148,30 @@ const getTrends = async (req, res) => {
 const getWorkspaceSummary = async (req, res) => {
   const now = new Date();
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  const endOfLastMonth   = new Date(now.getFullYear(), now.getMonth(), 0);
 
   const [
-    totalHeadcount,
-    newHiresThisMonth,
-    exitsThisMonth,
-    lastCycle,
-    prevCycle,
+    [{ count: totalHeadcount }],
+    [{ count: newHiresThisMonth }],
+    [{ count: exitsThisMonth }],
+    recentClosedCycles,
   ] = await Promise.all([
-    countDocuments('employees', { status: 'active' }),
-    countDocuments('employees', { dateOfHire: { $gte: startOfMonth } }),
-    countDocuments('employees', {
-      status: { $in: ['terminated', 'resigned'] },
-      updatedAt: { $gte: startOfMonth },
-    }),
-    // Most recent closed payroll cycle
-    global.dbo.collection('payroll_cycles').findOne(
-      { status: 'closed' },
-      { sort: { closedAt: -1 }, projection: { totals: 1, headcountProcessed: 1, name: 1 } }
-    ),
-    // Second most recent closed payroll cycle (for MoM comparison)
-    global.dbo.collection('payroll_cycles').find(
-      { status: 'closed' }
-    ).sort({ closedAt: -1 }).skip(1).limit(1).toArray(),
+    knex('employees').where({ status: 'active' }).count('* as count'),
+    knex('employees').where('dateOfHire', '>=', startOfMonth).count('* as count'),
+    knex('employees').whereIn('status', ['terminated', 'resigned']).where('updatedAt', '>=', startOfMonth).count('* as count'),
+    // Two most recent closed cycles — for the current-vs-previous month-over-month comparison.
+    knex('payroll_cycles').where({ status: 'closed' }).orderBy('closedAt', 'desc').limit(2)
+      .select('name', 'totalGross'),
   ]);
 
-  const currentGross  = lastCycle?.totals?.totalGross ?? 0;
-  const previousGross = prevCycle[0]?.totals?.totalGross ?? 0;
+  const [lastCycle, prevCycle] = recentClosedCycles;
+  const currentGross  = Number(lastCycle?.totalGross) || 0;
+  const previousGross = Number(prevCycle?.totalGross) || 0;
   const momChange     = previousGross > 0 ? ((currentGross - previousGross) / previousGross) * 100 : 0;
 
   return returnFunction(res, 200, true, req.locale.success, {
-    totalHeadcount,
-    newHiresThisMonth,
-    exitsThisMonth,
+    totalHeadcount: Number(totalHeadcount),
+    newHiresThisMonth: Number(newHiresThisMonth),
+    exitsThisMonth: Number(exitsThisMonth),
     lastCycleName:    lastCycle?.name ?? null,
     currentGross,
     previousGross,

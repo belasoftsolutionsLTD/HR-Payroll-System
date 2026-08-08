@@ -1,7 +1,13 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 10 cross-cutting sweep) — announcements/announcement_reads
+// are Postgres now. This module was a live, mounted route (/api/announcements) that
+// every prior phase's plan simply never named — 1 real row, no orphan concerns.
+// `readBy`'s Mongo $addToSet became its
+// own announcement_reads child table (see the migration file's header for the full
+// rationale); `audiences` stays a JSONB string array (always whole-replaced, never
+// per-element mutated).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -12,13 +18,12 @@ const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 const emailAnnouncementAudience = async ({ audiences, deptTargets, empTargets, jobGroupTargets, employmentTypeTargets, title, body }) => {
   const emails = new Set();
   const addByRole = async (roles) => {
-    const users = await findMany('users', { role: { $in: roles }, isActive: { $ne: false } }, { projection: { email: 1 } });
+    const users = await knex('users').whereIn('role', roles).whereNot('isActive', false).select('email');
     users.forEach(u => u.email && emails.add(u.email));
   };
-  const addByEmployeeFilter = async (filter) => {
-    const emps = await findMany('employees', filter, { projection: { _id: 1 } });
-    if (!emps.length) return;
-    const users = await findMany('users', { employeeId: { $in: emps.map(e => e._id) } }, { projection: { email: 1 } });
+  const addByEmployeeIds = async (empIds) => {
+    if (!empIds.length) return;
+    const users = await knex('users').whereIn('employeeId', empIds).select('email');
     users.forEach(u => u.email && emails.add(u.email));
   };
 
@@ -27,10 +32,22 @@ const emailAnnouncementAudience = async ({ audiences, deptTargets, empTargets, j
   } else {
     if (audiences.includes('staff')) await addByRole(['staff']);
     if (audiences.includes('department_head')) await addByRole(['department_head']);
-    for (const dept of deptTargets) await addByEmployeeFilter({ department: dept, status: { $in: ['active', 'on_leave'] } });
-    if (empTargets.length) await addByEmployeeFilter({ _id: { $in: empTargets.map(id => new ObjectId(id)) }, status: { $in: ['active', 'on_leave'] } });
-    for (const jgId of jobGroupTargets) await addByEmployeeFilter({ jobGroupId: new ObjectId(jgId), status: { $in: ['active', 'on_leave'] } });
-    for (const et of employmentTypeTargets) await addByEmployeeFilter({ employmentType: et, status: { $in: ['active', 'on_leave'] } });
+    for (const dept of deptTargets) {
+      const emps = await knex('employees').where({ department: dept }).whereIn('status', ['active', 'on_leave']).select('id');
+      await addByEmployeeIds(emps.map(e => e.id));
+    }
+    if (empTargets.length) {
+      const emps = await knex('employees').whereIn('id', empTargets).whereIn('status', ['active', 'on_leave']).select('id');
+      await addByEmployeeIds(emps.map(e => e.id));
+    }
+    for (const jgId of jobGroupTargets) {
+      const emps = await knex('employees').where({ jobGroupId: jgId }).whereIn('status', ['active', 'on_leave']).select('id');
+      await addByEmployeeIds(emps.map(e => e.id));
+    }
+    for (const et of employmentTypeTargets) {
+      const emps = await knex('employees').where({ employmentType: et }).whereIn('status', ['active', 'on_leave']).select('id');
+      await addByEmployeeIds(emps.map(e => e.id));
+    }
   }
 
   const tokens = { title, body };
@@ -56,30 +73,29 @@ const createAnnouncement = async (req, res) => {
 
   const type = ['news', 'alert', 'campaign'].includes(req.body.type) ? req.body.type : 'news';
 
-  const doc = {
-    title,
-    body,
-    type,
-    audiences,
-    // Keep legacy field for backward compat with staff portal read queries
-    audience: audiences.includes('all') ? 'all' : (audiences.some(a => a.startsWith('department:')) ? 'department' : 'staff'),
-    department: null,
-    createdBy: new ObjectId(req.user._id),
-    createdByName: req.user.name || '',
-    readBy: [],
-    createdAt: new Date(),
-  };
-
   // Extract department names from 'department:Finance' style entries
   const deptTargets = audiences.filter(a => a.startsWith('department:')).map(a => a.replace('department:', ''));
-  if (deptTargets.length === 1) doc.department = deptTargets[0];
 
   // Same 'prefix:value' convention for the newer targeting dimensions.
   const empTargets = audiences.filter(a => a.startsWith('employee:')).map(a => a.replace('employee:', ''));
   const jobGroupTargets = audiences.filter(a => a.startsWith('jobGroup:')).map(a => a.replace('jobGroup:', ''));
   const employmentTypeTargets = audiences.filter(a => a.startsWith('employmentType:')).map(a => a.replace('employmentType:', ''));
 
-  const result = await insertOne('announcements', doc);
+  const doc = {
+    id: newId(),
+    title,
+    body,
+    type,
+    audiences: JSON.stringify(audiences),
+    // Keep legacy field for backward compat with staff portal read queries
+    audience: audiences.includes('all') ? 'all' : (deptTargets.length ? 'department' : 'staff'),
+    department: deptTargets.length === 1 ? deptTargets[0] : null,
+    createdBy: req.user.id,
+    createdByName: req.user.name || '',
+    createdAt: new Date(),
+  };
+
+  const [saved] = await knex('announcements').insert(doc).returning('*');
 
   const notifySnippet = body.substring(0, 120) + (body.length > 120 ? '…' : '');
 
@@ -99,8 +115,8 @@ const createAnnouncement = async (req, res) => {
     }
     // Specific departments
     for (const dept of deptTargets) {
-      const emps = await findMany('employees', { department: dept, status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
-      emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
+      const emps = await knex('employees').where({ department: dept }).whereIn('status', ['active', 'on_leave']).select('id');
+      emps.forEach(emp => notifyEmployee(emp.id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
     }
     // Specific employees
     for (const empId of empTargets) {
@@ -108,81 +124,84 @@ const createAnnouncement = async (req, res) => {
     }
     // Job groups
     for (const jgId of jobGroupTargets) {
-      const emps = await findMany('employees', { jobGroupId: new ObjectId(jgId), status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
-      emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
+      const emps = await knex('employees').where({ jobGroupId: jgId }).whereIn('status', ['active', 'on_leave']).select('id');
+      emps.forEach(emp => notifyEmployee(emp.id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
     }
     // Employment types
     for (const et of employmentTypeTargets) {
-      const emps = await findMany('employees', { employmentType: et, status: { $in: ['active', 'on_leave'] } }, { projection: { _id: 1 } });
-      emps.forEach(emp => notifyEmployee(emp._id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
+      const emps = await knex('employees').where({ employmentType: et }).whereIn('status', ['active', 'on_leave']).select('id');
+      emps.forEach(emp => notifyEmployee(emp.id, { type: 'announcement', title: `📢 ${title}`, body: notifySnippet, link: '/staff-portal' }).catch(() => {}));
     }
   }
 
   emailAnnouncementAudience({ audiences, deptTargets, empTargets, jobGroupTargets, employmentTypeTargets, title, body }).catch(() => {});
 
-  return returnFunction(res, 201, true, 'Announcement published.', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Announcement published.', { _id: saved.id });
 };
 
 // ── HR: list all announcements ────────────────────────────────────────────────
 const listAnnouncements = async (req, res) => {
-  const announcements = await findMany('announcements', {}, { sort: { createdAt: -1 }, limit: 50 });
+  const announcements = await knex('announcements').orderBy('createdAt', 'desc').limit(50);
   return returnFunction(res, 200, true, req.locale.success, announcements);
 };
 
 // ── HR: delete announcement ───────────────────────────────────────────────────
 const deleteAnnouncement = async (req, res) => {
-  const ann = await findOne('announcements', { _id: new ObjectId(req.params.id) });
+  const ann = await knex('announcements').where({ id: req.params.id }).first();
   if (!ann) return returnFunction(res, 404, false, req.locale.notFound);
-  await global.dbo.collection('announcements').deleteOne({ _id: ann._id });
+  await knex('announcements').where({ id: ann.id }).delete(); // announcement_reads cascade on delete
   return returnFunction(res, 200, true, 'Announcement deleted.');
 };
 
 // ── Staff: get announcements visible to them ──────────────────────────────────
-// Matches directly against the stored `audiences` array (Mongo matches an array field
-// against a scalar by containment) rather than the derived legacy `audience` singular
-// field, so every targeting dimension HR can pick from actually becomes visible here.
+// Matches against the stored `audiences` JSONB array (via a `?` containment check)
+// rather than the derived legacy `audience` singular field, so every targeting
+// dimension HR can pick from actually becomes visible here.
 const getMyAnnouncements = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
+  const empId = String(req.user.employeeId);
 
-  const emp = await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1, jobGroupId: 1, employmentType: 1 } });
+  const emp = await knex('employees').where({ id: empId }).select('department', 'jobGroupId', 'employmentType').first();
   const dept = emp?.department;
 
-  const orClauses = [
-    { audiences: 'all' },
-    { audiences: 'staff' },
-    { audiences: `employee:${String(req.user.employeeId)}` },
-    // Legacy fallback — any announcement written before the `audiences` array existed
-    // only has these singular fields set, and would otherwise match nothing above and
-    // silently vanish from every staff member's view.
-    { audience: 'all' },
-    { audience: 'staff' },
-  ];
-  if (dept) {
-    orClauses.push({ audiences: `department:${dept}` });
-    orClauses.push({ audience: 'department', department: dept });
-  }
-  if (emp?.jobGroupId) orClauses.push({ audiences: `jobGroup:${String(emp.jobGroupId)}` });
-  if (emp?.employmentType) orClauses.push({ audiences: `employmentType:${emp.employmentType}` });
-  if (req.user.role === 'department_head') orClauses.push({ audiences: 'department_head' });
-  if (['hr_manager', 'super_admin'].includes(req.user.role)) orClauses.push({ audiences: 'hr_only' });
+  const audienceValues = ['all', 'staff', `employee:${empId}`];
+  if (dept) audienceValues.push(`department:${dept}`);
+  if (emp?.jobGroupId) audienceValues.push(`jobGroup:${emp.jobGroupId}`);
+  if (emp?.employmentType) audienceValues.push(`employmentType:${emp.employmentType}`);
+  if (req.user.role === 'department_head') audienceValues.push('department_head');
+  if (['hr_manager', 'super_admin'].includes(req.user.role)) audienceValues.push('hr_only');
 
-  const announcements = await findMany('announcements', { $or: orClauses }, { sort: { createdAt: -1 }, limit: 30 });
+  const announcements = await knex('announcements')
+    .where((qb) => {
+      // `audiences ?| array[...]` — true if the JSONB array contains any of the given
+      // strings. The first `?` is Postgres' own jsonb operator, not a knex bind
+      // placeholder — escaped as `\?` so knex doesn't count it as a second binding.
+      qb.whereRaw(`"audiences" \\?| ?::text[]`, [audienceValues]);
+      // Legacy fallback — any announcement written before the `audiences` array existed
+      // only has these singular fields set, and would otherwise match nothing above and
+      // silently vanish from every staff member's view.
+      qb.orWhere({ audience: 'all' }).orWhere({ audience: 'staff' });
+      if (dept) qb.orWhere({ audience: 'department', department: dept });
+    })
+    .orderBy('createdAt', 'desc').limit(30);
 
   // Attach read status for this user
-  const userId = String(req.user._id);
-  const enriched = announcements.map(a => ({
-    ...a,
-    isRead: (a.readBy || []).some(id => String(id) === userId),
-  }));
+  const announcementIds = announcements.map(a => a.id);
+  const reads = announcementIds.length
+    ? await knex('announcement_reads').whereIn('announcementId', announcementIds).where({ userId: req.user.id }).select('announcementId')
+    : [];
+  const readSet = new Set(reads.map(r => r.announcementId));
+  const enriched = announcements.map(a => ({ ...a, isRead: readSet.has(a.id) }));
 
   return returnFunction(res, 200, true, 'OK', enriched);
 };
 
 // ── Staff: mark announcement as read ─────────────────────────────────────────
 const markAnnouncementRead = async (req, res) => {
-  await updateOne('announcements', { _id: new ObjectId(req.params.id) }, {
-    $addToSet: { readBy: new ObjectId(req.user._id) },
-  });
+  const existing = await knex('announcement_reads').where({ announcementId: req.params.id, userId: req.user.id }).first();
+  if (!existing) {
+    await knex('announcement_reads').insert({ id: newId(), announcementId: req.params.id, userId: req.user.id, readAt: new Date() });
+  }
   return returnFunction(res, 200, true, 'OK');
 };
 

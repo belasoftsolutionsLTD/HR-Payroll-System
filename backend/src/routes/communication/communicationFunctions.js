@@ -1,9 +1,9 @@
 'use strict';
 // Postgres migration (Phase 9) — communities/community_posts/post_comments/
 // communication_one_on_ones/meeting_notes/trust_reports are Postgres now.
-// employees/users have been Postgres since Phase 1. `notifications` itself stays
-// Mongo (Phase 10) — every notification below goes through notifyUser/
-// notifyByRoles, which already handle that split (see notifyUser.js's own note).
+// employees/users have been Postgres since Phase 1. `notifications` joined them in
+// Phase 10 — every notification below goes through notifyUser/notifyByRoles, which
+// already handle the write (see notifyUser.js).
 const crypto = require('crypto');
 const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');

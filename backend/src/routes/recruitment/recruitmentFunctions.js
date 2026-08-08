@@ -8,7 +8,6 @@ const { validateRequiredFields, getPagination, paginatedResponse } = require('..
 // live in Postgres.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { knex, newId, insertOne, updateOne } = pgDB;
-const { ObjectId } = require('mongodb');
 const { notifyUser, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { notifyHR } = require('../inbox/inboxFunctions');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
@@ -309,8 +308,8 @@ const hireCandidate = async (application, requisition, actingUser) => {
     type: 'recruitment', subType: 'new_hire',
     title: 'New Hire',
     subtitle: `${fullName} has been hired as ${empDoc.designation}. Staff #: ${staffNumber}`,
-    referenceId: new ObjectId(empResult.id), referenceModel: 'employees',
-    requiresAction: false, triggeredBy: actingUser?._id ?? null,
+    referenceId: empResult.id, referenceModel: 'employees',
+    requiresAction: false, triggeredBy: actingUser?.id ?? null,
   }).catch(() => {});
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'New Hire',

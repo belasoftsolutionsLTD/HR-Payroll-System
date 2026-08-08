@@ -1,16 +1,14 @@
 const fs = require('fs');
 const path = require('path');
-const { ObjectId } = require('mongodb');
 const archiver = require('archiver');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // payroll_concepts, employee_compensations, payroll_cycles, payroll_results (+ its child
 // tables), payslips, employees, departments, users, compensation_audit_logs (Phase 2),
-// leave_requests/leave_types/public_holidays (Phase 3a), and timesheets (Phase 3b) now
-// live in Postgres. Everything this file still touches that HASN'T been migrated yet
-// (expense_claims, tax_config, overtime_config, company_settings, GL accounting) stays on
-// the Mongo helpers via commonDBFunctions/global.dbo, imported separately below.
+// leave_requests/leave_types/public_holidays (Phase 3a), timesheets (Phase 3b),
+// expense_claims/GL accounting (Phase 8), and tax_config/overtime_config/company_settings
+// (Phase 10) are all Postgres now — this file is fully migrated, no more Mongo helpers.
 const { findOne, findMany, insertOne, updateOne, countDocuments, knex, newId, addChildRow } = require('../../functions/Database/pgDBFunctions');
 const { generatePayslipFromResult } = require('../../services/payslipService');
 const { generateP9Form } = require('../../services/p9Service');
@@ -374,14 +372,14 @@ async function doLockCycleInternal(req, res, cycle) {
 
   // Load tax config once for all employees (avoids N+1 DB calls) — the fallback for any
   // statutory line (PAYE/NSSF/SHA/AHL) no payroll_concept has claimed via statutoryKey
-  // yet; see resolveStatutoryLine below. tax_config is unmigrated — stays Mongo.
+  // yet; see resolveStatutoryLine below. tax_config is Postgres now (Phase 10).
   const taxConfig = await loadTaxConfig();
   const taxCalc   = buildCalculator(taxConfig);
 
   // HR-defined overtime multipliers (weekday/weekend × day/night) — no hardcoded
   // defaults; falls back to 1x (no premium) for any bucket HR hasn't configured yet.
-  // overtime_config is unmigrated — stays Mongo.
-  const overtimeConfig = await global.dbo.collection('overtime_config').findOne({});
+  // overtime_config is Postgres now (Phase 10).
+  const overtimeConfig = await knex('overtime_config').first();
   const otRate = (key) => overtimeConfig?.[key] != null ? overtimeConfig[key] : 1;
 
   // payroll_concepts + employee_compensations targeting (scope:'individual'/'group') is
@@ -738,8 +736,8 @@ async function doCloseCycleInternal(req, res, cycle) {
   const results = await findMany('payroll_results', { cycleId: cycle.id });
   const period = `${MONTHS[cycle.periodMonth - 1]} ${cycle.periodYear}`;
   const notifyMessage = `Your payslip for ${period} has been generated. You can view and download it from your portal.`;
-  // company_settings is unmigrated — stays Mongo.
-  const companySettings = await global.dbo.collection('company_settings').findOne({});
+  // company_settings is Postgres now (Phase 10).
+  const companySettings = await knex('company_settings').first();
   const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   // Generate payslips for each employee
@@ -835,7 +833,7 @@ async function doCloseCycleInternal(req, res, cycle) {
     if (totalNet > 0) {
       const payload = {
         date: new Date(), description: `Payroll cycle closed — ${period}`, source: 'payroll_cycle_close', sourceModule: 'payroll',
-        referenceId: new ObjectId(cycle.id), referenceModel: 'payroll_cycles', lines: [],
+        referenceId: cycle.id, referenceModel: 'payroll_cycles', lines: [],
       };
       try {
         const expenseAcct = await resolveSystemAccount('salary_expense');
@@ -848,9 +846,9 @@ async function doCloseCycleInternal(req, res, cycle) {
           lines.push({ accountId: payableAcct._id, credit: amount, department });
         }
         payload.lines = lines;
-        await postJournalEntry({ ...payload, postedBy: req.user?.id ? new ObjectId(req.user.id) : null });
+        await postJournalEntry({ ...payload, postedBy: req.user?.id || null });
       } catch (err) {
-        await logPostingFailure({ source: 'payroll_cycle_close', sourceModule: 'payroll', referenceId: new ObjectId(cycle.id), referenceModel: 'payroll_cycles', attemptedPayload: payload, error: err });
+        await logPostingFailure({ source: 'payroll_cycle_close', sourceModule: 'payroll', referenceId: cycle.id, referenceModel: 'payroll_cycles', attemptedPayload: payload, error: err });
       }
     }
   }
@@ -964,7 +962,8 @@ const emailPayslips = async (req, res) => {
 
   let sent = 0, skipped = 0, failed = 0;
   const period = `${MONTHS[cycle.periodMonth - 1]} ${cycle.periodYear}`;
-  const companySettings = await global.dbo.collection('company_settings').findOne({});
+  // company_settings is Postgres now (Phase 10).
+  const companySettings = await knex('company_settings').first();
   const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   for (const result of results) {
@@ -1029,7 +1028,8 @@ const downloadPayslipsZip = async (req, res) => {
 
   const results = await findMany('payroll_results', { cycleId: cycle.id });
   if (!results.length) return returnFunction(res, 400, false, 'No payroll results found for this cycle.');
-  const companySettings = await global.dbo.collection('company_settings').findOne({});
+  // company_settings is Postgres now (Phase 10).
+  const companySettings = await knex('company_settings').first();
   const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
 
   res.setHeader('Content-Type', 'application/zip');

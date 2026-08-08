@@ -1904,6 +1904,123 @@ async function main() {
       { id: 'device_asset_tag', seq: devices.length },
     ]);
 
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 10 — Notifications, Inbox, Config/Settings, audit_logs, customReports
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── notifications — normalize recipientId/userId, link/navigateTo, read/isRead,
+    // subtitle/body down to single columns (see migration file header: 0 real
+    // divergence between any of these pairs across all 451 real rows). ──
+    const notifications = await dbo.collection('notifications').find({}).toArray();
+    counts.notifications = await upsertBatched('notifications', notifications.map((n) => ({
+      id: idStr(n._id), recipientId: idStr(n.recipientId ?? n.userId), title: n.title ?? null,
+      body: n.body ?? n.subtitle ?? n.message ?? null, type: n.type ?? null,
+      navigateTo: n.navigateTo ?? n.link ?? null, isRead: n.isRead ?? n.read ?? false,
+      readAt: toDate(n.readAt), createdAt: toDate(n.createdAt),
+    })));
+
+    const inboxItems = await dbo.collection('inbox_items').find({}).toArray();
+    counts.inbox_items = await upsertBatched('inbox_items', inboxItems.map((i) => ({
+      id: idStr(i._id), recipientId: idStr(i.recipientId), type: i.type ?? null, subType: i.subType ?? null,
+      title: i.title ?? null, subtitle: i.subtitle ?? null, referenceId: idStr(i.referenceId),
+      referenceModel: i.referenceModel ?? null, priority: i.priority ?? null, requiresAction: i.requiresAction ?? true,
+      status: i.status ?? null, actionTaken: i.actionTaken ?? null, actionedAt: toDate(i.actionedAt),
+      actionedBy: idStr(i.actionedBy), triggeredBy: idStr(i.triggeredBy), expiresAt: toDate(i.expiresAt),
+      createdAt: toDate(i.createdAt), updatedAt: toDate(i.updatedAt),
+    })));
+
+    // ── Config/Settings singletons — 0 real rows for 3 of these 4 in this
+    // environment (see migration file header); migrated as real tables regardless. ──
+    const companySettings = await dbo.collection('company_settings').find({}).toArray();
+    counts.company_settings = await upsertBatched('company_settings', companySettings.map((s) => ({
+      id: idStr(s._id), companyName: s.companyName ?? null, mission: s.mission ?? null, vision: s.vision ?? null,
+      coreValues: s.coreValues ?? null, address: s.address ?? null, phone: s.phone ?? null, email: s.email ?? null,
+      website: s.website ?? null, workStartTime: s.workStartTime ?? null, workEndTime: s.workEndTime ?? null,
+      primaryColor: s.primaryColor ?? null, gradientEndColor: s.gradientEndColor ?? null, gradientEnabled: s.gradientEnabled ?? null,
+      officeLatitude: s.officeLatitude ?? null, officeLongitude: s.officeLongitude ?? null, officeRadiusMeters: s.officeRadiusMeters ?? null,
+      facebook: s.facebook ?? null, twitter: s.twitter ?? null, linkedin: s.linkedin ?? null, instagram: s.instagram ?? null,
+      youtube: s.youtube ?? null, tiktok: s.tiktok ?? null, tagline: s.tagline ?? null, country: s.country ?? null,
+      currency: s.currency ?? null, timezone: s.timezone ?? null, fiscalYearStart: s.fiscalYearStart ?? null,
+      defaultVatRate: s.defaultVatRate ?? null, defaultTaxCategory: s.defaultTaxCategory ?? null,
+      logoPath: s.logoPath ?? null, logoFilename: s.logoFilename ?? null, termsPath: s.termsPath ?? null, termsFilename: s.termsFilename ?? null,
+      createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const taxConfig = await dbo.collection('tax_config').find({}).toArray();
+    counts.tax_config = await upsertBatched('tax_config', taxConfig.map((c) => ({
+      id: idStr(c._id), currency: c.currency ?? null, currencySymbol: c.currencySymbol ?? null,
+      incomeTax: c.incomeTax ? JSON.stringify(c.incomeTax) : null,
+      statutoryDeductions: c.statutoryDeductions ? JSON.stringify(c.statutoryDeductions) : null,
+      updatedAt: toDate(c.updatedAt),
+    })));
+
+    const overtimeConfig = await dbo.collection('overtime_config').find({}).toArray();
+    counts.overtime_config = await upsertBatched('overtime_config', overtimeConfig.map((c) => ({
+      id: idStr(c._id), nightStart: c.nightStart ?? null, nightEnd: c.nightEnd ?? null,
+      weekdayDayRate: c.weekdayDayRate ?? null, weekdayNightRate: c.weekdayNightRate ?? null,
+      weekendDayRate: c.weekendDayRate ?? null, weekendNightRate: c.weekendNightRate ?? null,
+      updatedAt: toDate(c.updatedAt),
+    })));
+
+    const commSettings = await dbo.collection('communication_settings').find({}).toArray();
+    counts.communication_settings = await upsertBatched('communication_settings', commSettings.map((s) => ({
+      id: idStr(s._id), emailProvider: s.emailProvider ?? null, smtpHost: s.smtpHost ?? null, smtpPort: s.smtpPort ?? null,
+      smtpUser: s.smtpUser ?? null, smtpFrom: s.smtpFrom ?? null, smsProvider: s.smsProvider ?? null,
+      smsApiKey: s.smsApiKey ?? null, smsFrom: s.smsFrom ?? null, notifyOnLeave: s.notifyOnLeave ?? null,
+      notifyOnPayroll: s.notifyOnPayroll ?? null, notifyOnAppraisal: s.notifyOnAppraisal ?? null,
+      createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const jdTemplates = await dbo.collection('jd_templates').find({}).toArray();
+    counts.jd_templates = await upsertBatched('jd_templates', jdTemplates.map((t) => ({
+      id: idStr(t._id), name: t.name ?? null, description: t.description ?? null, roles: t.roles ?? null,
+      pdfPath: t.pdfPath ?? null, pdfOriginalName: t.pdfOriginalName ?? null,
+      createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    const scheduledEvents = await dbo.collection('scheduled_events').find({}).toArray();
+    counts.scheduled_events = await upsertBatched('scheduled_events', scheduledEvents.map((e) => ({
+      id: idStr(e._id), title: e.title ?? null, type: e.type ?? null, description: e.description ?? null,
+      scheduledDate: e.scheduledDate ?? null, endDate: e.endDate ?? null, location: e.location ?? null,
+      audience: e.audience ?? null, department: e.department ?? null, createdBy: e.createdBy ?? null,
+      createdAt: toDate(e.createdAt), updatedAt: toDate(e.updatedAt),
+    })));
+
+    // ── audit_logs — high volume, no FK on userId (pre-login requests have none). ──
+    const auditLogs = await dbo.collection('audit_logs').find({}).toArray();
+    counts.audit_logs = await upsertBatched('audit_logs', auditLogs.map((a) => ({
+      id: idStr(a._id), userId: idStr(a.userId), userEmail: a.userEmail ?? null, userRole: a.userRole ?? null,
+      method: a.method ?? null, path: a.path ?? null, body: a.body ? JSON.stringify(a.body) : null,
+      statusCode: a.statusCode ?? null, ip: a.ip ?? null, userAgent: a.userAgent ?? null, timestamp: toDate(a.timestamp),
+    })));
+
+    // ── customReports (Reports module) ────────────────────────────────────────
+    const customReports = await dbo.collection('customReports').find({}).toArray();
+    counts.customReports = await upsertBatched('customReports', customReports.map((r) => ({
+      id: idStr(r._id), name: r.name ?? null, dataSources: r.dataSources ? JSON.stringify(r.dataSources) : null,
+      fields: r.fields ? JSON.stringify(r.fields) : null, filters: r.filters ? JSON.stringify(r.filters) : null,
+      groupBy: r.groupBy ?? null, dateRange: r.dateRange ? JSON.stringify(r.dateRange) : null, format: r.format ?? null,
+      schedule: r.schedule ? JSON.stringify(r.schedule) : null, createdBy: idStr(r.createdBy),
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // ── announcements + announcement_reads (found live/mounted during Phase 10's
+    // cross-cutting sweep, absent from every phase of the original plan) ─────────
+    const announcements = await dbo.collection('announcements').find({}).toArray();
+    counts.announcements = await upsertBatched('announcements', announcements.map((a) => ({
+      id: idStr(a._id), title: a.title ?? null, body: a.body ?? null, type: a.type ?? null,
+      audiences: a.audiences ? JSON.stringify(a.audiences) : null, audience: a.audience ?? null,
+      department: a.department ?? null, createdBy: idStr(a.createdBy), createdByName: a.createdByName ?? null,
+      createdAt: toDate(a.createdAt),
+    })));
+    // No natural per-read id in the Mongo shape (readBy was a flat array of user ids) —
+    // a fresh generated id, upserted on the real (announcementId, userId) semantic key
+    // so a re-run stays idempotent the same way Mongo's own $addToSet was.
+    const announcementReads = announcements.flatMap((a) => (a.readBy || []).map((userId) => ({
+      id: new ObjectId().toString(), announcementId: idStr(a._id), userId: idStr(userId), readAt: toDate(a.createdAt),
+    })));
+    counts.announcement_reads = await upsertBatched('announcement_reads', announcementReads, ['announcementId', 'userId']);
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

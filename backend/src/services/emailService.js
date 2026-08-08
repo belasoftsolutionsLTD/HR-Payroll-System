@@ -1,6 +1,11 @@
 const nodemailer = require('nodemailer');
 const logger = require('../lib/logger');
-const { findOne } = require('../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 10 cross-cutting sweep) — users has been Postgres since
+// Phase 1; this file's own unsubscribe check was still reading it off the Mongo helper,
+// silently serving stale/frozen data (new users, and any unsubscribe-preference change,
+// would never be seen) since that phase — same class of bug as reportFunctions.js's
+// `feedback` staleness finding earlier this phase.
+const { knex } = require('../functions/Database/pgDBFunctions');
 const { generateUnsubscribeToken } = require('../lib/email/unsubscribeToken');
 
 let transporter = null;
@@ -65,13 +70,13 @@ const sendEmail = async ({ to, subject, html, text, attachments = [], bypassUnsu
   // action they themselves triggered, not a marketing/notification stream.
   let finalHtml = html;
   if (!bypassUnsubscribe) {
-    const user = await findOne('users', { email: String(to).toLowerCase().trim() }, { projection: { _id: 1, unsubscribedFromEmails: 1 } }).catch(() => null);
+    const user = await knex('users').where({ email: String(to).toLowerCase().trim() }).select('id', 'unsubscribedFromEmails').first().catch(() => null);
     if (user) {
       if (user.unsubscribedFromEmails === true) {
         logger.info('Email skipped — recipient unsubscribed', { to, subject });
         return;
       }
-      finalHtml = html + unsubscribeFooter(user._id);
+      finalHtml = html + unsubscribeFooter(user.id);
     }
   }
 

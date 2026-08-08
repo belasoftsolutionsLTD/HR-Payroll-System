@@ -6,13 +6,16 @@ const { runAccrual, runYearEndCarryOver } = require('../leave/accrualEngine');
 const { getEffectiveScheduleForEmployee } = require('../../routes/attendance/attendanceFunctions');
 const { runDueScheduledReports } = require('../../routes/reports/reportFunctions');
 const { getLowStockLevels } = require('../../routes/inventory/inventoryLocationsFunctions');
-const { updateOne, findOne, findMany } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users (Phase 1), leave_requests/leave_types (Phase 3a),
 // attendance_records/shifts/work_schedules (Phase 3b), job_requisitions/
-// offboarding_records (Phase 4), employee_certifications (Phase 5), and
-// inventory_stock_levels (Phase 6) now live in Postgres; everything else this file
-// touches stays on the Mongo helpers above until its own phase.
+// offboarding_records (Phase 4), employee_certifications/enrollments (Phase 5),
+// inventory_stock_levels (Phase 6), and customReports (Phase 10) all now live in
+// Postgres — this file is fully migrated, no more Mongo helpers. (Two stale
+// `if (!global.dbo) return;` guards on checkLowStockAlerts/runTrainingAutomationRules
+// were removed in the Phase 10 sweep — both functions stopped touching Mongo in
+// earlier phases, so the guards would have silently no-op'd them post-cutover once
+// Mongo is decommissioned.)
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -33,7 +36,6 @@ const emailUser = async (userId, trigger, tokens, fallbackSubject, fallbackHtml)
 const LOW_STOCK_REALERT_MS = 20 * 60 * 60 * 1000;
 
 async function checkLowStockAlerts() {
-  if (!global.dbo) return;
   const lowLevels = await getLowStockLevels(null); // null = unrestricted, company-wide sweep
   const now = Date.now();
   const dueForAlert = lowLevels.filter((l) => !l.lastLowStockAlertAt || (now - new Date(l.lastLowStockAlertAt).getTime()) > LOW_STOCK_REALERT_MS);
@@ -483,7 +485,6 @@ async function closeExpiredRequisitions() {
 }
 
 async function runTrainingAutomationRules() {
-  if (!global.dbo) return;
   try {
     const { runDueScheduledAndExpiryRules } = require('../training/autoEnrollment');
     await runDueScheduledAndExpiryRules();

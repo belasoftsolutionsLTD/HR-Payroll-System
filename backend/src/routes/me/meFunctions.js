@@ -6,11 +6,9 @@ const { validateRequiredFields } = require('../../functions/Route Fns/routeFns')
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users/job_history/staff_notes (Phase 1), attendance_records (Phase 3b),
 // job_requisitions/candidates/applications (Phase 4), appraisal_records/goals/
-// reviews/review_cycles (Phase 5), and employee_awards/project_members/projects/
-// project_time_entries/tasks (Phase 9) now live in Postgres; everything else this
-// file touches (scheduled_events) is still unmigrated and stays on the Mongo
-// helpers via commonDBFunctions/global.dbo, imported separately below.
-const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// reviews/review_cycles (Phase 5), employee_awards/project_members/projects/
+// project_time_entries/tasks (Phase 9), and scheduled_events (Phase 10) now all
+// live in Postgres — this file is fully migrated, no more Mongo helpers.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
@@ -184,8 +182,8 @@ const contactHR = async (req, res) => {
     type: 'general', subType: 'staff_query',
     title: `${employee?.fullName ?? 'A staff member'} needs help: ${topic}`,
     subtitle: message || `Requesting HR to review/update "${topic}" on their profile.`,
-    referenceId: new ObjectId(empId), referenceModel: 'employees',
-    priority: 'normal', requiresAction: true, triggeredBy: req.user._id,
+    referenceId: empId, referenceModel: 'employees',
+    priority: 'normal', requiresAction: true, triggeredBy: req.user.id,
   });
 
   return returnFunction(res, 200, true, 'HR has been notified — they will follow up with you.');
@@ -324,20 +322,17 @@ const getMyAwards = async (req, res) => {
 };
 
 // ── Upcoming Events (training & team building) ────────────────────────────────
-// scheduled_events is unmigrated — stays Mongo; only the department lookup is Postgres.
+// scheduled_events is Postgres now (Phase 10).
 const getMyEvents = async (req, res) => {
   const today = new Date().toISOString().split('T')[0];
   const empId = myEmployeeId(req);
   const emp   = empId ? await pgDB.findOne('employees', { id: empId }) : null;
 
-  const filter = {
-    scheduledDate: { $gte: today },
-    $or: [
-      { audience: 'all' },
-      { audience: 'department', department: emp?.department ?? '__none__' },
-    ],
-  };
-  const events = await findMany('scheduled_events', filter, { sort: { scheduledDate: 1 }, limit: 20 });
+  const events = await pgDB.knex('scheduled_events')
+    .where('scheduledDate', '>=', today)
+    .where((qb) => qb.where({ audience: 'all' }).orWhere({ audience: 'department', department: emp?.department ?? '__none__' }))
+    .orderBy('scheduledDate', 'asc')
+    .limit(20);
   return returnFunction(res, 200, true, 'OK', events);
 };
 
@@ -515,8 +510,8 @@ const applyInternal = async (req, res) => {
     type: 'recruitment', subType: 'new_application',
     title: 'New Internal Application Received',
     subtitle: `${employee.fullName} applied for ${requisition.title}.`,
-    referenceId: new ObjectId(result.id), referenceModel: 'applications',
-    requiresAction: true, triggeredBy: req.user._id,
+    referenceId: result.id, referenceModel: 'applications',
+    requiresAction: true, triggeredBy: req.user.id,
   }).catch(() => {});
   {
     const hrUsers = await pgDB.knex('users').whereIn('role', ['super_admin', 'hr_manager']).whereNot('isActive', false).select('email');

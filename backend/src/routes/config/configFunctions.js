@@ -1,13 +1,11 @@
-const { ObjectId } = require('mongodb');
+const { ObjectId } = require('mongodb'); // still needed for pgMakeList's manual _id aliasing (bypasses pgDBFunctions' own automatic withMongoId)
 const path = require('path');
 const fs   = require('fs');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md, Phase 1) —
-// departments/branches/job_groups/designations/company_accounts now live in Postgres;
-// jd_templates/scheduled_events/communication_settings are unmigrated, so they stay on
-// the Mongo helpers above.
+// Postgres migration — departments/branches/job_groups/designations/company_accounts
+// have been Postgres since Phase 1; jd_templates/scheduled_events/communication_settings
+// are Postgres too now (Phase 10). Everything in this file goes through pgDB.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { notifyStaffByAudience } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -22,49 +20,6 @@ const emailStaffByAudience = async (audience, department, trigger, tokens, fallb
   if (!employees.length) return;
   const users = await pgDB.knex('users').whereIn('employeeId', employees.map(e => e.id)).select('email');
   users.filter(u => u.email).forEach(u => sendTemplatedEmail({ trigger, to: u.email, tokens, fallbackSubject, fallbackHtml }).catch(() => {}));
-};
-
-// ── Generic CRUD factory (Mongo collections) ──────────────────────────────────
-
-const makeList = (collection) => async (req, res) => {
-  const { page, limit, skip } = getPagination(req.query);
-  const [total, data] = await Promise.all([
-    countDocuments(collection, {}),
-    findMany(collection, {}, { skip, limit, sort: { name: 1 } }),
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(data, total, page, limit));
-};
-
-const makeCreate = (collection, requiredFields) => async (req, res) => {
-  if (!validateRequiredFields(req, res, requiredFields)) return;
-  const existing = await findOne(collection, { name: req.body.name });
-  if (existing) return returnFunction(res, 409, false, `A ${collection.replace(/_/g, ' ')} with this name already exists.`);
-  const doc = { ...req.body, createdAt: new Date(), updatedAt: new Date() };
-  const result = await insertOne(collection, doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
-};
-
-const makeUpdate = (collection) => async (req, res) => {
-  const update = { ...req.body, updatedAt: new Date() };
-  delete update._id;
-  await updateOne(collection, { _id: new ObjectId(req.params.id) }, { $set: update });
-  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
-};
-
-const makeDelete = (collection) => async (req, res) => {
-  await global.dbo.collection(collection).deleteOne({ _id: new ObjectId(req.params.id) });
-  return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
-};
-
-const makeBulkDelete = (collection) => async (req, res) => {
-  const { ids } = req.body;
-  if (!Array.isArray(ids) || !ids.length) {
-    return returnFunction(res, 400, false, 'ids must be a non-empty array.');
-  }
-  const result = await global.dbo.collection(collection).deleteMany({
-    _id: { $in: ids.map((id) => new ObjectId(id)) },
-  });
-  return returnFunction(res, 200, true, `${result.deletedCount} deleted.`, { deletedCount: result.deletedCount });
 };
 
 // ── Generic CRUD factory (Postgres tables) ────────────────────────────────────
@@ -211,13 +166,14 @@ const deleteDesignation = pgMakeDelete('designations'); // designation_departmen
 
 // ── JD Templates (reusable job description PDFs) ──────────────────────────────
 const listJdTemplates = async (req, res) => {
-  const data = await findMany('jd_templates', {}, { sort: { name: 1 } });
+  const data = await pgDB.knex('jd_templates').orderBy('name', 'asc');
   return returnFunction(res, 200, true, req.locale.success, data);
 };
 
 const createJdTemplate = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name'])) return;
   const doc = {
+    id: pgDB.newId(),
     name:            req.body.name.trim(),
     description:     req.body.description || '',
     roles:           req.body.roles       || '',
@@ -225,8 +181,8 @@ const createJdTemplate = async (req, res) => {
     pdfOriginalName: req.file ? req.file.originalname : null,
     createdAt: new Date(), updatedAt: new Date(),
   };
-  const result = await insertOne('jd_templates', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const [saved] = await pgDB.knex('jd_templates').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id });
 };
 
 const updateJdTemplate = async (req, res) => {
@@ -235,24 +191,24 @@ const updateJdTemplate = async (req, res) => {
   if (req.body.description !== undefined) update.description = req.body.description;
   if (req.body.roles       !== undefined) update.roles       = req.body.roles;
   if (req.file) {
-    const existing = await findOne('jd_templates', { _id: new ObjectId(req.params.id) });
+    const existing = await pgDB.knex('jd_templates').where({ id: req.params.id }).first();
     if (existing?.pdfPath) fs.unlink(path.resolve(existing.pdfPath), () => {});
     update.pdfPath         = req.file.path;
     update.pdfOriginalName = req.file.originalname;
   }
-  await updateOne('jd_templates', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await pgDB.knex('jd_templates').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteJdTemplate = async (req, res) => {
-  const existing = await findOne('jd_templates', { _id: new ObjectId(req.params.id) });
+  const existing = await pgDB.knex('jd_templates').where({ id: req.params.id }).first();
   if (existing?.pdfPath) fs.unlink(path.resolve(existing.pdfPath), () => {});
-  await global.dbo.collection('jd_templates').deleteOne({ _id: new ObjectId(req.params.id) });
+  await pgDB.knex('jd_templates').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted.');
 };
 
 const serveJdTemplate = async (req, res) => {
-  const template = await findOne('jd_templates', { _id: new ObjectId(req.params.id) });
+  const template = await pgDB.knex('jd_templates').where({ id: req.params.id }).first();
   if (!template?.pdfPath) return returnFunction(res, 404, false, 'No PDF for this template.');
   const filePath = path.resolve(template.pdfPath);
   if (!fs.existsSync(filePath)) return returnFunction(res, 404, false, 'File not found.');
@@ -269,19 +225,23 @@ const deleteCompanyAccount = pgMakeDelete('company_accounts');
 
 // ── Scheduled Events (Training sessions & Team Building events with dates) ────
 const listScheduledEvents = async (req, res) => {
-  const filter = {};
-  if (req.query.type) filter.type = req.query.type;
+  let query = pgDB.knex('scheduled_events');
+  if (req.query.type) query = query.where({ type: req.query.type });
   const upcoming = req.query.upcoming === 'true';
-  if (upcoming) filter.scheduledDate = { $gte: new Date().toISOString().split('T')[0] };
-  const events = await findMany('scheduled_events', filter, { sort: { scheduledDate: 1 } });
+  if (upcoming) query = query.where('scheduledDate', '>=', new Date().toISOString().split('T')[0]);
+  const events = await query.orderBy('scheduledDate', 'asc');
   return returnFunction(res, 200, true, req.locale.success, events);
 };
 
 const createScheduledEvent = async (req, res) => {
   const { title, type, description, scheduledDate, endDate, location, audience, department } = req.body;
   if (!title || !type || !scheduledDate) return returnFunction(res, 400, false, 'title, type, and scheduledDate are required.');
-  const doc = { title, type, description: description || '', scheduledDate, endDate: endDate || null, location: location || '', audience: audience || 'all', department: department || null, createdBy: req.user?.name || 'HR', createdAt: new Date(), updatedAt: new Date() };
-  const result = await insertOne('scheduled_events', doc);
+  const doc = {
+    id: pgDB.newId(), title, type, description: description || '', scheduledDate, endDate: endDate || null,
+    location: location || '', audience: audience || 'all', department: department || null,
+    createdBy: req.user?.name || 'HR', createdAt: new Date(), updatedAt: new Date(),
+  };
+  const [saved] = await pgDB.knex('scheduled_events').insert(doc).returning('*');
 
   // Fire-and-forget — notify affected staff without blocking the response
   const typeLabel = type === 'team_building' ? 'Team Building' : 'Training';
@@ -296,15 +256,24 @@ const createScheduledEvent = async (req, res) => {
     { typeLabel, eventTitle: title, bodyText },
     `${typeLabel}: ${title}`, `<p>${bodyText}</p>`).catch(() => {});
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id });
 };
 
-const updateScheduledEvent = makeUpdate('scheduled_events');
-const deleteScheduledEvent = makeDelete('scheduled_events');
+const updateScheduledEvent = async (req, res) => {
+  const update = { ...req.body, updatedAt: new Date() };
+  delete update.id;
+  await pgDB.knex('scheduled_events').where({ id: req.params.id }).update(update);
+  return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
+};
+
+const deleteScheduledEvent = async (req, res) => {
+  await pgDB.knex('scheduled_events').where({ id: req.params.id }).delete();
+  return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
+};
 
 // ── Communication Settings ────────────────────────────────────────────────────
 const getCommunicationSettings = async (req, res) => {
-  const settings = await findOne('communication_settings', {});
+  const settings = await pgDB.knex('communication_settings').first();
   return returnFunction(res, 200, true, req.locale.success, settings || {});
 };
 
@@ -315,11 +284,11 @@ const updateCommunicationSettings = async (req, res) => {
     if (req.body[key] !== undefined) patch[key] = req.body[key];
   }
   patch.updatedAt = new Date();
-  const existing = await findOne('communication_settings', {});
+  const existing = await pgDB.knex('communication_settings').first();
   if (existing) {
-    await updateOne('communication_settings', { _id: existing._id }, { $set: patch });
+    await pgDB.knex('communication_settings').where({ id: existing.id }).update(patch);
   } else {
-    await insertOne('communication_settings', { ...patch, createdAt: new Date() });
+    await pgDB.knex('communication_settings').insert({ id: pgDB.newId(), ...patch, createdAt: new Date() });
   }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };

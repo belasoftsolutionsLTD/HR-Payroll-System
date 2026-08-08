@@ -2,9 +2,8 @@
 // inventory_locations/inventory_items are Postgres now. The `counters` table stays the
 // same transactional-upsert pattern established in Phase 1 (staffNumberGenerator.js),
 // not the old Mongo findOneAndUpdate($inc). `company_settings` (used by sendPurchaseOrder
-// for PDF branding) is still Mongo — Phase 10 — left untouched.
+// for PDF branding) joined them in Phase 10.
 const { knex, newId } = require('../../functions/Database/pgDBFunctions');
-const { findOne } = require('../../functions/Database/commonDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { createStockMovement } = require('./inventoryMovementsFunctions');
@@ -167,7 +166,7 @@ const sendPurchaseOrder = async (req, res) => {
 
     // The table in the email body is a quick preview — a real PDF is attached so the
     // supplier has something they can actually file/print, not just read on screen.
-    const companySettings = await findOne('company_settings', {});
+    const companySettings = await knex('company_settings').first();
     const branding = { companyName: companySettings?.companyName, logoPath: companySettings?.logoPath };
     let attachments = [];
     try {

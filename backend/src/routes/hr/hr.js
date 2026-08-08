@@ -4,7 +4,6 @@ const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const {
   getOrgChart, getAllDocuments,
-  getNotifications, markNotificationRead, markAllNotificationsRead,
 } = require('./hrFunctions');
 
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
@@ -17,9 +16,9 @@ router.get('/org-chart', allowRoles([SUPER_ADMIN, HR_MANAGER, DEPT_HEAD]), Async
 // Documents (cross-employee document listing)
 router.get('/documents', allowRoles([SUPER_ADMIN, HR_MANAGER]), AsyncHandler(getAllDocuments));
 
-// Notifications (any authenticated user sees own)
-router.get('/notifications', AsyncHandler(getNotifications));
-router.patch('/notifications/read-all', AsyncHandler(markAllNotificationsRead));
-router.patch('/notifications/:id/read', AsyncHandler(markNotificationRead));
+// Notifications routes (getNotifications/markNotificationRead/markAllNotificationsRead)
+// were removed in the Phase 10 cross-cutting sweep — dead Mongo code with zero frontend
+// callers (see hrFunctions.js's header note). The live notification system is
+// /api/notifications + /api/inbox.
 
 module.exports = router;

@@ -1,10 +1,12 @@
+// Postgres migration (Phase 10) — company_settings is Postgres now (a
+// singleton one-row table).
 const path = require('path');
 const fs   = require('fs');
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 
 const getCompanySettings = async (req, res) => {
-  const settings = await findOne('company_settings', {});
+  const settings = await knex('company_settings').first();
   return returnFunction(res, 200, true, 'OK', settings || {});
 };
 
@@ -14,11 +16,11 @@ const updateCompanySettings = async (req, res) => {
   for (const key of ALLOWED) {
     if (req.body[key] !== undefined) patch[key] = req.body[key];
   }
-  const existing = await findOne('company_settings', {});
+  const existing = await knex('company_settings').first();
   if (existing) {
-    await updateOne('company_settings', { _id: existing._id }, { $set: patch });
+    await knex('company_settings').where({ id: existing.id }).update(patch);
   } else {
-    await insertOne('company_settings', { ...patch, createdAt: new Date() });
+    await knex('company_settings').insert({ id: newId(), ...patch, createdAt: new Date() });
   }
   return returnFunction(res, 200, true, 'Company settings updated.');
 };
@@ -30,17 +32,17 @@ const uploadCompanyFile = async (req, res, field) => {
     [`${field}Filename`]: req.file.originalname,
     updatedAt: new Date(),
   };
-  const existing = await findOne('company_settings', {});
+  const existing = await knex('company_settings').first();
   if (existing) {
-    await updateOne('company_settings', { _id: existing._id }, { $set: patch });
+    await knex('company_settings').where({ id: existing.id }).update(patch);
   } else {
-    await insertOne('company_settings', { ...patch, createdAt: new Date() });
+    await knex('company_settings').insert({ id: newId(), ...patch, createdAt: new Date() });
   }
   return returnFunction(res, 200, true, `${field} uploaded successfully.`, { path: req.file.path });
 };
 
 const serveCompanyLogo = async (req, res) => {
-  const settings = await findOne('company_settings', {});
+  const settings = await knex('company_settings').first();
   if (!settings?.logoPath) return returnFunction(res, 404, false, 'No logo uploaded.');
   const filePath = path.resolve(settings.logoPath);
   if (!fs.existsSync(filePath)) return returnFunction(res, 404, false, 'Logo file not found.');
@@ -52,7 +54,7 @@ const serveCompanyLogo = async (req, res) => {
 };
 
 const serveTermsPdf = async (req, res) => {
-  const settings = await findOne('company_settings', {});
+  const settings = await knex('company_settings').first();
   if (!settings?.termsPath) return returnFunction(res, 404, false, 'No terms PDF has been uploaded yet.');
   const filePath = path.resolve(settings.termsPath);
   if (!fs.existsSync(filePath)) return returnFunction(res, 404, false, 'Terms PDF file not found on server.');

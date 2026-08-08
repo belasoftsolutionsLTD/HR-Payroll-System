@@ -143,7 +143,9 @@ const buildCalculator = (config) => {
  */
 const loadTaxConfig = async () => {
   try {
-    const cfg = await global.dbo.collection('tax_config').findOne({});
+    // Postgres migration (Phase 10) — tax_config is Postgres now.
+    const { knex } = require('./Database/pgDBFunctions');
+    const cfg = await knex('tax_config').first();
     return cfg || KENYA_DEFAULT;
   } catch {
     return KENYA_DEFAULT;

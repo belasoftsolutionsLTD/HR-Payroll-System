@@ -1,3 +1,6 @@
+// Postgres migration (Phase 10) — overtime_config is Postgres now (a
+// singleton one-row table).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 
 // No hardcoded defaults on purpose — HR sets every multiplier themselves (per explicit
@@ -13,7 +16,7 @@ const DEFAULT_OVERTIME_CONFIG = {
 };
 
 const getOvertimeConfig = async (req, res) => {
-  const cfg = await global.dbo.collection('overtime_config').findOne({});
+  const cfg = await knex('overtime_config').first();
   return returnFunction(res, 200, true, 'OK', cfg || DEFAULT_OVERTIME_CONFIG);
 };
 
@@ -40,11 +43,11 @@ const updateOvertimeConfig = async (req, res) => {
     updatedAt: new Date(),
   };
 
-  const existing = await global.dbo.collection('overtime_config').findOne({});
+  const existing = await knex('overtime_config').first();
   if (existing) {
-    await global.dbo.collection('overtime_config').replaceOne({}, doc);
+    await knex('overtime_config').where({ id: existing.id }).update(doc);
   } else {
-    await global.dbo.collection('overtime_config').insertOne(doc);
+    await knex('overtime_config').insert({ id: newId(), ...doc });
   }
 
   return returnFunction(res, 200, true, 'Overtime rate configuration saved.', doc);

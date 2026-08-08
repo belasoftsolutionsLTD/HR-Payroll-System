@@ -1,4 +1,3 @@
-const { ObjectId } = require('mongodb'); // still needed for notifyHR's referenceId (inbox stays Mongo)
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
@@ -755,8 +754,8 @@ const maybeGenerateCertificate = async (enrollmentId) => {
     const certificateNumber = await generateCertificateNumber(year);
     const expiresAt = course.certificateValidityDays ? new Date(now.getTime() + course.certificateValidityDays * 86400000) : null;
 
-    // company_settings is unmigrated — stays Mongo.
-    const settings = await global.dbo.collection('company_settings').findOne({});
+    // company_settings is Postgres now (Phase 10).
+    const settings = await knex('company_settings').first();
     const pdfUrl = await generateCertificatePDF({
       employeeName: user?.name || 'Employee',
       courseTitle: course.title,
@@ -848,8 +847,8 @@ const uploadExternalCertificate = async (req, res) => {
     type: 'training', subType: 'external_cert_uploaded',
     title: 'External Certificate Submitted',
     subtitle: `An employee uploaded "${doc.name}" for verification.`,
-    referenceId: new ObjectId(result.id), referenceModel: 'externalCertificates',
-    requiresAction: true, triggeredBy: req.user._id,
+    referenceId: result.id, referenceModel: 'external_certificates',
+    requiresAction: true, triggeredBy: req.user.id,
   }).catch(() => {});
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id });

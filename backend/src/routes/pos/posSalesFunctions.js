@@ -1,6 +1,6 @@
 // Postgres migration (Phase 6) — pos_sales/pos_vouchers/inventory_locations/
 // inventory_items/inventory_stock_movements are all Postgres now. `company_settings`
-// (used by getReceipt for branding) is still Mongo (Phase 10) — left untouched.
+// (used by getReceipt for branding) joined them in Phase 10.
 // gl_accounts/gl_journal_entries (via glEngine) became Postgres in Phase 7 — voidSale's
 // own direct gl_journal_entries lookup below was fixed then too (found while sweeping
 // Phase 7 for cross-cutting touches); referenceId there is stored as an opaque string
@@ -8,7 +8,6 @@
 // items/cartDiscount/payments are JSONB columns (whole-replaced), matching the
 // established "no $push/$pull found" convention used throughout this phase.
 const { knex, newId } = require('../../functions/Database/pgDBFunctions');
-const { findOne } = require('../../functions/Database/commonDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { deductStockForSale, returnStockFromSale, getStockLevel } = require('../../lib/inventory/inventoryIntegration');
@@ -363,7 +362,7 @@ const getReceipt = async (req, res) => {
   if (!sale) return returnFunction(res, 404, false, req.locale.notFound);
   const [location, settings] = await Promise.all([
     knex('inventory_locations').where({ id: sale.locationId }).select('name').first(),
-    findOne('company_settings', {}),
+    knex('company_settings').first(),
   ]);
   const pdfBuffer = await generateReceiptPDF(sale, { companyName: settings?.companyName, location, logoPath: settings?.logoPath });
   res.setHeader('Content-Type', 'application/pdf');

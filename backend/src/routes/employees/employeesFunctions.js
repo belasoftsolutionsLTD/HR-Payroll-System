@@ -5,10 +5,9 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees, job_history, and their supporting lookups (Phase 1), leave_types/
-// leave_balances/leave_requests (Phase 3a), and offboarding_records (Phase 4) now
-// live in Postgres. Everything this file still touches that HASN'T been migrated yet
-// (notifications) stays on the Mongo helpers via commonDBFunctions/global.dbo,
-// imported separately below.
+// leave_balances/leave_requests (Phase 3a), offboarding_records (Phase 4), and
+// notifications (Phase 10) all now live in Postgres — this file is fully migrated,
+// no more Mongo helpers.
 const {
   findOne, findMany, insertOne, insertMany, updateOne, deleteOne, countDocuments,
   knex, replaceChildRows, addChildRow, deleteChildRow,
@@ -346,9 +345,9 @@ const createEmployee = async (req, res) => {
     type: 'hr', subType: 'new_employee',
     title: '👤 New Employee Added',
     subtitle: newEmpMsg,
-    referenceId: new ObjectId(employeeId), referenceModel: 'employees',
+    referenceId: employeeId, referenceModel: 'employees',
     requiresAction: false,
-    triggeredBy: req.user._id,
+    triggeredBy: req.user.id,
   }).catch(() => {});
 
   return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: employeeId, staffNumber });

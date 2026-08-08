@@ -1,14 +1,16 @@
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, findMany, countDocuments } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users (Phase 1), leave_balances/leave_requests/leave_types/public_holidays
-// (Phase 3a), attendance_records/shifts (Phase 3b), and goals (Phase 5) now live in
-// Postgres. Everything this file still touches that HASN'T been migrated yet
-// (expense_claims, job_postings, payroll_runs, communication_posts, scheduled_events,
-// inbox_items) stays on the Mongo helpers above.
+// (Phase 3a), attendance_records/shifts (Phase 3b), goals (Phase 5), expense_claims
+// (Phase 8), community_posts/job_requisitions (Phase 4/9), and scheduled_events/
+// inbox_items (Phase 10) now all live in Postgres — this file is fully migrated, no
+// more Mongo helpers. (job_postings/payroll_runs/communication_posts were stale
+// legacy collection names nothing ever wrote to — see the notes at each call site
+// below for their real, actively-written replacements.)
 const pgDB = require('../../functions/Database/pgDBFunctions');
 
 const today = () => new Date().toISOString().split('T')[0];
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 // ── Role-based summary ─────────────────────────────────────────────────────────
 const getDashboardSummary = async (req, res) => {
@@ -75,37 +77,47 @@ const getDashboardSummary = async (req, res) => {
   const [totalHeadcount, newHires, openPositions] = await Promise.all([
     pgDB.knex('employees').where({ status: 'active' }).count('* as count').first().then(r => Number(r.count)),
     pgDB.knex('employees').where({ status: 'active' }).where('createdAt', '>=', monthStart).count('* as count').first().then(r => Number(r.count)),
-    countDocuments('job_postings', { status: { $in: ['open', 'active'] } }),
+    // job_postings was a stale/legacy collection name nothing ever wrote to; job_requisitions
+    // is the real, actively-written table for this concept (see reportFunctions.js's
+    // executive dashboard, which uses the same table for the same stat).
+    pgDB.knex('job_requisitions').where({ status: 'open' }).count('* as count').first().then(r => Number(r.count)),
   ]);
 
-  // Payroll cycle status — payroll_runs is a stale/legacy collection name predating
-  // payroll_cycles (see reportFunctions.js's own note on the same legacy-model issue);
-  // this always resolves to "No active cycle" today regardless of migration, so left
-  // exactly as-is rather than silently "fixed" into something the app never actually did.
-  const currentPayroll = await findOne('payroll_runs', {}, { sort: { createdAt: -1 } });
+  // Payroll cycle status — payroll_runs was a stale/legacy collection name predating
+  // payroll_cycles that nothing ever wrote to (this stat always showed "No active cycle"
+  // regardless of Mongo vs Postgres); payroll_cycles is the real, actively-written table.
+  const currentPayroll = await pgDB.knex('payroll_cycles').orderBy('createdAt', 'desc').first();
 
   return returnFunction(res, 200, true, 'ok', {
     role: 'hr',
     totalHeadcount,
     newHires,
     openPositions,
-    payrollStatus: currentPayroll ? `${currentPayroll.period || 'Current'} cycle: ${currentPayroll.status || 'open'}` : 'No active cycle',
+    payrollStatus: currentPayroll ? `${MONTHS[currentPayroll.periodMonth - 1]} ${currentPayroll.periodYear} cycle: ${currentPayroll.status || 'open'}` : 'No active cycle',
   });
 };
 
 // ── Feed preview ──────────────────────────────────────────────────────────────
 const getFeedPreview = async (req, res) => {
-  const posts = await findMany('communication_posts', { type: { $ne: 'trust' } }, {
-    limit: 3,
-    sort: { createdAt: -1 },
-  });
+  // communication_posts was a stale/legacy collection name nothing ever wrote to;
+  // community_posts (Phase 9) is the real, actively-written table for the company feed.
+  // authorId references users, not employees — and the row already caches authorName
+  // as a fast path (see communicationFunctions.js's own enrichPost), so only posts
+  // missing that cache need the users→employees lookup.
+  const posts = await pgDB.knex('community_posts').whereNot({ type: 'trust' }).orderBy('createdAt', 'desc').limit(3);
 
-  const authorIds = [...new Set(posts.filter(p => p.authorId).map(p => String(p.authorId)))];
-  const authors = authorIds.length
-    ? await pgDB.knex('employees').whereIn('id', authorIds).select('id', 'fullName')
-    : [];
-  const authorById = Object.fromEntries(authors.map(a => [a.id, a]));
-  const enriched = posts.map(p => ({ ...p, authorName: (p.authorId && authorById[String(p.authorId)]?.fullName) || 'Unknown' }));
+  const needsLookup = posts.filter(p => !p.authorName && p.authorId);
+  const authorIds = [...new Set(needsLookup.map(p => p.authorId))];
+  const users = authorIds.length ? await pgDB.knex('users').whereIn('id', authorIds).select('id', 'employeeId') : [];
+  const employeeIds = [...new Set(users.map(u => u.employeeId).filter(Boolean))];
+  const employees = employeeIds.length ? await pgDB.knex('employees').whereIn('id', employeeIds).select('id', 'fullName') : [];
+  const empNameById = Object.fromEntries(employees.map(e => [e.id, e.fullName]));
+  const userToEmpName = Object.fromEntries(users.map(u => [u.id, empNameById[u.employeeId]]));
+
+  // _id alias: this route bypasses pgDBFunctions' own findMany/withMongoId wrapper
+  // (raw knex, needed for the whereNot/orderBy chain), so the frontend's still-Mongo-
+  // shaped FeedPost._id contract is aliased here manually.
+  const enriched = posts.map(p => ({ ...p, _id: p.id, authorName: p.authorName || userToEmpName[p.authorId] || 'Unknown' }));
 
   return returnFunction(res, 200, true, 'ok', enriched);
 };
@@ -113,11 +125,9 @@ const getFeedPreview = async (req, res) => {
 // ── Upcoming events ───────────────────────────────────────────────────────────
 const getUpcomingEvents = async (req, res) => {
   const todayStr = today();
-  const events = await findMany('scheduled_events', { scheduledDate: { $gte: todayStr } }, {
-    limit: 5,
-    sort: { scheduledDate: 1 },
-  });
-  return returnFunction(res, 200, true, 'ok', events);
+  const events = await pgDB.knex('scheduled_events').where('scheduledDate', '>=', todayStr).orderBy('scheduledDate', 'asc').limit(5);
+  // _id alias — see the matching note in getFeedPreview above.
+  return returnFunction(res, 200, true, 'ok', events.map(e => ({ ...e, _id: e.id })));
 };
 
 // ── Celebrations (birthdays + work anniversaries this week) ──────────────────
@@ -206,8 +216,9 @@ const getLiveAttendance = async (req, res) => {
 
 // ── Pending actions count ─────────────────────────────────────────────────────
 const getPendingActions = async (req, res) => {
-  const filter = { recipientId: req.user._id, requiresAction: true, status: { $in: ['unread', 'read'] } };
-  const items = await findMany('inbox_items', filter, { projection: { type: 1 } });
+  const items = await pgDB.knex('inbox_items')
+    .where({ recipientId: req.user.id, requiresAction: true }).whereIn('status', ['unread', 'read'])
+    .select('type');
 
   const byType = {};
   let total = 0;
