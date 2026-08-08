@@ -1561,6 +1561,349 @@ async function main() {
       createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
     })));
 
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 9 — Projects/Tasks, Communication/Social/Messages, Awards, IT
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── projects (+ members, invites, subtasks, notes, chat groups, messages) ──
+    const projects = await dbo.collection('projects').find({}).toArray();
+    counts.projects = await upsertBatched('projects', projects.map((p) => ({
+      id: idStr(p._id), name: p.name ?? null, description: p.description ?? null, status: p.status ?? null,
+      startDate: toDate(p.startDate), endDate: toDate(p.endDate), departments: p.departments ? JSON.stringify(p.departments) : null,
+      teamLeaderId: idStr(p.teamLeaderId), teamLeaderName: p.teamLeaderName ?? null, createdBy: idStr(p.createdBy),
+      supervisorName: p.supervisorName ?? null, completedAt: toDate(p.completedAt),
+      code: p.code ?? null, clientName: p.clientName ?? null, clientId: idStr(p.clientId), budget: p.budget ?? null,
+      currency: p.currency ?? null, billable: p.billable ?? null, createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+    })));
+
+    const projectMembers = await dbo.collection('project_members').find({}).toArray();
+    counts.project_members = await upsertBatched('project_members', projectMembers.map((m) => ({
+      id: idStr(m._id), projectId: idStr(m.projectId), employeeId: idStr(m.employeeId), name: m.name ?? null,
+      department: m.department ?? null, role: m.role ?? null, addedAt: toDate(m.addedAt),
+    })));
+
+    const projectInvites = await dbo.collection('project_invites').find({}).toArray();
+    counts.project_invites = await upsertBatched('project_invites', projectInvites.map((i) => ({
+      id: idStr(i._id), projectId: idStr(i.projectId), projectName: i.projectName ?? null, email: i.email ?? null,
+      name: i.name ?? null, projectRole: i.projectRole ?? null, contractEndDate: toDate(i.contractEndDate),
+      invitedBy: idStr(i.invitedBy), invitedByName: i.invitedByName ?? null, tokenHash: i.tokenHash ?? null,
+      status: i.status ?? null, expiresAt: toDate(i.expiresAt), createdEmployeeId: idStr(i.createdEmployeeId),
+      respondedAt: toDate(i.respondedAt), createdAt: toDate(i.createdAt), updatedAt: toDate(i.updatedAt),
+    })));
+
+    const projectSubtasks = await dbo.collection('project_subtasks').find({}).toArray();
+    counts.project_subtasks = await upsertBatched('project_subtasks', projectSubtasks.map((s) => ({
+      id: idStr(s._id), projectId: idStr(s.projectId), title: s.title ?? null, description: s.description ?? null,
+      department: s.department ?? null, attachmentFilename: s.attachmentFilename ?? null,
+      attachmentOriginalName: s.attachmentOriginalName ?? null, status: s.status ?? null,
+      assignedEmployees: s.assignedEmployees ? JSON.stringify(s.assignedEmployees) : null,
+      deptHeadReport: s.deptHeadReport ? JSON.stringify(s.deptHeadReport) : null,
+      createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    const projectNotes = await dbo.collection('project_notes').find({}).toArray();
+    counts.project_notes = await upsertBatched('project_notes', projectNotes.map((n) => ({
+      id: idStr(n._id), projectId: idStr(n.projectId), text: n.text ?? null, createdBy: idStr(n.createdBy),
+      createdByName: n.createdByName ?? null, createdAt: toDate(n.createdAt),
+    })));
+
+    const projectChatGroups = await dbo.collection('project_chat_groups').find({}).toArray();
+    counts.project_chat_groups = await upsertBatched('project_chat_groups', projectChatGroups.map((g) => ({
+      id: idStr(g._id), projectId: idStr(g.projectId), name: g.name ?? null,
+      memberIds: g.memberIds ? JSON.stringify(g.memberIds.map(idStr)) : null,
+      createdBy: idStr(g.createdBy), createdByName: g.createdByName ?? null,
+      createdAt: toDate(g.createdAt), updatedAt: toDate(g.updatedAt),
+    })));
+
+    // project_chat_groups must exist before project_messages (FK) — written above.
+    const projectMessages = await dbo.collection('project_messages').find({}).toArray();
+    counts.project_messages = await upsertBatched('project_messages', projectMessages.map((m) => ({
+      id: idStr(m._id), projectId: idStr(m.projectId), groupId: idStr(m.groupId), senderId: idStr(m.senderId),
+      senderName: m.senderName ?? null, senderRole: m.senderRole ?? null, message: m.message ?? null,
+      attachmentFilename: m.attachmentFilename ?? null, attachmentOriginalName: m.attachmentOriginalName ?? null,
+      attachmentMimeType: m.attachmentMimeType ?? null, createdAt: toDate(m.createdAt),
+    })));
+
+    // project_time_entries — NEW table (see migration file header), 0 real Mongo rows
+    // to migrate since the write endpoint never existed before this phase.
+    const projectTimeEntries = await dbo.collection('project_time_entries').find({}).toArray();
+    counts.project_time_entries = await upsertBatched('project_time_entries', projectTimeEntries.map((e) => ({
+      id: idStr(e._id), projectId: idStr(e.projectId), employeeId: idStr(e.employeeId), hours: e.hours ?? null,
+      date: toDate(e.date), task: e.task ?? null, description: e.description ?? null, billable: e.billable ?? false,
+      createdAt: toDate(e.createdAt), updatedAt: toDate(e.updatedAt),
+    })));
+
+    // ── task_templates (+ tasks and their child tables) ──────────────────────
+    const taskTemplates = await dbo.collection('task_templates').find({}).toArray();
+    counts.task_templates = await upsertBatched('task_templates', taskTemplates.map((t) => ({
+      id: idStr(t._id), name: t.name ?? null, description: t.description ?? null, triggerEvent: t.triggerEvent ?? null,
+      applyTo: t.applyTo ? JSON.stringify(t.applyTo) : null, isActive: t.isActive ?? true, isDefault: t.isDefault ?? false,
+      sections: t.sections ? JSON.stringify(t.sections) : null, tasks: t.tasks ? JSON.stringify(t.tasks) : null,
+      usageCount: t.usageCount ?? 0, createdBy: t.createdBy ?? null, createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    // task_templates must exist before tasks (FK templateId) — written above.
+    const tasks = await dbo.collection('tasks').find({}).toArray();
+    counts.tasks = await upsertBatched('tasks', tasks.map((t) => ({
+      id: idStr(t._id), title: t.title ?? null, description: t.description ?? null, notes: t.notes ?? null,
+      status: t.status ?? null, priority: t.priority ?? null, type: t.type ?? null,
+      assignedTo: idStr(t.assignedTo), assignedToName: t.assignedToName ?? null, assignedToRole: t.assignedToRole ?? null,
+      assignedBy: t.assignedBy ?? null, department: t.department ?? null,
+      module: t.module ?? null, linkedEmployeeId: idStr(t.linkedEmployeeId), linkedEmployeeName: t.linkedEmployeeName ?? null,
+      dueDate: t.dueDate ?? null, startDate: t.startDate ?? null, completedAt: toDate(t.completedAt),
+      documentAction: t.documentAction ?? null, documentStatus: t.documentStatus ?? null, meetingDuration: t.meetingDuration ?? null,
+      meetingLocation: t.meetingLocation ?? null, meetingLink: t.meetingLink ?? null,
+      meetingAttendees: t.meetingAttendees ? JSON.stringify(t.meetingAttendees.map(idStr)) : null,
+      deviceAction: t.deviceAction ?? null, deviceStatus: t.deviceStatus ?? null, approvalType: t.approvalType ?? null,
+      approverId: idStr(t.approverId), approvalDecision: t.approvalDecision ?? null,
+      blockedByTaskIds: t.blockedByTaskIds ? JSON.stringify(t.blockedByTaskIds.map(idStr)) : null,
+      attachments: t.attachments ? JSON.stringify(t.attachments) : null, tags: t.tags ? JSON.stringify(t.tags) : null,
+      templateId: idStr(t.templateId), templateTaskId: idStr(t.templateTaskId), sectionId: idStr(t.sectionId),
+      isTeam: t.isTeam ?? false, teamId: idStr(t.teamId),
+      createdBy: idStr(t.createdBy), createdByName: t.createdByName ?? null,
+      createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    // tasks must exist before their child tables (FK) — written above.
+    const taskSubtasks = tasks.flatMap((t) => (Array.isArray(t.subtasks) ? t.subtasks : []).map((s) => ({
+      id: idStr(s._id), taskId: idStr(t._id), title: s.title ?? null, isCompleted: s.isCompleted ?? false,
+      completedAt: toDate(s.completedAt),
+    })));
+    counts.task_subtasks = await upsertBatched('task_subtasks', taskSubtasks);
+
+    const taskComments = tasks.flatMap((t) => (Array.isArray(t.comments) ? t.comments : []).map((c) => ({
+      id: idStr(c._id), taskId: idStr(t._id), authorId: idStr(c.authorId), authorName: c.authorName ?? null,
+      text: c.text ?? null, mentions: c.mentions ? JSON.stringify(c.mentions) : null, createdAt: toDate(c.createdAt),
+    })));
+    counts.task_comments = await upsertBatched('task_comments', taskComments);
+
+    // No natural id on activity entries — plain insert, no upsert conflict key.
+    const taskActivity = tasks.flatMap((t) => (Array.isArray(t.activity) ? t.activity : []).map((a) => ({
+      taskId: idStr(t._id), action: a.action ?? null, fromValue: a.from != null ? String(a.from) : null,
+      toValue: a.to != null ? String(a.to) : null, performedByName: a.performedByName ?? null, timestamp: toDate(a.timestamp),
+    })));
+    counts.task_activity = await upsertBatched('task_activity', taskActivity, null);
+
+    // ── communities (+ members) ───────────────────────────────────────────────
+    const communities = await dbo.collection('communities').find({}).toArray();
+    counts.communities = await upsertBatched('communities', communities.map((c) => ({
+      id: idStr(c._id), companyId: idStr(c.companyId), name: c.name ?? null, description: c.description ?? null,
+      icon: c.icon ?? null, type: c.type ?? null, adminIds: c.adminIds ? JSON.stringify(c.adminIds.map(idStr)) : null,
+      isArchived: c.isArchived ?? false, createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt),
+    })));
+
+    // communities must exist before community_members (FK) — written above.
+    const communityMembers = communities.flatMap((c) => (Array.isArray(c.memberIds) ? c.memberIds : []).map((personId) => ({
+      communityId: idStr(c._id), personId: idStr(personId), addedAt: toDate(c.createdAt),
+    })));
+    counts.community_members = await upsertBatched('community_members', communityMembers, ['communityId', 'personId']);
+
+    // ── community_posts (+ reactions) and post_comments ───────────────────────
+    const communityPosts = await dbo.collection('community_posts').find({}).toArray();
+    counts.community_posts = await upsertBatched('community_posts', communityPosts.map((p) => ({
+      id: idStr(p._id), companyId: idStr(p.companyId), communityId: idStr(p.communityId), authorId: idStr(p.authorId),
+      authorName: p.authorName ?? null, type: p.type ?? null, content: p.content ?? null,
+      imageUrls: p.imageUrls ? JSON.stringify(p.imageUrls) : null, isPinned: p.isPinned ?? false, pinExpiresAt: toDate(p.pinExpiresAt),
+      celebrationType: p.celebrationType ?? null, celebrationEmployeeId: idStr(p.celebrationEmployeeId),
+      celebrationEmployeeName: p.celebrationEmployeeName ?? null, visibility: p.visibility ?? null,
+      commentCount: p.commentCount ?? 0, viewCount: p.viewCount ?? 0, createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+    })));
+
+    // community_posts must exist before community_post_reactions (FK) — written above.
+    const communityPostReactions = communityPosts.flatMap((p) => (Array.isArray(p.reactions) ? p.reactions : []).map((r) => ({
+      postId: idStr(p._id), userId: idStr(r.employeeId), type: r.type ?? null, reactedAt: toDate(r.reactedAt),
+    })));
+    counts.community_post_reactions = await upsertBatched('community_post_reactions', communityPostReactions, ['postId', 'userId', 'type']);
+
+    // Top-level comments must be written before replies (self-FK parentCommentId) —
+    // sort so every parent lands before its children within the same batch pass.
+    const postComments = await dbo.collection('post_comments').find({}).toArray();
+    const postCommentsSorted = [...postComments].sort((a, b) => (a.parentCommentId ? 1 : 0) - (b.parentCommentId ? 1 : 0));
+    counts.post_comments = await upsertBatched('post_comments', postCommentsSorted.map((c) => ({
+      id: idStr(c._id), postId: idStr(c.postId), authorId: idStr(c.authorId), content: c.content ?? null,
+      parentCommentId: idStr(c.parentCommentId), reactions: c.reactions ? JSON.stringify(c.reactions) : null,
+      createdAt: toDate(c.createdAt),
+    })));
+
+    // ── 1:1 meetings (Communication module's — see migration file header for the
+    // communication_one_on_ones vs Phase 5's own one_on_ones naming collision note) ──
+    const commOneOnOnes = await dbo.collection('one_on_ones').find({}).toArray();
+    counts.communication_one_on_ones = await upsertBatched('communication_one_on_ones', commOneOnOnes.map((s) => ({
+      id: idStr(s._id), companyId: idStr(s.companyId), participant1Id: idStr(s.participant1Id),
+      participant2Id: idStr(s.participant2Id), frequency: s.frequency ?? null, dayOfWeek: s.dayOfWeek ?? null,
+      time: s.time ?? null, duration: s.duration ?? null, videoLink: s.videoLink ?? null, isActive: s.isActive ?? true,
+      createdAt: toDate(s.createdAt),
+    })));
+
+    // communication_one_on_ones must exist before meeting_notes (FK) — written above.
+    const meetingNotes = await dbo.collection('meeting_notes').find({}).toArray();
+    counts.meeting_notes = await upsertBatched('meeting_notes', meetingNotes.map((n) => ({
+      id: idStr(n._id), seriesId: idStr(n.seriesId), companyId: idStr(n.companyId), date: toDate(n.date),
+      agendaItems: n.agendaItems ? JSON.stringify(n.agendaItems) : null, notes: n.notes ?? null,
+      actionItems: n.actionItems ? JSON.stringify(n.actionItems) : null, aiSummary: n.aiSummary ?? null,
+      status: n.status ?? null, createdAt: toDate(n.createdAt), updatedAt: toDate(n.updatedAt),
+    })));
+
+    // ── trust_reports (anonymous, no FKs) ─────────────────────────────────────
+    const trustReports = await dbo.collection('trust_reports').find({}).toArray();
+    counts.trust_reports = await upsertBatched('trust_reports', trustReports.map((r) => ({
+      id: idStr(r._id), trackingCode: r.trackingCode ?? null, category: r.category ?? null, description: r.description ?? null,
+      attachmentUrl: r.attachmentUrl ?? null, status: r.status ?? null, adminNotes: r.adminNotes ?? null,
+      responseToReporter: r.responseToReporter ?? null, createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // ── conversations (+ participants) and messages (+ reads) ────────────────
+    const conversations = await dbo.collection('conversations').find({}).toArray();
+    counts.conversations = await upsertBatched('conversations', conversations.map((c) => ({
+      id: idStr(c._id), isGroup: c.isGroup ?? false, groupName: c.groupName ?? null, lastMessage: c.lastMessage ?? null,
+      lastMessageAt: toDate(c.lastMessageAt), createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt),
+    })));
+
+    // conversations must exist before conversation_participants (FK) — written above.
+    // Folds participants[] + admins[] into one row per person with an isAdmin flag.
+    const conversationParticipants = conversations.flatMap((c) => {
+      const adminSet = new Set((c.admins || []).map(idStr));
+      return (Array.isArray(c.participants) ? c.participants : []).map((p) => ({
+        conversationId: idStr(c._id), userId: idStr(p), isAdmin: adminSet.has(idStr(p)), joinedAt: toDate(c.createdAt),
+      }));
+    });
+    counts.conversation_participants = await upsertBatched('conversation_participants', conversationParticipants, ['conversationId', 'userId']);
+
+    const messages = await dbo.collection('messages').find({}).toArray();
+    counts.messages = await upsertBatched('messages', messages.map((m) => ({
+      id: idStr(m._id), conversationId: idStr(m.conversationId), senderId: idStr(m.senderId), senderName: m.senderName ?? null,
+      content: m.content ?? null, attachments: m.attachments ? JSON.stringify(m.attachments) : null,
+      isSystem: m.isSystem ?? false, createdAt: toDate(m.createdAt),
+    })));
+
+    // messages must exist before message_reads (FK) — written above.
+    const messageReads = messages.flatMap((m) => (Array.isArray(m.readBy) ? m.readBy : []).map((userId) => ({
+      messageId: idStr(m._id), userId: idStr(userId), readAt: toDate(m.createdAt),
+    })));
+    counts.message_reads = await upsertBatched('message_reads', messageReads, ['messageId', 'userId']);
+
+    // ── award_types, employee_awards, company_values ──────────────────────────
+    const awardTypes = await dbo.collection('award_types').find({}).toArray();
+    counts.award_types = await upsertBatched('award_types', awardTypes.map((t) => ({
+      id: idStr(t._id), name: t.name ?? null, description: t.description ?? null, category: t.category ?? null,
+      repeatInterval: t.repeatInterval ?? null, nextDueDate: toDate(t.nextDueDate),
+      createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    // award_types must exist before employee_awards (FK) — written above.
+    const employeeAwards = await dbo.collection('employee_awards').find({}).toArray();
+    counts.employee_awards = await upsertBatched('employee_awards', employeeAwards.map((a) => ({
+      id: idStr(a._id), employeeId: idStr(a.employeeId), employeeName: a.employeeName ?? null, staffNumber: a.staffNumber ?? null,
+      department: a.department ?? null, awardTypeId: idStr(a.awardTypeId), awardTypeName: a.awardTypeName ?? null,
+      notes: a.notes ?? null, year: a.year ?? null, awardedBy: a.awardedBy ?? null, awardedAt: toDate(a.awardedAt),
+    })));
+
+    const companyValues = await dbo.collection('company_values').find({}).toArray();
+    counts.company_values = await upsertBatched('company_values', companyValues.map((v) => ({
+      id: idStr(v._id), companyId: idStr(v.companyId), name: v.name ?? null, description: v.description ?? null,
+      emoji: v.emoji ?? null, color: v.color ?? null, order: v.order ?? null, isActive: v.isActive ?? true,
+      createdAt: toDate(v.createdAt), updatedAt: toDate(v.updatedAt),
+    })));
+
+    // ── kudos (+ reactions, comments) ──────────────────────────────────────────
+    // company_values must exist before kudos (FK valueId) — written above.
+    const kudos = await dbo.collection('kudos').find({}).toArray();
+    counts.kudos = await upsertBatched('kudos', kudos.map((k) => ({
+      id: idStr(k._id), companyId: idStr(k.companyId), giverId: idStr(k.giverId), giverName: k.giverName ?? null,
+      recipientIds: k.recipientIds ? JSON.stringify(k.recipientIds.map(idStr)) : null, valueId: idStr(k.valueId),
+      valueName: k.valueName ?? null, valueColor: k.valueColor ?? null, message: k.message ?? null, gifUrl: k.gifUrl ?? null,
+      visibility: k.visibility ?? null, pointsAwarded: k.pointsAwarded ?? 0, createdAt: toDate(k.createdAt),
+    })));
+
+    // kudos must exist before its child tables (FK) — written above.
+    const kudosReactions = kudos.flatMap((k) => (Array.isArray(k.reactions) ? k.reactions : []).map((r) => ({
+      kudosId: idStr(k._id), personId: idStr(r.employeeId), type: r.type ?? null, reactedAt: toDate(r.reactedAt),
+    })));
+    counts.kudos_reactions = await upsertBatched('kudos_reactions', kudosReactions, ['kudosId', 'personId', 'type']);
+
+    const kudosComments = kudos.flatMap((k) => (Array.isArray(k.comments) ? k.comments : []).map((c) => ({
+      id: idStr(c._id), kudosId: idStr(k._id), authorId: idStr(c.authorId), authorName: c.authorName ?? null,
+      content: c.content ?? null, createdAt: toDate(c.createdAt),
+    })));
+    counts.kudos_comments = await upsertBatched('kudos_comments', kudosComments);
+
+    // ── award_programs (+ nominations), recognition_settings ─────────────────
+    const awardPrograms = await dbo.collection('award_programs').find({}).toArray();
+    counts.award_programs = await upsertBatched('award_programs', awardPrograms.map((p) => ({
+      id: idStr(p._id), companyId: idStr(p.companyId), name: p.name ?? null, description: p.description ?? null,
+      icon: p.icon ?? null, frequency: p.frequency ?? null, status: p.status ?? null, nominationBy: p.nominationBy ?? null,
+      selectionMethod: p.selectionMethod ?? null, prizeType: p.prizeType ?? null, prizeDescription: p.prizeDescription ?? null,
+      announcementMethod: p.announcementMethod ?? null, currentCycleStart: toDate(p.currentCycleStart),
+      currentCycleEnd: toDate(p.currentCycleEnd), createdBy: idStr(p.createdBy), createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+    })));
+
+    // award_programs/company_values must exist before award_nominations (FK) — written above.
+    const awardNominations = await dbo.collection('award_nominations').find({}).toArray();
+    counts.award_nominations = await upsertBatched('award_nominations', awardNominations.map((n) => ({
+      id: idStr(n._id), companyId: idStr(n.companyId), programId: idStr(n.programId), nomineeId: idStr(n.nomineeId),
+      nominatorId: idStr(n.nominatorId), reason: n.reason ?? null, valueId: idStr(n.valueId), cycleStart: toDate(n.cycleStart),
+      isWinner: n.isWinner ?? false, createdAt: toDate(n.createdAt), announcedAt: toDate(n.announcedAt),
+    })));
+
+    const recognitionSettings = await dbo.collection('recognition_settings').find({}).toArray();
+    counts.recognition_settings = await upsertBatched('recognition_settings', recognitionSettings.map((s) => ({
+      id: idStr(s._id), companyId: idStr(s.companyId), pointsEnabled: s.pointsEnabled ?? false, pointsPerKudos: s.pointsPerKudos ?? null,
+      monthlyBudget: s.monthlyBudget ?? null, allowSelfRecognition: s.allowSelfRecognition ?? false,
+      minMessageLength: s.minMessageLength ?? null, maxKudosPerDay: s.maxKudosPerDay ?? null,
+      notifyOnKudos: s.notifyOnKudos ?? true, postToFeed: s.postToFeed ?? true, updatedAt: toDate(s.updatedAt),
+    })));
+
+    // ── devices (+ assignment history), software_apps (+ assignments), it_requests ──
+    const devices = await dbo.collection('devices').find({}).toArray();
+    counts.devices = await upsertBatched('devices', devices.map((d) => ({
+      id: idStr(d._id), name: d.name ?? null, type: d.type ?? null, brand: d.brand ?? null, model: d.model ?? null,
+      serialNumber: d.serialNumber ?? null, assetTag: d.assetTag ?? null, purchaseDate: toDate(d.purchaseDate),
+      purchasePrice: d.purchasePrice ?? null, currency: d.currency ?? null, vendor: d.vendor ?? null,
+      warrantyExpiry: toDate(d.warrantyExpiry), condition: d.condition ?? null, status: d.status ?? null,
+      assignedTo: idStr(d.assignedTo), assignedAt: toDate(d.assignedAt), notes: d.notes ?? null,
+      createdAt: toDate(d.createdAt), updatedAt: toDate(d.updatedAt),
+    })));
+
+    // devices must exist before device_assignment_history (FK) — written above.
+    const deviceAssignmentHistory = devices.flatMap((d) => (Array.isArray(d.assignmentHistory) ? d.assignmentHistory : []).map((h) => ({
+      deviceId: idStr(d._id), employeeId: idStr(h.employeeId), assignedAt: toDate(h.assignedAt),
+      returnedAt: toDate(h.returnedAt), condition: h.condition ?? null,
+    })));
+    counts.device_assignment_history = await upsertBatched('device_assignment_history', deviceAssignmentHistory, null);
+
+    const softwareApps = await dbo.collection('software_apps').find({}).toArray();
+    counts.software_apps = await upsertBatched('software_apps', softwareApps.map((s) => ({
+      id: idStr(s._id), name: s.name ?? null, category: s.category ?? null, vendor: s.vendor ?? null,
+      licenseType: s.licenseType ?? null, totalLicenses: s.totalLicenses ?? null, assignedLicenses: s.assignedLicenses ?? 0,
+      costPerLicense: s.costPerLicense ?? null, currency: s.currency ?? null, billingCycle: s.billingCycle ?? null,
+      renewalDate: toDate(s.renewalDate), adminId: idStr(s.adminId), loginUrl: s.loginUrl ?? null, status: s.status ?? null,
+      notes: s.notes ?? null, createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    // software_apps must exist before software_assignments (FK) — written above.
+    const softwareAssignments = softwareApps.flatMap((s) => (Array.isArray(s.assignedEmployeeIds) ? s.assignedEmployeeIds : []).map((empId) => ({
+      softwareId: idStr(s._id), employeeId: idStr(empId), assignedAt: toDate(s.updatedAt || s.createdAt),
+    })));
+    counts.software_assignments = await upsertBatched('software_assignments', softwareAssignments, ['softwareId', 'employeeId']);
+
+    const itRequests = await dbo.collection('it_requests').find({}).toArray();
+    counts.it_requests = await upsertBatched('it_requests', itRequests.map((r) => ({
+      id: idStr(r._id), requesterId: idStr(r.requesterId), employeeId: idStr(r.employeeId), type: r.type ?? null,
+      subject: r.subject ?? null, description: r.description ?? null, priority: r.priority ?? null, status: r.status ?? null,
+      assignedTo: idStr(r.assignedTo), resolution: r.resolution ?? null, resolvedAt: toDate(r.resolvedAt),
+      deviceId: idStr(r.deviceId), deviceName: r.deviceName ?? null, repairNotes: r.repairNotes ?? null,
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // device_asset_tag counter — devices.assetTag used a countDocuments-based
+    // pseudo-sequence with no real Mongo `counters` doc backing it (see migration
+    // file header). Seed it from the real current device count so the next
+    // generated tag continues where the old logic would have left off, same
+    // "don't start fresh at 0" lesson as every earlier phase's counter migration.
+    counts.counters = (counts.counters || 0) + await upsertBatched('counters', [
+      { id: 'device_asset_tag', seq: devices.length },
+    ]);
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

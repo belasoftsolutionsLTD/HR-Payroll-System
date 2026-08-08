@@ -1,4 +1,6 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 9) — tasks/task_templates are Postgres now.
+// employees are Postgres since Phase 1.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
 
 function calculateDueDate(referenceDate, dueOffset) {
@@ -12,27 +14,19 @@ function calculateDueDate(referenceDate, dueOffset) {
 
 async function resolveAssignee(assignTo, employee) {
   const role = (assignTo || '').toLowerCase();
-  if (role === 'employee') return { id: employee._id, name: employee.fullName };
+  if (role === 'employee') return { id: employee.id, name: employee.fullName };
   if (role === 'manager' && employee.managerId) {
-    try {
-      const mgr = await global.dbo.collection('employees').findOne(
-        { _id: new ObjectId(String(employee.managerId)) },
-        { projection: { _id: 1, fullName: 1 } }
-      );
-      if (mgr) return { id: mgr._id, name: mgr.fullName };
-    } catch { /* fall through */ }
+    const mgr = await knex('employees').where({ id: String(employee.managerId) }).select('id', 'fullName').first();
+    if (mgr) return { id: mgr.id, name: mgr.fullName };
   }
   // HR, IT, Finance, Legal → role-based (no concrete assignee yet)
   return { id: null, name: assignTo || 'HR' };
 }
 
 async function triggerTasksFromTemplate(templateId, employeeId, referenceDate) {
-  const tplOid = typeof templateId === 'string' ? new ObjectId(templateId) : templateId;
-  const empOid = typeof employeeId === 'string' ? new ObjectId(employeeId) : employeeId;
-
   const [template, employee] = await Promise.all([
-    global.dbo.collection('task_templates').findOne({ _id: tplOid }),
-    global.dbo.collection('employees').findOne({ _id: empOid }),
+    knex('task_templates').where({ id: String(templateId) }).first(),
+    knex('employees').where({ id: String(employeeId) }).first(),
   ]);
 
   if (!template || !employee) return { created: 0, error: 'Not found' };
@@ -43,6 +37,7 @@ async function triggerTasksFromTemplate(templateId, employeeId, referenceDate) {
     const assignee = await resolveAssignee(tplTask.assignTo, employee);
 
     docs.push({
+      id: newId(),
       title:            tplTask.title,
       description:      tplTask.description || '',
       status:           'not_started',
@@ -56,27 +51,19 @@ async function triggerTasksFromTemplate(templateId, employeeId, referenceDate) {
       department:       employee.department || '',
 
       module:           template.triggerEvent || 'general',
-      linkedEmployeeId: employee._id,
+      linkedEmployeeId: employee.id,
       linkedEmployeeName: employee.fullName,
 
-      templateId:       template._id,
+      templateId:       template.id,
       templateTaskId:   tplTask._id || null,
       sectionId:        tplTask.sectionId || null,
 
       dueDate:          dueDate.toISOString().split('T')[0],
 
-      subtasks:         [],
-      blockedByTaskIds: [],
-      attachments:      [],
-      comments:         [],
-      activity: [{
-        action:          'created',
-        from:            null,
-        to:              null,
-        performedByName: 'System',
-        timestamp:       new Date(),
-      }],
-      tags: [],
+      meetingAttendees: JSON.stringify([]),
+      blockedByTaskIds: JSON.stringify([]),
+      attachments:      JSON.stringify([]),
+      tags:             JSON.stringify([]),
 
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -85,7 +72,10 @@ async function triggerTasksFromTemplate(templateId, employeeId, referenceDate) {
 
   if (!docs.length) return { created: 0 };
 
-  await global.dbo.collection('tasks').insertMany(docs);
+  const saved = await knex('tasks').insert(docs).returning('id');
+  await knex('task_activity').insert(docs.map((d) => ({
+    taskId: d.id, action: 'created', fromValue: null, toValue: null, performedByName: 'System', timestamp: d.createdAt,
+  })));
 
   const notified = new Set();
   for (const doc of docs) {

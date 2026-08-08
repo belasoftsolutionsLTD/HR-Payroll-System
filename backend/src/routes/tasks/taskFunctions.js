@@ -1,12 +1,14 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 9) — tasks/task_templates (+ child tables
+// task_subtasks/task_comments/task_activity) are Postgres now. employees/users
+// have been Postgres since Phase 1.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee } = require('../../functions/HR/notifyUser');
 const { triggerTasksFromTemplate } = require('../../lib/tasks/triggerTasksFromTemplate');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 const emailTaskAssigned = async (employeeId, employeeName, title, dueDate, priority) => {
-  const empUser = await findOne('users', { employeeId }, { projection: { email: 1 } });
+  const empUser = await knex('users').where({ employeeId }).select('email').first();
   if (!empUser?.email) return;
   const tokens = { employeeName, taskTitle: title, dueInfo: dueDate ? `Due ${dueDate} · ` : '', priority: priority || 'medium' };
   return sendTemplatedEmail({
@@ -24,37 +26,37 @@ const VALID_TYPES     = ['action', 'document', 'form', 'meeting', 'equipment', '
 const VALID_MODULES   = ['onboarding', 'offboarding', 'hr', 'it', 'performance', 'general', 'new_hire', 'probation_end', 'role_change'];
 const VALID_PRIORITIES = ['high', 'medium', 'low'];
 
-const safeId = (v) => { try { return v ? new ObjectId(v) : null; } catch { return null; } };
-
 const getPagination = (q) => {
   const page  = Math.max(1, parseInt(q.page) || 1);
   const limit = Math.min(100, parseInt(q.limit) || 50);
   return { page, limit, skip: (page - 1) * limit };
 };
 
-function buildTaskFilter(q, extra = {}) {
-  const f = { ...extra };
-  if (q.status)   f.status   = q.status;
-  if (q.priority) f.priority = q.priority;
-  if (q.type)     f.type     = q.type;
-  if (q.module)   f.module   = q.module;
-  if (q.search)   f.title    = { $regex: q.search, $options: 'i' };
-  if (q.department) f.department = q.department;
-  if (q.linkedEmployeeId) {
-    const id = safeId(q.linkedEmployeeId);
-    if (id) f.linkedEmployeeId = id;
-  }
+// dueDate is stored as a plain 'YYYY-MM-DD' text column (matches real data —
+// never a timestamp), so every comparison here is a string comparison.
+function applyTaskFilter(query, q, extra = {}) {
+  let r = query;
+  if (extra.assignedTo) r = r.where({ assignedTo: extra.assignedTo });
+  if (extra.isTeam !== undefined) r = r.where({ isTeam: extra.isTeam });
+  if (extra.department) r = r.where({ department: extra.department });
+  if (q.status)   r = r.where({ status: q.status });
+  if (q.priority) r = r.where({ priority: q.priority });
+  if (q.type)     r = r.where({ type: q.type });
+  if (q.module)   r = r.where({ module: q.module });
+  if (q.search)   r = r.whereILike('title', `%${q.search}%`);
+  if (q.department) r = r.where({ department: q.department });
+  if (q.linkedEmployeeId) r = r.where({ linkedEmployeeId: q.linkedEmployeeId });
 
   const today = new Date().toISOString().split('T')[0];
   const weekEnd = new Date(); weekEnd.setDate(weekEnd.getDate() + 7);
   const weekEndStr = weekEnd.toISOString().split('T')[0];
 
-  if (q.dateFilter === 'today')    f.dueDate = today;
-  if (q.dateFilter === 'overdue')  { f.status = { $nin: ['completed'] }; f.dueDate = { $lt: today }; }
-  if (q.dateFilter === 'this_week') f.dueDate = { $gte: today, $lte: weekEndStr };
-  if (q.dateFilter === 'no_date')  f.dueDate = { $exists: false };
+  if (q.dateFilter === 'today')     r = r.where({ dueDate: today });
+  if (q.dateFilter === 'overdue')   r = r.whereNot({ status: 'completed' }).where('dueDate', '<', today);
+  if (q.dateFilter === 'this_week') r = r.where('dueDate', '>=', today).where('dueDate', '<=', weekEndStr);
+  if (q.dateFilter === 'no_date')   r = r.whereNull('dueDate');
 
-  return f;
+  return r;
 }
 
 // ── Stats card counts ─────────────────────────────────────────────────────────
@@ -63,84 +65,88 @@ const getTaskStats = async (req, res) => {
   const weekStart = new Date(); weekStart.setDate(weekStart.getDate() - 7);
   const weekStartStr = weekStart.toISOString().split('T')[0];
 
-  let baseFilter = {};
-  if (!HR.includes(req.user?.role)) {
-    baseFilter.assignedTo = req.user.employeeId;
-  }
+  const myEmployeeId = req.user?.employeeId ? String(req.user.employeeId) : null;
+  const base = () => {
+    let q = knex('tasks');
+    if (!HR.includes(req.user?.role)) q = q.where({ assignedTo: myEmployeeId });
+    return q;
+  };
 
-  const [total, dueToday, overdue, completedThisWeek] = await Promise.all([
-    countDocuments('tasks', { ...baseFilter, status: { $ne: 'completed' } }),
-    countDocuments('tasks', { ...baseFilter, dueDate: today, status: { $nin: ['completed', 'blocked'] } }),
-    countDocuments('tasks', { ...baseFilter, status: 'overdue' }),
-    countDocuments('tasks', { ...baseFilter, status: 'completed', completedAt: { $gte: weekStartStr } }),
+  const [[{ count: total }], [{ count: dueToday }], [{ count: overdue }], [{ count: completedThisWeek }]] = await Promise.all([
+    base().whereNot({ status: 'completed' }).count('* as count'),
+    base().where({ dueDate: today }).whereNotIn('status', ['completed', 'blocked']).count('* as count'),
+    base().where({ status: 'overdue' }).count('* as count'),
+    base().where({ status: 'completed' }).where('completedAt', '>=', weekStartStr).count('* as count'),
   ]);
 
-  return returnFunction(res, 200, true, 'OK', { total, dueToday, overdue, completedThisWeek });
+  return returnFunction(res, 200, true, 'OK', {
+    total: Number(total), dueToday: Number(dueToday), overdue: Number(overdue), completedThisWeek: Number(completedThisWeek),
+  });
 };
 
 // ── My Tasks (personal) ───────────────────────────────────────────────────────
 const getMyTasks = async (req, res) => {
   if (!req.user.employeeId) return returnFunction(res, 200, true, 'OK', []);
-  const filter = buildTaskFilter(req.query, { assignedTo: req.user.employeeId });
-  const tasks  = await findMany('tasks', filter, { sort: { dueDate: 1, priority: 1 } });
+  const myId = String(req.user.employeeId);
+  const query = applyTaskFilter(knex('tasks'), req.query, { assignedTo: myId });
+  const tasks = await query.orderBy('dueDate', 'asc').orderBy('priority', 'asc');
   return returnFunction(res, 200, true, 'OK', tasks);
 };
 
 // ── Team Tasks — tasks assigned to 2+ people at once ──────────────────────────
 const listTeamTasks = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-
-  let baseFilter = { isTeam: true };
+  const extra = { isTeam: true };
 
   // Dept heads only see team tasks within their department
   if (!HR.includes(req.user?.role)) {
-    const empId = req.user.employeeId;
+    const empId = req.user.employeeId ? String(req.user.employeeId) : null;
     if (!empId) return returnFunction(res, 200, true, 'OK', { data: [], total: 0 });
-    const me = await findOne('employees', { _id: empId });
+    const me = await knex('employees').where({ id: empId }).select('department').first();
     if (!me?.department) return returnFunction(res, 200, true, 'OK', { data: [], total: 0 });
-    baseFilter.department = me.department;
+    extra.department = me.department;
   }
 
-  const filter = buildTaskFilter(req.query, baseFilter);
+  const [{ count }] = await applyTaskFilter(knex('tasks'), req.query, extra).count('* as count');
+  const data = await applyTaskFilter(knex('tasks'), req.query, extra).orderBy('dueDate', 'asc').limit(limit).offset(skip);
 
-  const [total, data] = await Promise.all([
-    countDocuments('tasks', filter),
-    findMany('tasks', filter, { sort: { dueDate: 1 }, skip, limit }),
-  ]);
-
-  return returnFunction(res, 200, true, 'OK', { data, total, page, limit });
+  return returnFunction(res, 200, true, 'OK', { data, total: Number(count), page, limit });
 };
 
 // ── All Tasks (HR admin) ──────────────────────────────────────────────────────
 const listAllTasks = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const filter = buildTaskFilter(req.query);
-
-  const [total, data] = await Promise.all([
-    countDocuments('tasks', filter),
-    findMany('tasks', filter, { sort: { dueDate: 1, createdAt: -1 }, skip, limit }),
-  ]);
-  return returnFunction(res, 200, true, 'OK', { data, total, page, limit });
+  const [{ count }] = await applyTaskFilter(knex('tasks'), req.query).count('* as count');
+  const data = await applyTaskFilter(knex('tasks'), req.query).orderBy('dueDate', 'asc').orderBy('createdAt', 'desc').limit(limit).offset(skip);
+  return returnFunction(res, 200, true, 'OK', { data, total: Number(count), page, limit });
 };
 
 // ── Task detail ───────────────────────────────────────────────────────────────
 const _isTaskHR = (role) => ['super_admin', 'hr_manager'].includes(role);
 
 const getTaskDetail = async (req, res) => {
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const task = await knex('tasks').where({ id: req.params.id }).first();
   if (!task) return returnFunction(res, 404, false, 'Task not found.');
   if (!_isTaskHR(req.user?.role) && String(task.assignedTo) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
 
+  const [subtasks, comments, activity] = await Promise.all([
+    knex('task_subtasks').where({ taskId: task.id }),
+    knex('task_comments').where({ taskId: task.id }).orderBy('createdAt', 'asc'),
+    knex('task_activity').where({ taskId: task.id }).orderBy('timestamp', 'asc'),
+  ]);
+
   // Fetch linked employee mini-card if present
   let linkedEmployee = null;
   if (task.linkedEmployeeId) {
-    linkedEmployee = await findOne('employees', { _id: task.linkedEmployeeId },
-      { projection: { fullName: 1, designation: 1, department: 1 } });
+    linkedEmployee = await knex('employees').where({ id: task.linkedEmployeeId }).select('fullName', 'designation', 'department').first();
   }
 
-  return returnFunction(res, 200, true, 'OK', { ...task, linkedEmployee });
+  return returnFunction(res, 200, true, 'OK', {
+    ...task, linkedEmployee, subtasks, comments,
+    activity: activity.map((a) => ({ action: a.action, from: a.fromValue, to: a.toValue, performedByName: a.performedByName, timestamp: a.timestamp })),
+  });
 };
 
 // ── Create task ───────────────────────────────────────────────────────────────
@@ -156,6 +162,7 @@ const createTask = async (req, res) => {
   if (!title) return returnFunction(res, 400, false, 'Title is required.');
 
   const baseDoc = (emp) => ({
+    id: newId(),
     title:           title.trim(),
     description:     description || '',
     notes:           notes || '',
@@ -163,13 +170,13 @@ const createTask = async (req, res) => {
     priority:        VALID_PRIORITIES.includes(priority) ? priority : 'medium',
     type:            VALID_TYPES.includes(type) ? type : 'action',
 
-    assignedTo:      emp._id,
+    assignedTo:      emp.id,
     assignedToName:  emp.fullName,
     assignedBy:      req.user?.name || 'HR',
     department:      emp.department || '',
 
     module:          VALID_MODULES.includes(mod) ? mod : 'general',
-    linkedEmployeeId: safeId(linkedEmployeeId),
+    linkedEmployeeId: linkedEmployeeId || null,
     linkedEmployeeName: null,
 
     dueDate:    dueDate  || null,
@@ -182,29 +189,20 @@ const createTask = async (req, res) => {
     meetingDuration: meetingDuration || null,
     meetingLocation: meetingLocation || '',
     meetingLink:     meetingLink || '',
-    meetingAttendees: (meetingAttendees || []).map(safeId).filter(Boolean),
+    meetingAttendees: JSON.stringify((meetingAttendees || []).filter(Boolean)),
     deviceAction:    deviceAction || null,
     deviceStatus:    deviceAction ? 'pending' : null,
     approvalType:    approvalType || '',
-    approverId:      safeId(approverId),
+    approverId:      approverId || null,
     approvalDecision: approvalDecision || 'pending',
 
-    subtasks: (Array.isArray(subtasks) ? subtasks : []).map(t => ({
-      _id: new ObjectId(), title: t.title || t, isCompleted: false, completedAt: null,
-    })),
-    blockedByTaskIds: (Array.isArray(blockedByTaskIds) ? blockedByTaskIds : []).map(safeId).filter(Boolean),
-    attachments: [],
-    comments: [],
-    activity: [{
-      action: 'created', from: null, to: null,
-      performedByName: req.user?.name || 'HR',
-      timestamp: new Date(),
-    }],
-    tags: Array.isArray(tags) ? tags : [],
+    blockedByTaskIds: JSON.stringify((Array.isArray(blockedByTaskIds) ? blockedByTaskIds : []).filter(Boolean)),
+    attachments: JSON.stringify([]),
+    tags: JSON.stringify(Array.isArray(tags) ? tags : []),
     templateId: null,
     templateTaskId: null,
 
-    createdBy: req.user?._id,
+    createdBy: req.user?.id ?? null,
     createdByName: req.user?.name || 'HR',
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -212,122 +210,125 @@ const createTask = async (req, res) => {
 
   // Bulk department assign
   if (bulkDepartment) {
-    const employees = await findMany('employees', { department: bulkDepartment, status: 'active' },
-      { projection: { _id: 1, fullName: 1, department: 1 } });
+    const employees = await knex('employees').where({ department: bulkDepartment, status: 'active' }).select('id', 'fullName', 'department');
     if (!employees.length) return returnFunction(res, 404, false, 'No active employees in that department.');
-    await global.dbo.collection('tasks').insertMany(employees.map(baseDoc));
+    const docs = employees.map((e) => baseDoc(e));
+    await knex('tasks').insert(docs);
+    for (const d of docs) {
+      await knex('task_activity').insert({ taskId: d.id, action: 'created', fromValue: null, toValue: null, performedByName: d.createdByName, timestamp: d.createdAt });
+    }
     return returnFunction(res, 201, true, `Assigned to ${employees.length} employees.`);
   }
 
   // Multi-assignee (≥2): one task per employee, all stamped as a team task
   const assignedToIds = req.body.assignedToIds;
   if (Array.isArray(assignedToIds) && assignedToIds.length >= 2) {
-    const safeIds = assignedToIds.map(safeId).filter(Boolean);
-    const employees = await findMany('employees', { _id: { $in: safeIds } },
-      { projection: { _id: 1, fullName: 1, department: 1 } });
+    const safeIds = assignedToIds.filter(Boolean).map(String);
+    const employees = await knex('employees').whereIn('id', safeIds).select('id', 'fullName', 'department');
     if (!employees.length) return returnFunction(res, 404, false, 'Employees not found.');
-    const teamId = new ObjectId();
-    await global.dbo.collection('tasks').insertMany(employees.map(emp => ({
-      ...baseDoc(emp),
-      isTeam: true,
-      teamId,
-    })));
-    employees.forEach(emp => notifyEmployee(emp._id, {
+    const teamId = newId();
+    const docs = employees.map((emp) => ({ ...baseDoc(emp), isTeam: true, teamId }));
+    await knex('tasks').insert(docs);
+    for (const d of docs) {
+      await knex('task_activity').insert({ taskId: d.id, action: 'created', fromValue: null, toValue: null, performedByName: d.createdByName, timestamp: d.createdAt });
+    }
+    employees.forEach((emp) => notifyEmployee(emp.id, {
       title: `New team task: ${title}`,
       body:  `${dueDate ? `Due ${dueDate} · ` : ''}${priority || 'medium'} priority`,
       type:  'task',
     }));
-    employees.forEach(emp => emailTaskAssigned(emp._id, emp.fullName, title, dueDate, priority));
+    employees.forEach((emp) => emailTaskAssigned(emp.id, emp.fullName, title, dueDate, priority));
     return returnFunction(res, 201, true, `Assigned to ${employees.length} employees.`);
   }
 
   if (!assignedTo) return returnFunction(res, 400, false, 'assignedTo or bulkDepartment is required.');
-  const employee = await findOne('employees', { _id: safeId(assignedTo) });
+  const employee = await knex('employees').where({ id: assignedTo }).select('id', 'fullName', 'department').first();
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
 
   const doc = baseDoc(employee);
 
   // Resolve linked employee name
   if (doc.linkedEmployeeId) {
-    const linked = await findOne('employees', { _id: doc.linkedEmployeeId }, { projection: { fullName: 1 } });
+    const linked = await knex('employees').where({ id: doc.linkedEmployeeId }).select('fullName').first();
     if (linked) doc.linkedEmployeeName = linked.fullName;
   }
 
-  const result = await insertOne('tasks', doc);
+  const [saved] = await knex('tasks').insert(doc).returning('*');
+  await knex('task_activity').insert({ taskId: saved.id, action: 'created', fromValue: null, toValue: null, performedByName: doc.createdByName, timestamp: doc.createdAt });
 
-  notifyEmployee(employee._id, {
+  notifyEmployee(employee.id, {
     title: `New task: ${title}`,
     body:  `${dueDate ? `Due ${dueDate} · ` : ''}${priority || 'medium'} priority`,
     type:  'task',
   });
-  emailTaskAssigned(employee._id, employee.fullName, title, dueDate, priority);
+  emailTaskAssigned(employee.id, employee.fullName, title, dueDate, priority);
 
-  return returnFunction(res, 201, true, 'Task created.', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Task created.', { id: saved.id });
 };
 
 // ── Update task ───────────────────────────────────────────────────────────────
+const JSONB_TASK_FIELDS = ['meetingAttendees', 'blockedByTaskIds', 'attachments', 'tags'];
+
 const updateTask = async (req, res) => {
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const task = await knex('tasks').where({ id: req.params.id }).first();
   if (!task) return returnFunction(res, 404, false, 'Task not found.');
 
-  const update = { ...req.body, updatedAt: new Date() };
-  delete update._id;
-  if (update.assignedTo) update.assignedTo = safeId(update.assignedTo);
-  if (update.linkedEmployeeId) update.linkedEmployeeId = safeId(update.linkedEmployeeId);
-  if (update.blockedByTaskIds) update.blockedByTaskIds = update.blockedByTaskIds.map(safeId).filter(Boolean);
+  const update = { updatedAt: new Date() };
+  for (const [key, val] of Object.entries(req.body)) {
+    if (key === 'id' || key === '_id') continue;
+    update[key] = JSONB_TASK_FIELDS.includes(key) ? JSON.stringify(val) : val;
+  }
   if (update.status === 'completed' && !task.completedAt) update.completedAt = new Date();
 
-  // Build activity entry
+  // Build activity entries
   const activityEntries = [];
   if (update.status && update.status !== task.status) {
-    activityEntries.push({ action: 'status_changed', from: task.status, to: update.status, performedByName: req.user?.name, timestamp: new Date() });
+    activityEntries.push({ taskId: task.id, action: 'status_changed', fromValue: task.status, toValue: update.status, performedByName: req.user?.name, timestamp: new Date() });
   }
   if (update.dueDate && update.dueDate !== task.dueDate) {
-    activityEntries.push({ action: 'due_date_changed', from: task.dueDate, to: update.dueDate, performedByName: req.user?.name, timestamp: new Date() });
+    activityEntries.push({ taskId: task.id, action: 'due_date_changed', fromValue: task.dueDate, toValue: update.dueDate, performedByName: req.user?.name, timestamp: new Date() });
   }
   if (update.assignedTo && String(update.assignedTo) !== String(task.assignedTo)) {
-    activityEntries.push({ action: 'reassigned', from: task.assignedToName, to: update.assignedToName || '', performedByName: req.user?.name, timestamp: new Date() });
+    activityEntries.push({ taskId: task.id, action: 'reassigned', fromValue: task.assignedToName, toValue: update.assignedToName || '', performedByName: req.user?.name, timestamp: new Date() });
   }
 
-  const patch = { $set: update };
-  if (activityEntries.length) patch.$push = { activity: { $each: activityEntries } };
-
-  await global.dbo.collection('tasks').updateOne({ _id: task._id }, patch);
+  await knex('tasks').where({ id: task.id }).update(update);
+  if (activityEntries.length) await knex('task_activity').insert(activityEntries);
   return returnFunction(res, 200, true, 'Updated.');
 };
 
 // ── Delete task ───────────────────────────────────────────────────────────────
 const deleteTask = async (req, res) => {
-  await global.dbo.collection('tasks').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('task_subtasks').where({ taskId: req.params.id }).delete();
+  await knex('task_comments').where({ taskId: req.params.id }).delete();
+  await knex('task_activity').where({ taskId: req.params.id }).delete();
+  await knex('tasks').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, 'Deleted.');
 };
 
 // ── Mark task complete ────────────────────────────────────────────────────────
 const completeTask = async (req, res) => {
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const task = await knex('tasks').where({ id: req.params.id }).first();
   if (!task) return returnFunction(res, 404, false, 'Task not found.');
   if (!_isTaskHR(req.user?.role) && String(task.assignedTo) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
 
   // Dependency check
-  if ((task.blockedByTaskIds || []).length) {
-    const blockers = await global.dbo.collection('tasks').countDocuments({
-      _id: { $in: task.blockedByTaskIds }, status: { $ne: 'completed' },
-    });
-    if (blockers > 0) return returnFunction(res, 400, false, 'Complete prerequisite tasks first.');
+  const blockedByIds = task.blockedByTaskIds || [];
+  if (blockedByIds.length) {
+    const [{ count: blockers }] = await knex('tasks').whereIn('id', blockedByIds).whereNot({ status: 'completed' }).count('* as count');
+    if (Number(blockers) > 0) return returnFunction(res, 400, false, 'Complete prerequisite tasks first.');
   }
 
-  await global.dbo.collection('tasks').updateOne({ _id: task._id }, {
-    $set: { status: 'completed', completedAt: new Date(), updatedAt: new Date() },
-    $push: { activity: { action: 'completed', from: task.status, to: 'completed', performedByName: req.user?.name, timestamp: new Date() } },
-  });
+  const now = new Date();
+  await knex('tasks').where({ id: task.id }).update({ status: 'completed', completedAt: now, updatedAt: now });
+  await knex('task_activity').insert({ taskId: task.id, action: 'completed', fromValue: task.status, toValue: 'completed', performedByName: req.user?.name, timestamp: now });
 
-  // Auto-unblock tasks that were blocked by this one
-  await global.dbo.collection('tasks').updateMany(
-    { blockedByTaskIds: task._id, status: 'blocked' },
-    { $set: { status: 'not_started', updatedAt: new Date() } }
-  );
+  // Auto-unblock tasks that were blocked by this one — blockedByTaskIds is JSONB,
+  // so a Postgres-native "contains this id" check via the @> operator.
+  await knex('tasks').where({ status: 'blocked' }).whereRaw('"blockedByTaskIds" @> ?', [JSON.stringify([task.id])])
+    .update({ status: 'not_started', updatedAt: now });
 
   // Approval-type tasks have a dedicated approverId field that nothing in the codebase
   // ever notified — the assignee could mark it complete and the approver would never
@@ -341,7 +342,7 @@ const completeTask = async (req, res) => {
       type: 'general',
     }).catch(() => {});
 
-    const approverUser = await findOne('users', { employeeId: task.approverId }, { projection: { email: 1 } });
+    const approverUser = await knex('users').where({ employeeId: task.approverId }).select('email').first();
     if (approverUser?.email) {
       const tokens = { taskTitle: task.title, assigneeName: req.user?.name || 'the assignee' };
       sendTemplatedEmail({
@@ -357,97 +358,97 @@ const completeTask = async (req, res) => {
 
 // ── Reopen task ───────────────────────────────────────────────────────────────
 const reopenTask = async (req, res) => {
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const task = await knex('tasks').where({ id: req.params.id }).first();
   if (!task) return returnFunction(res, 404, false, 'Task not found.');
   if (!_isTaskHR(req.user?.role) && String(task.assignedTo) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
-  await global.dbo.collection('tasks').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    {
-      $set: { status: 'not_started', completedAt: null, updatedAt: new Date() },
-      $push: { activity: { action: 'status_changed', from: 'completed', to: 'not_started', performedByName: req.user?.name, timestamp: new Date() } },
-    }
-  );
+  const now = new Date();
+  await knex('tasks').where({ id: task.id }).update({ status: 'not_started', completedAt: null, updatedAt: now });
+  await knex('task_activity').insert({ taskId: task.id, action: 'status_changed', fromValue: 'completed', toValue: 'not_started', performedByName: req.user?.name, timestamp: now });
   return returnFunction(res, 200, true, 'Task reopened.');
+};
+
+// ── Quick status patch — used by staff portal (moved from tasks.js's own
+// inline handler, which bypassed this file's shared VALID_STATUSES/auth pattern) ─
+const updateTaskStatus = async (req, res) => {
+  const { status } = req.body;
+  if (!VALID_STATUSES.includes(status)) return returnFunction(res, 400, false, 'Invalid status.');
+  const task = await knex('tasks').where({ id: req.params.id }).first();
+  if (!task) return returnFunction(res, 404, false, 'Task not found.');
+  const isHR = _isTaskHR(req.user?.role);
+  if (!isHR && String(task.assignedTo) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Forbidden.');
+  const patch = { status, updatedAt: new Date() };
+  if (status === 'completed') patch.completedAt = new Date();
+  await knex('tasks').where({ id: task.id }).update(patch);
+  return returnFunction(res, 200, true, 'Status updated.');
 };
 
 // ── Add comment ───────────────────────────────────────────────────────────────
 const addComment = async (req, res) => {
   const { text } = req.body;
   if (!text?.trim()) return returnFunction(res, 400, false, 'Comment text is required.');
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const task = await knex('tasks').where({ id: req.params.id }).first();
   if (!task) return returnFunction(res, 404, false, 'Task not found.');
   if (!_isTaskHR(req.user?.role) && String(task.assignedTo) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
 
   const comment = {
-    _id:       new ObjectId(),
-    authorId:  req.user?._id,
+    id: newId(),
+    taskId: task.id,
+    authorId: req.user?.id ?? null,
     authorName: req.user?.name || 'Unknown',
-    text:      text.trim(),
-    mentions:  [],
+    text: text.trim(),
+    mentions: JSON.stringify([]),
     createdAt: new Date(),
   };
 
-  await global.dbo.collection('tasks').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    {
-      $push: { comments: comment },
-      $set:  { updatedAt: new Date() },
-    }
-  );
+  const [saved] = await knex('task_comments').insert(comment).returning('*');
+  await knex('tasks').where({ id: task.id }).update({ updatedAt: new Date() });
 
-  return returnFunction(res, 201, true, 'Comment added.', comment);
+  return returnFunction(res, 201, true, 'Comment added.', saved);
 };
 
 // ── Add subtask ───────────────────────────────────────────────────────────────
 const addSubtask = async (req, res) => {
   const { title } = req.body;
   if (!title?.trim()) return returnFunction(res, 400, false, 'Subtask title required.');
-  const taskCheck = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const taskCheck = await knex('tasks').where({ id: req.params.id }).first();
   if (!taskCheck) return returnFunction(res, 404, false, 'Task not found.');
   if (!_isTaskHR(req.user?.role) && String(taskCheck.assignedTo) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
 
-  const subtask = { _id: new ObjectId(), title: title.trim(), isCompleted: false, completedAt: null };
-
-  await global.dbo.collection('tasks').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $push: { subtasks: subtask }, $set: { updatedAt: new Date() } }
-  );
-  return returnFunction(res, 201, true, 'Subtask added.', subtask);
+  const subtask = { id: newId(), taskId: taskCheck.id, title: title.trim(), isCompleted: false, completedAt: null };
+  const [saved] = await knex('task_subtasks').insert(subtask).returning('*');
+  await knex('tasks').where({ id: taskCheck.id }).update({ updatedAt: new Date() });
+  return returnFunction(res, 201, true, 'Subtask added.', saved);
 };
 
 // ── Toggle subtask ────────────────────────────────────────────────────────────
 const toggleSubtask = async (req, res) => {
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
+  const task = await knex('tasks').where({ id: req.params.id }).first();
   if (!task) return returnFunction(res, 404, false, 'Task not found.');
   if (!_isTaskHR(req.user?.role) && String(task.assignedTo) !== String(req.user?.employeeId)) {
     return returnFunction(res, 403, false, 'Forbidden.');
   }
 
-  const subId = new ObjectId(req.params.subId);
-  const subtask = (task.subtasks || []).find(s => String(s._id) === String(subId));
+  const subtask = await knex('task_subtasks').where({ id: req.params.subId, taskId: task.id }).first();
   if (!subtask) return returnFunction(res, 404, false, 'Subtask not found.');
 
   const completed = !subtask.isCompleted;
-  await global.dbo.collection('tasks').updateOne(
-    { _id: task._id, 'subtasks._id': subId },
-    { $set: { 'subtasks.$.isCompleted': completed, 'subtasks.$.completedAt': completed ? new Date() : null, updatedAt: new Date() } }
-  );
+  await knex('task_subtasks').where({ id: subtask.id }).update({ isCompleted: completed, completedAt: completed ? new Date() : null });
+  await knex('tasks').where({ id: task.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Subtask updated.', { isCompleted: completed });
 };
 
 // ── Export CSV ────────────────────────────────────────────────────────────────
 const exportTasksCSV = async (req, res) => {
-  const filter = buildTaskFilter(req.query);
-  const tasks  = await findMany('tasks', filter, { sort: { dueDate: 1 } });
+  const tasks = await applyTaskFilter(knex('tasks'), req.query).orderBy('dueDate', 'asc');
 
   const header = 'Task,Type,Assignee,Module,Priority,Status,Due Date,Completed At,Created By\n';
-  const rows   = tasks.map(t => [
+  const rows = tasks.map((t) => [
     `"${(t.title || '').replace(/"/g, '""')}"`,
     t.type, t.assignedToName, t.module, t.priority, t.status,
     t.dueDate || '', t.completedAt ? String(t.completedAt).split('T')[0] : '',
@@ -461,40 +462,28 @@ const exportTasksCSV = async (req, res) => {
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
 const getTaskAnalytics = async (req, res) => {
-  const [rawStatus, rawModule, rawDept, totalCompleted, totalOverdue, total] = await Promise.all([
-    global.dbo.collection('tasks').aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]).toArray(),
-    global.dbo.collection('tasks').aggregate([
-      { $group: { _id: '$module', count: { $sum: 1 }, overdue: { $sum: { $cond: [{ $eq: ['$status', 'overdue'] }, 1, 0] } } } },
-      { $sort: { count: -1 } },
-    ]).toArray(),
-    global.dbo.collection('tasks').aggregate([
-      { $match: { department: { $exists: true, $ne: null, $ne: '' } } },
-      { $group: { _id: '$department', overdue: { $sum: { $cond: [{ $eq: ['$status', 'overdue'] }, 1, 0] } } } },
-      { $match: { overdue: { $gt: 0 } } },
-      { $sort: { overdue: -1 } },
-      { $limit: 10 },
-    ]).toArray(),
-    countDocuments('tasks', { status: 'completed' }),
-    countDocuments('tasks', { status: 'overdue' }),
-    countDocuments('tasks', {}),
+  const [rawStatus, rawModule, rawDept, [{ count: totalCompleted }], [{ count: totalOverdue }], [{ count: total }]] = await Promise.all([
+    knex('tasks').select('status').count('* as count').groupBy('status'),
+    knex('tasks').select('module').count('* as count')
+      .sum({ overdue: knex.raw(`CASE WHEN status = 'overdue' THEN 1 ELSE 0 END`) }).groupBy('module').orderBy('count', 'desc'),
+    knex('tasks').whereNotNull('department').whereNot({ department: '' }).select('department')
+      .sum({ overdue: knex.raw(`CASE WHEN status = 'overdue' THEN 1 ELSE 0 END`) }).groupBy('department'),
+    knex('tasks').where({ status: 'completed' }).count('* as count'),
+    knex('tasks').where({ status: 'overdue' }).count('* as count'),
+    knex('tasks').count('* as count'),
   ]);
 
   // 30-day completion trend (batch)
   const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 29); thirtyDaysAgo.setHours(0, 0, 0, 0);
+  const thirtyDaysAgoStr = thirtyDaysAgo.toISOString().split('T')[0];
   const [completedByDay, createdByDay] = await Promise.all([
-    global.dbo.collection('tasks').aggregate([
-      { $match: { status: 'completed', completedAt: { $gte: thirtyDaysAgo.toISOString().split('T')[0] } } },
-      { $group: { _id: { $substr: ['$completedAt', 0, 10] }, completed: { $sum: 1 } } },
-    ]).toArray(),
-    global.dbo.collection('tasks').aggregate([
-      { $match: { createdAt: { $gte: thirtyDaysAgo } } },
-      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, created: { $sum: 1 } } },
-    ]).toArray(),
+    knex('tasks').where({ status: 'completed' }).where('completedAt', '>=', thirtyDaysAgoStr)
+      .select(knex.raw(`substr("completedAt"::text, 1, 10) as day`)).count('* as completed').groupByRaw(`substr("completedAt"::text, 1, 10)`),
+    knex('tasks').where('createdAt', '>=', thirtyDaysAgo)
+      .select(knex.raw(`to_char("createdAt", 'YYYY-MM-DD') as day`)).count('* as created').groupByRaw(`to_char("createdAt", 'YYYY-MM-DD')`),
   ]);
-  const completedMap = Object.fromEntries(completedByDay.map(d => [d._id, d.completed]));
-  const createdMap   = Object.fromEntries(createdByDay.map(d => [d._id, d.created]));
+  const completedMap = Object.fromEntries(completedByDay.map((d) => [d.day, Number(d.completed)]));
+  const createdMap   = Object.fromEntries(createdByDay.map((d) => [d.day, Number(d.created)]));
   const completionTrend = [];
   for (let i = 29; i >= 0; i--) {
     const d = new Date(); d.setDate(d.getDate() - i);
@@ -504,14 +493,15 @@ const getTaskAnalytics = async (req, res) => {
 
   return returnFunction(res, 200, true, 'OK', {
     summary: {
-      total,
-      completed: totalCompleted,
-      overdue: totalOverdue,
-      completionRate: total > 0 ? Math.round((totalCompleted / total) * 100) : 0,
+      total: Number(total),
+      completed: Number(totalCompleted),
+      overdue: Number(totalOverdue),
+      completionRate: Number(total) > 0 ? Math.round((Number(totalCompleted) / Number(total)) * 100) : 0,
     },
-    statusBreakdown: rawStatus.filter(s => s._id).map(s => ({ status: s._id, count: s.count })),
-    moduleBreakdown: rawModule.filter(m => m._id).map(m => ({ module: m._id, count: m.count, overdue: m.overdue || 0 })),
-    deptOverdue: rawDept.filter(d => d._id).map(d => ({ department: d._id, overdue: d.overdue })),
+    statusBreakdown: rawStatus.filter((s) => s.status).map((s) => ({ status: s.status, count: Number(s.count) })),
+    moduleBreakdown: rawModule.filter((m) => m.module).map((m) => ({ module: m.module, count: Number(m.count), overdue: Number(m.overdue) || 0 })),
+    deptOverdue: rawDept.filter((d) => Number(d.overdue) > 0).sort((a, b) => Number(b.overdue) - Number(a.overdue)).slice(0, 10)
+      .map((d) => ({ department: d.department, overdue: Number(d.overdue) })),
     completionTrend,
   });
 };
@@ -519,59 +509,50 @@ const getTaskAnalytics = async (req, res) => {
 // ── Employee search for task assignment ───────────────────────────────────────
 const searchEmployeesForTask = async (req, res) => {
   const { q = '' } = req.query;
-  const filter = { status: 'active' };
-  if (q.trim()) filter.$or = [
-    { fullName: { $regex: q.trim(), $options: 'i' } },
-    { staffNumber: { $regex: q.trim(), $options: 'i' } },
-  ];
-  const employees = await findMany('employees', filter, {
-    projection: { _id: 1, fullName: 1, staffNumber: 1, department: 1, designation: 1 },
-    limit: 20, sort: { fullName: 1 },
-  });
+  let query = knex('employees').where({ status: 'active' });
+  if (q.trim()) query = query.where((qb) => qb.whereILike('fullName', `%${q.trim()}%`).orWhereILike('staffNumber', `%${q.trim()}%`));
+  const employees = await query.select('id', 'fullName', 'staffNumber', 'department', 'designation').orderBy('fullName').limit(20);
   return returnFunction(res, 200, true, 'OK', employees);
 };
 
 // ── List employees with task counts ──────────────────────────────────────────
 const listEmployeesWithTaskCounts = async (req, res) => {
   const { q = '' } = req.query;
-  const filter = { status: { $ne: 'terminated' } };
-  if (q.trim()) filter.fullName = { $regex: q.trim(), $options: 'i' };
-
-  const employees = await findMany('employees', filter, {
-    projection: { _id: 1, fullName: 1, department: 1, designation: 1 },
-    limit: 50, sort: { fullName: 1 },
-  });
+  let query = knex('employees').whereNot({ status: 'terminated' });
+  if (q.trim()) query = query.whereILike('fullName', `%${q.trim()}%`);
+  const employees = await query.select('id', 'fullName', 'department', 'designation').orderBy('fullName').limit(50);
   if (!employees.length) return returnFunction(res, 200, true, 'OK', []);
 
-  const ids = employees.map(e => e._id);
-  const counts = await global.dbo.collection('tasks').aggregate([
-    { $match: { assignedTo: { $in: ids } } },
-    { $group: { _id: '$assignedTo', total: { $sum: 1 },
-      not_started: { $sum: { $cond: [{ $eq: ['$status', 'not_started'] }, 1, 0] } },
-      in_progress: { $sum: { $cond: [{ $eq: ['$status', 'in_progress'] }, 1, 0] } },
-      completed:   { $sum: { $cond: [{ $eq: ['$status', 'completed']   }, 1, 0] } },
-      overdue:     { $sum: { $cond: [{ $eq: ['$status', 'overdue']     }, 1, 0] } },
-      blocked:     { $sum: { $cond: [{ $eq: ['$status', 'blocked']     }, 1, 0] } },
-    } },
-  ]).toArray();
+  const ids = employees.map((e) => e.id);
+  const counts = await knex('tasks').whereIn('assignedTo', ids).select('assignedTo')
+    .count('* as total')
+    .sum({ not_started: knex.raw(`CASE WHEN status = 'not_started' THEN 1 ELSE 0 END`) })
+    .sum({ in_progress: knex.raw(`CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END`) })
+    .sum({ completed: knex.raw(`CASE WHEN status = 'completed' THEN 1 ELSE 0 END`) })
+    .sum({ overdue: knex.raw(`CASE WHEN status = 'overdue' THEN 1 ELSE 0 END`) })
+    .sum({ blocked: knex.raw(`CASE WHEN status = 'blocked' THEN 1 ELSE 0 END`) })
+    .groupBy('assignedTo');
 
-  const countMap = Object.fromEntries(counts.map(c => [String(c._id), c]));
-  const result   = employees.map(e => ({ ...e, taskCounts: countMap[String(e._id)] || { total: 0, not_started: 0, in_progress: 0, completed: 0, overdue: 0, blocked: 0 } }));
+  const countMap = Object.fromEntries(counts.map((c) => [c.assignedTo, {
+    total: Number(c.total), not_started: Number(c.not_started), in_progress: Number(c.in_progress),
+    completed: Number(c.completed), overdue: Number(c.overdue), blocked: Number(c.blocked),
+  }]));
+  const result = employees.map((e) => ({ ...e, taskCounts: countMap[e.id] || { total: 0, not_started: 0, in_progress: 0, completed: 0, overdue: 0, blocked: 0 } }));
 
   return returnFunction(res, 200, true, 'OK', result);
 };
 
 // ── Tasks for a specific employee ─────────────────────────────────────────────
 const listTasksByEmployee = async (req, res) => {
-  const empId = safeId(req.params.employeeId);
+  const empId = req.params.employeeId;
   if (!empId) return returnFunction(res, 400, false, 'Invalid ID.');
 
-  const filter = { assignedTo: empId };
-  if (req.query.status) filter.status = req.query.status;
+  let query = knex('tasks').where({ assignedTo: empId });
+  if (req.query.status) query = query.where({ status: req.query.status });
 
   const [employee, tasks] = await Promise.all([
-    findOne('employees', { _id: empId }, { projection: { fullName: 1, department: 1, designation: 1 } }),
-    findMany('tasks', filter, { sort: { dueDate: 1 } }),
+    knex('employees').where({ id: empId }).select('fullName', 'department', 'designation').first(),
+    query.orderBy('dueDate', 'asc'),
   ]);
   if (!employee) return returnFunction(res, 404, false, 'Employee not found.');
   return returnFunction(res, 200, true, 'OK', { employee, tasks });
@@ -582,12 +563,12 @@ const listTasksByEmployee = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const listTemplates = async (req, res) => {
-  const templates = await findMany('task_templates', {}, { sort: { isDefault: -1, name: 1 } });
+  const templates = await knex('task_templates').orderBy('isDefault', 'desc').orderBy('name', 'asc');
   return returnFunction(res, 200, true, 'OK', templates);
 };
 
 const getTemplate = async (req, res) => {
-  const tpl = await findOne('task_templates', { _id: new ObjectId(req.params.id) });
+  const tpl = await knex('task_templates').where({ id: req.params.id }).first();
   if (!tpl) return returnFunction(res, 404, false, 'Template not found.');
   return returnFunction(res, 200, true, 'OK', tpl);
 };
@@ -597,66 +578,73 @@ const createTemplate = async (req, res) => {
   if (!name?.trim()) return returnFunction(res, 400, false, 'Template name is required.');
 
   const doc = {
+    id: newId(),
     name:         name.trim(),
     description:  description || '',
     triggerEvent: triggerEvent || 'custom',
-    applyTo:      applyTo || { type: 'all', departments: [], roles: [], employmentTypes: [] },
+    applyTo:      JSON.stringify(applyTo || { type: 'all', departments: [], roles: [], employmentTypes: [] }),
     isActive:     isActive !== false,
     isDefault:    false,
-    sections:     (sections || []).map((s, i) => ({ _id: new ObjectId(), name: s.name || `Section ${i+1}`, order: i })),
-    tasks: (tasks || []).map((t, i) => ({
-      _id:           new ObjectId(),
-      title:         t.title || `Task ${i+1}`,
+    sections:     JSON.stringify((sections || []).map((s, i) => ({ _id: newId(), name: s.name || `Section ${i + 1}`, order: i }))),
+    tasks: JSON.stringify((tasks || []).map((t, i) => ({
+      _id:           newId(),
+      title:         t.title || `Task ${i + 1}`,
       description:   t.description || '',
       type:          VALID_TYPES.includes(t.type) ? t.type : 'action',
       assignTo:      t.assignTo || 'HR',
       priority:      VALID_PRIORITIES.includes(t.priority) ? t.priority : 'medium',
-      sectionId:     t.sectionId ? new ObjectId(t.sectionId) : null,
+      sectionId:     t.sectionId || null,
       order:         i,
       dueOffset:     t.dueOffset || { direction: 'after', days: 0 },
       documentAction: t.documentAction || null,
       meetingDuration: t.meetingDuration || null,
       deviceAction:  t.deviceAction || null,
       isRequired:    t.isRequired !== false,
-    })),
+    }))),
     usageCount: 0,
     createdBy:  req.user?.name || 'HR',
     createdAt:  new Date(),
     updatedAt:  new Date(),
   };
 
-  const result = await insertOne('task_templates', doc);
-  return returnFunction(res, 201, true, 'Template created.', { _id: result.insertedId, ...doc });
+  const [saved] = await knex('task_templates').insert(doc).returning('*');
+  return returnFunction(res, 201, true, 'Template created.', saved);
 };
 
 const updateTemplate = async (req, res) => {
-  const update = { ...req.body, updatedAt: new Date() };
-  delete update._id;
-  if (update.tasks) {
-    update.tasks = update.tasks.map((t, i) => ({
-      _id:           t._id ? new ObjectId(t._id) : new ObjectId(),
-      title:         t.title || `Task ${i+1}`,
-      description:   t.description || '',
-      type:          VALID_TYPES.includes(t.type) ? t.type : 'action',
-      assignTo:      t.assignTo || 'HR',
-      priority:      VALID_PRIORITIES.includes(t.priority) ? t.priority : 'medium',
-      sectionId:     t.sectionId ? new ObjectId(t.sectionId) : null,
-      order:         i,
-      dueOffset:     t.dueOffset || { direction: 'after', days: 0 },
-      documentAction: t.documentAction || null,
-      meetingDuration: t.meetingDuration || null,
-      deviceAction:  t.deviceAction || null,
-      isRequired:    t.isRequired !== false,
-    }));
+  const update = { updatedAt: new Date() };
+  for (const [key, val] of Object.entries(req.body)) {
+    if (key === 'id' || key === '_id') continue;
+    if (key === 'tasks') {
+      update.tasks = JSON.stringify(val.map((t, i) => ({
+        _id:           t._id || newId(),
+        title:         t.title || `Task ${i + 1}`,
+        description:   t.description || '',
+        type:          VALID_TYPES.includes(t.type) ? t.type : 'action',
+        assignTo:      t.assignTo || 'HR',
+        priority:      VALID_PRIORITIES.includes(t.priority) ? t.priority : 'medium',
+        sectionId:     t.sectionId || null,
+        order:         i,
+        dueOffset:     t.dueOffset || { direction: 'after', days: 0 },
+        documentAction: t.documentAction || null,
+        meetingDuration: t.meetingDuration || null,
+        deviceAction:  t.deviceAction || null,
+        isRequired:    t.isRequired !== false,
+      })));
+    } else if (key === 'sections' || key === 'applyTo') {
+      update[key] = JSON.stringify(val);
+    } else {
+      update[key] = val;
+    }
   }
-  await updateOne('task_templates', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('task_templates').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, 'Template updated.');
 };
 
 const deleteTemplate = async (req, res) => {
-  const tpl = await findOne('task_templates', { _id: new ObjectId(req.params.id) });
+  const tpl = await knex('task_templates').where({ id: req.params.id }).first();
   if (tpl?.isDefault) return returnFunction(res, 400, false, 'Cannot delete default templates. Deactivate instead.');
-  await global.dbo.collection('task_templates').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('task_templates').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, 'Template deleted.');
 };
 
@@ -666,11 +654,7 @@ const applyTemplate = async (req, res) => {
 
   const result = await triggerTasksFromTemplate(req.params.id, employeeId, startDate || new Date().toISOString().split('T')[0]);
 
-  // Increment usage count
-  await global.dbo.collection('task_templates').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $inc: { usageCount: 1 } }
-  );
+  await knex('task_templates').where({ id: req.params.id }).increment('usageCount', 1);
 
   return returnFunction(res, 201, true, `${result.created} tasks created from template.`, result);
 };
@@ -678,7 +662,7 @@ const applyTemplate = async (req, res) => {
 module.exports = {
   getTaskStats, getMyTasks, listTeamTasks, listAllTasks,
   getTaskDetail, createTask, updateTask, deleteTask,
-  completeTask, reopenTask, addComment, addSubtask, toggleSubtask,
+  completeTask, reopenTask, updateTaskStatus, addComment, addSubtask, toggleSubtask,
   exportTasksCSV, getTaskAnalytics,
   searchEmployeesForTask, listEmployeesWithTaskCounts, listTasksByEmployee,
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, applyTemplate,

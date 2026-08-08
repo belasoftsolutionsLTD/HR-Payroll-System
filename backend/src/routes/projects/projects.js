@@ -15,6 +15,7 @@ const {
   listNotes, createNote, deleteNote,
   listChatGroups, createChatGroup, updateChatGroup, deleteChatGroup,
   getMessages, sendMessage,
+  createTimeEntry,
 } = require('./projectsFunctions');
 
 const hrOnly   = allowRoles(HR_ROLES);
@@ -78,6 +79,10 @@ router.delete('/:id/chat-groups/:groupId', allRoles, AsyncHandler(deleteChatGrou
 
 router.get('/:id/messages',  allRoles, AsyncHandler(getMessages));
 router.post('/:id/messages', allRoles, projectUpload.single('file'), AsyncHandler(sendMessage));
+
+// NEW this phase — was called by the staff portal's "log time" form but never
+// wired up anywhere (see projectsFunctions.js's createTimeEntry).
+router.post('/:id/time-entries', allRoles, AsyncHandler(createTimeEntry));
 
 router.post('/:id/members',               mgmtOnly, AsyncHandler(addMembers));
 router.delete('/:id/members/:employeeId', mgmtOnly, AsyncHandler(removeMember));

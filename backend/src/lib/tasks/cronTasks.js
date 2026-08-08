@@ -105,9 +105,8 @@ async function checkExpiringCertifications() {
   }
 }
 
+// tasks/task_templates now live in Postgres (Phase 9).
 async function dailyTaskJobs() {
-  if (!global.dbo) return;
-
   const todayStr = new Date().toISOString().split('T')[0];
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -117,55 +116,38 @@ async function dailyTaskJobs() {
   const in14Str = in14.toISOString().split('T')[0];
 
   // 1. Mark overdue
-  await global.dbo.collection('tasks').updateMany(
-    { status: { $in: ['not_started', 'in_progress'] }, dueDate: { $lt: todayStr } },
-    { $set: { status: 'overdue', updatedAt: new Date() } }
-  );
+  await pgDB.knex('tasks').whereIn('status', ['not_started', 'in_progress']).where('dueDate', '<', todayStr)
+    .update({ status: 'overdue', updatedAt: new Date() });
 
   // 2. Trigger onboarding for employees starting within 14 days (first time only)
-  const onboardingTpl = await global.dbo.collection('task_templates').findOne({
-    triggerEvent: 'new_hire', isActive: true,
-  });
+  const onboardingTpl = await pgDB.knex('task_templates').where({ triggerEvent: 'new_hire', isActive: true }).first();
+  let newHires = [];
   if (onboardingTpl) {
-    const newHires = await global.dbo.collection('employees').find({
-      startDate: { $gte: todayStr, $lte: in14Str }, status: { $ne: 'terminated' },
-    }).toArray();
+    newHires = await pgDB.knex('employees').where('startDate', '>=', todayStr).where('startDate', '<=', in14Str).whereNot({ status: 'terminated' });
 
     for (const emp of newHires) {
-      const already = await global.dbo.collection('tasks').findOne({
-        linkedEmployeeId: emp._id, templateId: onboardingTpl._id,
-      });
+      const already = await pgDB.knex('tasks').where({ linkedEmployeeId: emp.id, templateId: onboardingTpl.id }).first();
       if (!already) {
-        await triggerTasksFromTemplate(onboardingTpl._id, emp._id, emp.startDate || todayStr);
+        await triggerTasksFromTemplate(onboardingTpl.id, emp.id, emp.startDate || todayStr);
       }
     }
   }
 
   // 3. Trigger offboarding when endDate is set and approaching
-  const offboardingTpl = await global.dbo.collection('task_templates').findOne({
-    triggerEvent: 'offboarding', isActive: true,
-  });
+  const offboardingTpl = await pgDB.knex('task_templates').where({ triggerEvent: 'offboarding', isActive: true }).first();
   if (offboardingTpl) {
-    const leavers = await global.dbo.collection('employees').find({
-      endDate: { $gte: todayStr, $lte: in14Str },
-    }).toArray();
+    const leavers = await pgDB.knex('employees').where('endDate', '>=', todayStr).where('endDate', '<=', in14Str);
 
     for (const emp of leavers) {
-      const already = await global.dbo.collection('tasks').findOne({
-        linkedEmployeeId: emp._id, templateId: offboardingTpl._id,
-      });
+      const already = await pgDB.knex('tasks').where({ linkedEmployeeId: emp.id, templateId: offboardingTpl.id }).first();
       if (!already) {
-        await triggerTasksFromTemplate(offboardingTpl._id, emp._id, emp.endDate);
+        await triggerTasksFromTemplate(offboardingTpl.id, emp.id, emp.endDate);
       }
     }
   }
 
   // 4. Remind about tasks due tomorrow
-  const dueTomorrow = await global.dbo.collection('tasks').find({
-    status: { $in: ['not_started', 'in_progress'] },
-    dueDate: tomorrowStr,
-    assignedTo: { $ne: null },
-  }).toArray();
+  const dueTomorrow = await pgDB.knex('tasks').whereIn('status', ['not_started', 'in_progress']).where({ dueDate: tomorrowStr }).whereNotNull('assignedTo');
 
   for (const task of dueTomorrow) {
     notifyEmployee(task.assignedTo, {
@@ -177,7 +159,7 @@ async function dailyTaskJobs() {
       `Due tomorrow: "${task.title}"`, `<p>Make sure to complete this task by ${task.dueDate}.</p>`);
   }
 
-  console.log(`[CRON] Daily task jobs done — overdue marked, ${newHires?.length ?? 0} onboarding triggers checked, ${dueTomorrow.length} reminders sent`);
+  console.log(`[CRON] Daily task jobs done — overdue marked, ${newHires.length} onboarding triggers checked, ${dueTomorrow.length} reminders sent`);
 }
 
 // attendance_records now lives in Postgres (Phase 3b).

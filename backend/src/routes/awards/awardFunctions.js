@@ -1,13 +1,18 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 9) — award_types/employee_awards/company_values/
+// kudos (+ kudos_reactions/kudos_comments)/award_programs/award_nominations/
+// recognition_settings are Postgres now. employees/users have been Postgres
+// since Phase 1. The Mongo `awards` collection (indexed in initIndexes.js but
+// never read/written by any route) is dead and was not migrated — see the
+// Phase 9 migration file header.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { notifyEmployee, notifyByRoles } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
 
 const emailAwardGranted = async (employeeId, awardName, notes) => {
   const [empUser, emp] = await Promise.all([
-    global.dbo.collection('users').findOne({ employeeId: new ObjectId(employeeId) }, { projection: { email: 1 } }),
-    global.dbo.collection('employees').findOne({ _id: new ObjectId(employeeId) }, { projection: { fullName: 1 } }),
+    knex('users').where({ employeeId: String(employeeId) }).select('email').first(),
+    knex('employees').where({ id: String(employeeId) }).select('fullName').first(),
   ]);
   if (!empUser?.email) return;
   const tokens = { employeeName: emp?.fullName || 'there', awardName, notes: notes || '' };
@@ -18,38 +23,43 @@ const emailAwardGranted = async (employeeId, awardName, notes) => {
   }).catch(() => {});
 };
 
+// A requester's own id in the id-space this module has always used
+// polymorphically for the "who did this" fields (giverId/personId/authorId) —
+// employee id when linked, otherwise their user id. See migration file header.
+const actingPersonId = (req) => (req.user.employeeId ? String(req.user.employeeId) : req.user.id);
+
 // ── Award Types (templates) ───────────────────────────────────────────────────
 
 const listAwardTypes = async (req, res) => {
-  const types = await findMany('award_types', {}, { sort: { name: 1 } });
+  const types = await knex('award_types').orderBy('name', 'asc');
   return returnFunction(res, 200, true, 'OK', types);
 };
 
 const createAwardType = async (req, res) => {
   const { name, description, category, repeatInterval, nextDueDate } = req.body;
   if (!name) return returnFunction(res, 400, false, 'Award name is required.');
-  const existing = await findOne('award_types', { name: { $regex: `^${name}$`, $options: 'i' } });
+  const existing = await knex('award_types').whereRaw('lower(name) = lower(?)', [name]).first();
   if (existing) return returnFunction(res, 409, false, 'An award type with this name already exists.');
-  const result = await insertOne('award_types', {
-    name, description: description || '', category: category || 'general',
+  const [saved] = await knex('award_types').insert({
+    id: newId(), name, description: description || '', category: category || 'general',
     repeatInterval: repeatInterval || 'none',
     nextDueDate: nextDueDate ? new Date(nextDueDate) : null,
     createdAt: new Date(),
-  });
-  return returnFunction(res, 201, true, 'Award type created.', { _id: result.insertedId });
+  }).returning('*');
+  return returnFunction(res, 201, true, 'Award type created.', { id: saved.id });
 };
 
 const updateAwardType = async (req, res) => {
   const { name, description, category, repeatInterval, nextDueDate } = req.body;
-  await global.dbo.collection('award_types').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { name, description, category, repeatInterval: repeatInterval || 'none', nextDueDate: nextDueDate ? new Date(nextDueDate) : null, updatedAt: new Date() } }
-  );
+  await knex('award_types').where({ id: req.params.id }).update({
+    name, description, category, repeatInterval: repeatInterval || 'none',
+    nextDueDate: nextDueDate ? new Date(nextDueDate) : null, updatedAt: new Date(),
+  });
   return returnFunction(res, 200, true, 'Award type updated.');
 };
 
 const deleteAwardType = async (req, res) => {
-  await global.dbo.collection('award_types').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('award_types').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, 'Award type deleted.');
 };
 
@@ -60,26 +70,15 @@ const listEmployeeAwards = async (req, res) => {
   const limit = Math.min(100, parseInt(req.query.limit) || 20);
   const skip  = (page - 1) * limit;
 
-  const filter = {};
-  if (req.query.awardTypeId) filter.awardTypeId = new ObjectId(req.query.awardTypeId);
-  if (req.query.year)        filter.year = parseInt(req.query.year);
-  if (req.query.search) {
-    filter.employeeName = { $regex: req.query.search, $options: 'i' };
-  }
+  let query = knex('employee_awards');
+  if (req.query.awardTypeId) query = query.where({ awardTypeId: req.query.awardTypeId });
+  if (req.query.year)        query = query.where({ year: parseInt(req.query.year) });
+  if (req.query.search)      query = query.whereILike('employeeName', `%${req.query.search}%`);
 
-  const [total, awards] = await Promise.all([
-    countDocuments('employee_awards', filter),
-    global.dbo.collection('employee_awards').find(filter)
-      .sort({ awardedAt: -1 }).skip(skip).limit(limit).toArray(),
-  ]);
+  const [{ count: total }] = await query.clone().count('* as count');
+  const awards = await query.clone().orderBy('awardedAt', 'desc').limit(limit).offset(skip);
 
-  // Populate award type names
-  const typeIds = [...new Set(awards.map(a => String(a.awardTypeId)).filter(Boolean))];
-  const types   = await findMany('award_types', { _id: { $in: typeIds.map(id => new ObjectId(id)) } });
-  const typeMap  = Object.fromEntries(types.map(t => [String(t._id), t.name]));
-
-  const enriched = awards.map(a => ({ ...a, awardTypeName: typeMap[String(a.awardTypeId)] || 'Unknown' }));
-  return returnFunction(res, 200, true, 'OK', { data: enriched, total, page, limit });
+  return returnFunction(res, 200, true, 'OK', { data: awards, total: Number(total), page, limit });
 };
 
 // Single award
@@ -88,32 +87,27 @@ const grantAward = async (req, res) => {
   if (!employeeId || !awardTypeId) return returnFunction(res, 400, false, 'employeeId and awardTypeId are required.');
 
   const [emp, awardType] = await Promise.all([
-    findOne('employees', { _id: new ObjectId(employeeId) }),
-    findOne('award_types', { _id: new ObjectId(awardTypeId) }),
+    knex('employees').where({ id: employeeId }).first(),
+    knex('award_types').where({ id: awardTypeId }).first(),
   ]);
   if (!emp)       return returnFunction(res, 404, false, 'Employee not found.');
   if (!awardType) return returnFunction(res, 404, false, 'Award type not found.');
 
-  const doc = {
-    employeeId:   new ObjectId(employeeId),
-    employeeName: emp.fullName,
-    staffNumber:  emp.staffNumber || null,
-    department:   emp.department  || null,
-    awardTypeId:  new ObjectId(awardTypeId),
-    awardTypeName: awardType.name,
-    notes:        notes || '',
-    year:         year || new Date().getFullYear(),
-    awardedBy:    req.user?.name || 'HR',
-    awardedAt:    new Date(),
-  };
-  const result = await insertOne('employee_awards', doc);
-  notifyEmployee(new ObjectId(employeeId), {
+  const [saved] = await knex('employee_awards').insert({
+    id: newId(),
+    employeeId, employeeName: emp.fullName, staffNumber: emp.staffNumber || null, department: emp.department || null,
+    awardTypeId, awardTypeName: awardType.name,
+    notes: notes || '', year: year || new Date().getFullYear(),
+    awardedBy: req.user?.name || 'HR', awardedAt: new Date(),
+  }).returning('*');
+
+  notifyEmployee(employeeId, {
     title: 'You received an award!',
     body: `Congratulations! You've been awarded "${awardType.name}"${notes ? ': ' + notes : '.'}`,
     type: 'general',
   }).catch(() => {});
   emailAwardGranted(employeeId, awardType.name, notes);
-  return returnFunction(res, 201, true, 'Award granted.', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Award granted.', { id: saved.id });
 };
 
 // Bulk award — grant the same award to multiple employees at once
@@ -122,44 +116,35 @@ const bulkGrantAward = async (req, res) => {
   if (!Array.isArray(employeeIds) || !employeeIds.length) return returnFunction(res, 400, false, 'employeeIds array is required.');
   if (!awardTypeId) return returnFunction(res, 400, false, 'awardTypeId is required.');
 
-  const awardType = await findOne('award_types', { _id: new ObjectId(awardTypeId) });
+  const awardType = await knex('award_types').where({ id: awardTypeId }).first();
   if (!awardType) return returnFunction(res, 404, false, 'Award type not found.');
 
-  const employees = await global.dbo.collection('employees')
-    .find({ _id: { $in: employeeIds.map(id => new ObjectId(id)) } })
-    .project({ _id: 1, fullName: 1, staffNumber: 1, department: 1 })
-    .toArray();
-
+  const employees = await knex('employees').whereIn('id', employeeIds).select('id', 'fullName', 'staffNumber', 'department');
   if (!employees.length) return returnFunction(res, 404, false, 'No valid employees found.');
 
   const awardYear = year || new Date().getFullYear();
-  const docs = employees.map(emp => ({
-    employeeId:   emp._id,
-    employeeName: emp.fullName,
-    staffNumber:  emp.staffNumber || null,
-    department:   emp.department  || null,
-    awardTypeId:  new ObjectId(awardTypeId),
-    awardTypeName: awardType.name,
-    notes:        notes || '',
-    year:         awardYear,
-    awardedBy:    req.user?.name || 'HR',
-    awardedAt:    new Date(),
+  const docs = employees.map((emp) => ({
+    id: newId(),
+    employeeId: emp.id, employeeName: emp.fullName, staffNumber: emp.staffNumber || null, department: emp.department || null,
+    awardTypeId, awardTypeName: awardType.name,
+    notes: notes || '', year: awardYear,
+    awardedBy: req.user?.name || 'HR', awardedAt: new Date(),
   }));
 
-  await global.dbo.collection('employee_awards').insertMany(docs);
-  await Promise.all(employees.map(emp =>
-    notifyEmployee(emp._id, {
+  await knex('employee_awards').insert(docs);
+  await Promise.all(employees.map((emp) =>
+    notifyEmployee(emp.id, {
       title: 'You received an award!',
       body: `Congratulations! You've been awarded "${awardType.name}"${notes ? ': ' + notes : '.'}`,
       type: 'general',
     }).catch(() => {})
   ));
-  employees.forEach(emp => emailAwardGranted(emp._id, awardType.name, notes));
+  employees.forEach((emp) => emailAwardGranted(emp.id, awardType.name, notes));
   return returnFunction(res, 201, true, `Award granted to ${docs.length} employee(s).`, { count: docs.length });
 };
 
 const revokeAward = async (req, res) => {
-  await global.dbo.collection('employee_awards').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('employee_awards').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, 'Award revoked.');
 };
 
@@ -171,29 +156,20 @@ const searchEmployeesForAward = async (req, res) => {
   const limit = Math.min(100, parseInt(req.query.limit) || 30);
   const skip  = (page - 1) * limit;
 
-  const filter = { status: { $in: ['active', 'on_leave'] } };
-  if (q)    filter.$or = [
-    { fullName:    { $regex: q, $options: 'i' } },
-    { staffNumber: { $regex: q, $options: 'i' } },
-  ];
-  if (dept) filter.department = dept;
+  let query = knex('employees').whereIn('status', ['active', 'on_leave']);
+  if (q) query = query.where((qb) => qb.whereILike('fullName', `%${q}%`).orWhereILike('staffNumber', `%${q}%`));
+  if (dept) query = query.where({ department: dept });
 
-  const [total, employees] = await Promise.all([
-    countDocuments('employees', filter),
-    global.dbo.collection('employees')
-      .find(filter)
-      .project({ _id: 1, fullName: 1, staffNumber: 1, department: 1, designation: 1 })
-      .sort({ fullName: 1 })
-      .skip(skip).limit(limit)
-      .toArray(),
-  ]);
-  return returnFunction(res, 200, true, 'OK', { data: employees, total, page, limit });
+  const [{ count: total }] = await query.clone().count('* as count');
+  const employees = await query.clone().select('id', 'fullName', 'staffNumber', 'department', 'designation').orderBy('fullName').limit(limit).offset(skip);
+
+  return returnFunction(res, 200, true, 'OK', { data: employees, total: Number(total), page, limit });
 };
 
 // Awards by type + by department + top employees for chart/insight cards
 const getAwardStats = async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
-  const all  = await global.dbo.collection('employee_awards').find({ year }).toArray();
+  const all  = await knex('employee_awards').where({ year });
 
   const byType = {};
   const byDept = {};
@@ -219,13 +195,13 @@ const getAwardStats = async (req, res) => {
 
 // Award types that are scheduled (repeatInterval !== 'none') and due within 60 days
 const getUpcomingAwards = async (req, res) => {
-  const types = await findMany('award_types', { repeatInterval: { $nin: ['none', null] }, nextDueDate: { $ne: null } });
+  const types = await knex('award_types').whereNotIn('repeatInterval', ['none']).whereNotNull('nextDueDate');
   const now   = new Date();
   const horizon = new Date(now.getTime() + 60 * 24 * 60 * 60 * 1000);
 
   const upcoming = types
-    .map(t => ({ ...t, daysUntilDue: Math.ceil((new Date(t.nextDueDate) - now) / (1000 * 60 * 60 * 24)) }))
-    .filter(t => new Date(t.nextDueDate) <= horizon)
+    .map((t) => ({ ...t, daysUntilDue: Math.ceil((new Date(t.nextDueDate) - now) / (1000 * 60 * 60 * 24)) }))
+    .filter((t) => new Date(t.nextDueDate) <= horizon)
     .sort((a, b) => a.daysUntilDue - b.daysUntilDue);
 
   return returnFunction(res, 200, true, 'OK', upcoming);
@@ -233,69 +209,54 @@ const getUpcomingAwards = async (req, res) => {
 
 // After granting a scheduled award, advance the nextDueDate by one interval
 const advanceAwardSchedule = async (req, res) => {
-  const type = await findOne('award_types', { _id: new ObjectId(req.params.id) });
+  const type = await knex('award_types').where({ id: req.params.id }).first();
   if (!type) return returnFunction(res, 404, false, 'Award type not found.');
 
   const base = type.nextDueDate ? new Date(type.nextDueDate) : new Date();
-  let next = new Date(base);
+  const next = new Date(base);
   if (type.repeatInterval === 'monthly')   next.setMonth(next.getMonth() + 1);
   else if (type.repeatInterval === 'quarterly') next.setMonth(next.getMonth() + 3);
   else if (type.repeatInterval === 'annually')  next.setFullYear(next.getFullYear() + 1);
 
-  await global.dbo.collection('award_types').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { nextDueDate: next, updatedAt: new Date() } }
-  );
+  await knex('award_types').where({ id: req.params.id }).update({ nextDueDate: next, updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Schedule advanced.', { nextDueDate: next });
 };
 
 // ── COMPANY VALUES ─────────────────────────────────────────────────────────────
 
 const listValues = async (req, res) => {
-  const values = await findMany('company_values',
-    { companyId: req.user.companyId, isActive: { $ne: false } },
-    { sort: { order: 1 } }
-  );
+  const values = await knex('company_values').where({ companyId: req.user.companyId ?? null }).whereNot({ isActive: false }).orderBy('order', 'asc');
   return returnFunction(res, 200, true, 'OK', values);
 };
 
 const createValue = async (req, res) => {
   const { name, description, emoji, color } = req.body;
   if (!name?.trim()) return returnFunction(res, 400, false, 'Value name is required.');
-  const count = await global.dbo.collection('company_values').countDocuments({ companyId: req.user.companyId });
-  const doc = {
-    companyId: req.user.companyId,
+  const [{ count }] = await knex('company_values').where({ companyId: req.user.companyId ?? null }).count('* as count');
+  const [saved] = await knex('company_values').insert({
+    id: newId(), companyId: req.user.companyId ?? null,
     name: name.trim(), description: description || '',
     emoji: emoji || '⭐', color: color || '#6366f1',
-    order: count, isActive: true, createdAt: new Date(),
-  };
-  const result = await global.dbo.collection('company_values').insertOne(doc);
-  return returnFunction(res, 201, true, 'Value created', { _id: result.insertedId, ...doc });
+    order: Number(count), isActive: true, createdAt: new Date(),
+  }).returning('*');
+  return returnFunction(res, 201, true, 'Value created', saved);
 };
 
 const updateValue = async (req, res) => {
   const { name, description, emoji, color } = req.body;
-  await global.dbo.collection('company_values').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { name, description, emoji, color, updatedAt: new Date() } }
-  );
+  await knex('company_values').where({ id: req.params.id }).update({ name, description, emoji, color, updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Value updated', null);
 };
 
 const deleteValue = async (req, res) => {
-  await global.dbo.collection('company_values').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { isActive: false } }
-  );
+  await knex('company_values').where({ id: req.params.id }).update({ isActive: false });
   return returnFunction(res, 200, true, 'Value removed', null);
 };
 
 const reorderValues = async (req, res) => {
   const { order } = req.body; // array of { _id, order }
   await Promise.all(
-    (order || []).map(({ _id, order: ord }) =>
-      global.dbo.collection('company_values').updateOne({ _id: new ObjectId(_id) }, { $set: { order: ord } })
-    )
+    (order || []).map(({ _id, order: ord }) => knex('company_values').where({ id: _id }).update({ order: ord }))
   );
   return returnFunction(res, 200, true, 'Order updated', null);
 };
@@ -305,58 +266,36 @@ const reorderValues = async (req, res) => {
 const listKudos = async (req, res) => {
   const { page = 1, limit = 20, recipientId } = req.query;
   const skip = (Number(page) - 1) * Number(limit);
-  const filter = { companyId: req.user.companyId };
-  if (recipientId) filter.recipientIds = new ObjectId(recipientId);
+  let query = knex('kudos').where({ companyId: req.user.companyId ?? null });
+  if (recipientId) query = query.whereRaw('"recipientIds" @> ?', [JSON.stringify([String(recipientId)])]);
 
-  const kudos = await global.dbo
-    .collection('kudos')
-    .find(filter)
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(Number(limit))
-    .toArray();
+  const kudos = await query.orderBy('createdAt', 'desc').limit(Number(limit)).offset(skip);
 
   const enriched = await Promise.all(
-    kudos.map(async k => {
+    kudos.map(async (k) => {
       let granterName = k.giverName ?? '';
       if (!granterName) {
-        const giver = await findOne('employees', { _id: k.giverId }, { projection: { fullName: 1 } });
+        const giver = await knex('employees').where({ id: k.giverId }).select('fullName').first();
         if (giver) {
           granterName = giver.fullName;
         } else {
-          const giverUser = await findOne('users', { _id: k.giverId }, { projection: { fullName: 1, email: 1 } });
-          granterName = giverUser?.fullName ?? giverUser?.email ?? '';
+          const giverUser = await knex('users').where({ id: k.giverId }).select('name', 'email').first();
+          granterName = giverUser?.name ?? giverUser?.email ?? '';
         }
       }
       const recipients = await Promise.all(
-        (k.recipientIds || []).map(id => findOne('employees', { _id: id }, { projection: { fullName: 1 } }))
+        (k.recipientIds || []).map((id) => knex('employees').where({ id }).select('fullName').first())
       );
-      const enrichedComments = await Promise.all(
-        (k.comments || []).map(async (c, idx) => {
-          let authorName = c.authorName;
-          if (!authorName && c.authorId) {
-            const author = await findOne('employees', { _id: c.authorId }, { projection: { fullName: 1 } });
-            authorName = author?.fullName ?? 'Unknown';
-          }
-          return {
-            _id: c._id ? String(c._id) : String(c.authorId || idx),
-            content: c.content || c.text || '',
-            authorName: authorName || 'Unknown',
-            createdAt: c.createdAt,
-          };
-        })
-      );
-      return {
-        ...k,
-        granterId: String(k.giverId),
-        granterName,
-        recipientNames: recipients.filter(Boolean).map(r => r.fullName),
-        comments: enrichedComments,
-      };
+      const reactions = await knex('kudos_reactions').where({ kudosId: k.id });
+      const comments = await knex('kudos_comments').where({ kudosId: k.id }).orderBy('createdAt', 'asc');
+      const enrichedComments = comments.map((c) => ({
+        id: c.id, content: c.content, authorName: c.authorName || 'Unknown', createdAt: c.createdAt,
+      }));
+      return { ...k, granterName, recipients: recipients.filter(Boolean), reactions, comments: enrichedComments };
     })
   );
-  const total = await global.dbo.collection('kudos').countDocuments(filter);
-  return returnFunction(res, 200, true, 'OK', { kudos: enriched, total });
+
+  return returnFunction(res, 200, true, 'OK', enriched);
 };
 
 const createKudos = async (req, res) => {
@@ -366,11 +305,11 @@ const createKudos = async (req, res) => {
   }
 
   // Enforce recognition settings
-  const settings = await findOne('recognition_settings', {});
+  const settings = await knex('recognition_settings').first();
   if (settings) {
     if (!settings.allowSelfRecognition) {
-      const giverId = String(req.user.employeeId || req.user._id);
-      const selfIncluded = recipientIds.some(id => String(id) === giverId);
+      const giverId = actingPersonId(req);
+      const selfIncluded = recipientIds.some((id) => String(id) === giverId);
       if (selfIncluded) return returnFunction(res, 400, false, 'You cannot send kudos to yourself.');
     }
     const minLen = settings.minMessageLength ?? 0;
@@ -379,11 +318,8 @@ const createKudos = async (req, res) => {
     }
     if (settings.maxKudosPerDay) {
       const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-      const sentToday = await global.dbo.collection('kudos').countDocuments({
-        giverId: req.user.employeeId || req.user._id,
-        createdAt: { $gte: todayStart },
-      });
-      if (sentToday >= settings.maxKudosPerDay) {
+      const [{ count: sentToday }] = await knex('kudos').where({ giverId: actingPersonId(req) }).where('createdAt', '>=', todayStart).count('* as count');
+      if (Number(sentToday) >= settings.maxKudosPerDay) {
         return returnFunction(res, 429, false, `Daily kudos limit of ${settings.maxKudosPerDay} reached.`);
       }
     }
@@ -391,57 +327,56 @@ const createKudos = async (req, res) => {
 
   let valueName = '', valueColor = '#6366f1';
   if (valueId) {
-    const val = await findOne('company_values', { _id: new ObjectId(valueId) });
+    const val = await knex('company_values').where({ id: valueId }).first();
     if (val) { valueName = val.name; valueColor = val.color; }
   }
 
   let giverName = req.user.fullName ?? '';
   if (!giverName && req.user.employeeId) {
-    const giverEmp = await findOne('employees', { _id: req.user.employeeId }, { projection: { fullName: 1 } });
+    const giverEmp = await knex('employees').where({ id: String(req.user.employeeId) }).select('fullName').first();
     giverName = giverEmp?.fullName ?? '';
   }
 
   const doc = {
-    companyId: req.user.companyId,
-    giverId: req.user.employeeId || req.user._id,
+    id: newId(),
+    companyId: req.user.companyId ?? null,
+    giverId: actingPersonId(req),
     giverName,
-    recipientIds: recipientIds.map(id => new ObjectId(id)),
-    valueId: valueId ? new ObjectId(valueId) : null,
+    recipientIds: JSON.stringify(recipientIds.map(String)),
+    valueId: valueId || null,
     valueName, valueColor,
     message, gifUrl: gifUrl || null,
     visibility,
     pointsAwarded: Number(pointsAwarded),
-    reactions: [], comments: [],
     createdAt: new Date(),
   };
 
-  const result = await global.dbo.collection('kudos').insertOne(doc);
-  await Promise.all(doc.recipientIds.map(id =>
-    notifyEmployee(id, {
-      title: `You received kudos from ${giverName}!`,
-      body: message,
-      type: 'general',
-    }).catch(() => {})
+  const [saved] = await knex('kudos').insert(doc).returning('*');
+  await Promise.all(recipientIds.map((id) =>
+    notifyEmployee(id, { title: `You received kudos from ${giverName}!`, body: message, type: 'general' }).catch(() => {})
   ));
-  return returnFunction(res, 201, true, 'Kudos sent! 🏅', { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, 'Kudos sent! 🏅', { id: saved.id });
 };
 
 const deleteKudos = async (req, res) => {
-  await global.dbo.collection('kudos').deleteOne({ _id: new ObjectId(req.params.id) });
+  await knex('kudos_reactions').where({ kudosId: req.params.id }).delete();
+  await knex('kudos_comments').where({ kudosId: req.params.id }).delete();
+  await knex('kudos').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, 'Kudos removed', null);
 };
 
 const reactToKudos = async (req, res) => {
   const { type } = req.body;
-  const empId = req.user.employeeId || req.user._id;
-  const kudosId = new ObjectId(req.params.id);
-  const k = await findOne('kudos', { _id: kudosId });
+  const personId = actingPersonId(req);
+  const kudosId = req.params.id;
+  const k = await knex('kudos').where({ id: kudosId }).first();
   if (!k) return returnFunction(res, 404, false, 'Not found', null);
-  const existing = (k.reactions || []).find(r => String(r.employeeId) === String(empId) && r.type === type);
+
+  const existing = await knex('kudos_reactions').where({ kudosId, personId, type }).first();
   if (existing) {
-    await global.dbo.collection('kudos').updateOne({ _id: kudosId }, { $pull: { reactions: { employeeId: empId, type } } });
+    await knex('kudos_reactions').where({ kudosId, personId, type }).delete();
   } else {
-    await global.dbo.collection('kudos').updateOne({ _id: kudosId }, { $push: { reactions: { type, employeeId: empId, reactedAt: new Date() } } });
+    await knex('kudos_reactions').insert({ kudosId, personId, type, reactedAt: new Date() });
   }
   return returnFunction(res, 200, true, 'Reaction updated', null);
 };
@@ -449,91 +384,92 @@ const reactToKudos = async (req, res) => {
 const addKudosComment = async (req, res) => {
   const commentText = (req.body.content || req.body.text || '').trim();
   if (!commentText) return returnFunction(res, 400, false, 'Comment text required', null);
-  const empId = req.user.employeeId || req.user._id;
-  const author = await findOne('employees', { _id: empId }, { projection: { fullName: 1 } });
-  const commentId = new ObjectId();
+  const personId = actingPersonId(req);
+  const author = req.user.employeeId ? await knex('employees').where({ id: String(req.user.employeeId) }).select('fullName').first() : null;
+
   const comment = {
-    _id: commentId,
-    authorId: empId,
+    id: newId(),
+    kudosId: req.params.id,
+    authorId: personId,
     authorName: author?.fullName ?? 'Unknown',
     content: commentText,
     createdAt: new Date(),
   };
-  await global.dbo.collection('kudos').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $push: { comments: comment } }
-  );
-  return returnFunction(res, 201, true, 'Comment added', { ...comment, _id: String(commentId) });
+  const [saved] = await knex('kudos_comments').insert(comment).returning('*');
+  return returnFunction(res, 201, true, 'Comment added', saved);
 };
 
 // ── LEADERBOARD ────────────────────────────────────────────────────────────────
+// kudos.recipientIds is a whole-replaced JSONB array (never per-row mutated —
+// see migration file header), so the Mongo $unwind/$group here becomes a
+// jsonb_array_elements_text unnest + GROUP BY.
 
 const getLeaderboard = async (req, res) => {
   const { period = 'month', department, limit: lim = 20 } = req.query;
   const now = new Date();
   let startDate;
-  if (period === 'month')   { startDate = new Date(now.getFullYear(), now.getMonth(), 1); }
-  else if (period === 'quarter') { startDate = new Date(now.getFullYear(), Math.floor(now.getMonth()/3)*3, 1); }
-  else { startDate = new Date(now.getFullYear(), 0, 1); }
+  if (period === 'month')   startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+  else if (period === 'quarter') startDate = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+  else startDate = new Date(now.getFullYear(), 0, 1);
 
-  const pipeline = [
-    { $match: { companyId: req.user.companyId, createdAt: { $gte: startDate } } },
-    { $unwind: '$recipientIds' },
-    { $group: { _id: '$recipientIds', kudosReceived: { $sum: 1 }, pointsEarned: { $sum: '$pointsAwarded' } } },
-    { $sort: { kudosReceived: -1 } },
-    { $limit: Number(lim) },
-  ];
+  const rows = await knex('kudos')
+    .where({ companyId: req.user.companyId ?? null }).where('createdAt', '>=', startDate)
+    .crossJoin(knex.raw('jsonb_array_elements_text("recipientIds") as "recipientId"'))
+    .select('recipientId')
+    .count('* as kudosReceived')
+    .sum('pointsAwarded as pointsEarned')
+    .groupBy('recipientId')
+    .orderBy('kudosReceived', 'desc')
+    .limit(Number(lim));
 
-  const results = await global.dbo.collection('kudos').aggregate(pipeline).toArray();
   const enriched = await Promise.all(
-    results.map(async (r, i) => {
-      const emp = await findOne('employees', { _id: r._id }, { projection: { fullName: 1, department: 1, designation: 1 } });
+    rows.map(async (r, i) => {
+      const emp = await knex('employees').where({ id: r.recipientId }).select('fullName', 'department', 'designation').first();
       return {
         rank: i + 1,
-        employeeId: String(r._id),
+        employeeId: r.recipientId,
         employeeName: emp?.fullName ?? '',
         designation: emp?.designation ?? '',
         department: emp?.department ?? '',
-        kudosReceived: r.kudosReceived,
-        pointsEarned: r.pointsEarned,
+        kudosReceived: Number(r.kudosReceived),
+        pointsEarned: Number(r.pointsEarned) || 0,
       };
     })
   );
 
-  const filtered = department ? enriched.filter(r => r.department === department) : enriched;
+  const filtered = department ? enriched.filter((r) => r.department === department) : enriched;
   return returnFunction(res, 200, true, 'OK', filtered);
 };
 
 const getMyRank = async (req, res) => {
-  const empId = req.user.employeeId || req.user._id;
+  const empId = actingPersonId(req);
   const now = new Date();
   const startDate = new Date(now.getFullYear(), now.getMonth(), 1);
 
-  const pipeline = [
-    { $match: { companyId: req.user.companyId, createdAt: { $gte: startDate } } },
-    { $unwind: '$recipientIds' },
-    { $group: { _id: '$recipientIds', count: { $sum: 1 } } },
-    { $sort: { count: -1 } },
-  ];
+  const rows = await knex('kudos')
+    .where({ companyId: req.user.companyId ?? null }).where('createdAt', '>=', startDate)
+    .crossJoin(knex.raw('jsonb_array_elements_text("recipientIds") as "recipientId"'))
+    .select('recipientId')
+    .count('* as count')
+    .groupBy('recipientId')
+    .orderBy('count', 'desc');
 
-  const all = await global.dbo.collection('kudos').aggregate(pipeline).toArray();
-  const idx = all.findIndex(r => String(r._id) === String(empId));
+  const idx = rows.findIndex((r) => String(r.recipientId) === String(empId));
   return returnFunction(res, 200, true, 'OK', {
     rank: idx >= 0 ? idx + 1 : null,
-    kudosReceived: idx >= 0 ? all[idx].count : 0,
-    total: all.length,
+    kudosReceived: idx >= 0 ? Number(rows[idx].count) : 0,
+    total: rows.length,
   });
 };
 
 // ── AWARD PROGRAMS ─────────────────────────────────────────────────────────────
 
 const listPrograms = async (req, res) => {
-  const programs = await findMany('award_programs', { companyId: req.user.companyId }, { sort: { createdAt: -1 } });
+  const programs = await knex('award_programs').where({ companyId: req.user.companyId ?? null }).orderBy('createdAt', 'desc');
 
-  const enriched = await Promise.all(programs.map(async p => {
-    const nomineeCount = await global.dbo.collection('award_nominations')
-      .countDocuments({ programId: p._id, cycleStart: p.currentCycleStart });
-    return { ...p, nomineeCount };
+  const enriched = await Promise.all(programs.map(async (p) => {
+    const [{ count: nomineeCount }] = await knex('award_nominations').where({ programId: p.id, cycleStart: p.currentCycleStart }).count('* as count');
+    return { ...p, nomineeCount: Number(nomineeCount) };
   }));
   return returnFunction(res, 200, true, 'OK', enriched);
 };
@@ -542,8 +478,8 @@ const createProgram = async (req, res) => {
   const { name, description, icon, frequency, nominationBy, selectionMethod, prizeType, prizeDescription, announcementMethod, cycleStart, cycleEnd } = req.body;
   if (!name?.trim()) return returnFunction(res, 400, false, 'Program name required', null);
 
-  const doc = {
-    companyId: req.user.companyId,
+  const [saved] = await knex('award_programs').insert({
+    id: newId(), companyId: req.user.companyId ?? null,
     name: name.trim(), description: description || '',
     icon: icon || '🏆', frequency: frequency || 'monthly',
     status: 'active',
@@ -554,16 +490,15 @@ const createProgram = async (req, res) => {
     announcementMethod: announcementMethod || 'both',
     currentCycleStart: cycleStart ? new Date(cycleStart) : new Date(),
     currentCycleEnd: cycleEnd ? new Date(cycleEnd) : null,
-    createdBy: new ObjectId(req.user.id),
+    createdBy: req.user.id,
     createdAt: new Date(),
-  };
+  }).returning('*');
 
-  const result = await global.dbo.collection('award_programs').insertOne(doc);
-  return returnFunction(res, 201, true, 'Program created', { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, 'Program created', saved);
 };
 
 const getProgram = async (req, res) => {
-  const p = await findOne('award_programs', { _id: new ObjectId(req.params.id) });
+  const p = await knex('award_programs').where({ id: req.params.id }).first();
   if (!p) return returnFunction(res, 404, false, 'Program not found', null);
   return returnFunction(res, 200, true, 'OK', p);
 };
@@ -577,7 +512,7 @@ const updateProgram = async (req, res) => {
   if (cycleStart) update.currentCycleStart = new Date(cycleStart);
   if (cycleEnd) update.currentCycleEnd = new Date(cycleEnd);
 
-  await global.dbo.collection('award_programs').updateOne({ _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('award_programs').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, 'Program updated', null);
 };
 
@@ -585,42 +520,32 @@ const nominateForProgram = async (req, res) => {
   const { nomineeId, reason, valueId } = req.body;
   if (!nomineeId || !reason?.trim()) return returnFunction(res, 400, false, 'Nominee and reason required', null);
 
-  const program = await findOne('award_programs', { _id: new ObjectId(req.params.id) });
+  const program = await knex('award_programs').where({ id: req.params.id }).first();
   if (!program) return returnFunction(res, 404, false, 'Program not found', null);
 
-  const doc = {
-    companyId: req.user.companyId,
-    programId: new ObjectId(req.params.id),
-    nomineeId: new ObjectId(nomineeId),
-    nominatorId: new ObjectId(req.user.id),
-    reason,
-    valueId: valueId ? new ObjectId(valueId) : null,
-    cycleStart: program.currentCycleStart,
-    isWinner: false,
-    createdAt: new Date(),
-  };
-  const result = await global.dbo.collection('award_nominations').insertOne(doc);
+  const [saved] = await knex('award_nominations').insert({
+    id: newId(), companyId: req.user.companyId ?? null,
+    programId: req.params.id, nomineeId, nominatorId: req.user.id,
+    reason, valueId: valueId || null, cycleStart: program.currentCycleStart,
+    isWinner: false, createdAt: new Date(),
+  }).returning('*');
 
-  const nominee = await findOne('employees', { _id: doc.nomineeId }, { projection: { fullName: 1 } });
+  const nominee = await knex('employees').where({ id: nomineeId }).select('fullName').first();
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Award Nomination Submitted',
     body: `${nominee?.fullName || 'An employee'} was nominated for "${program.name}".`,
     type: 'general',
   }).catch(() => {});
 
-  return returnFunction(res, 201, true, 'Nomination submitted', { _id: result.insertedId });
+  return returnFunction(res, 201, true, 'Nomination submitted', { id: saved.id });
 };
 
 const listNominations = async (req, res) => {
-  const noms = await global.dbo
-    .collection('award_nominations')
-    .find({ programId: new ObjectId(req.params.id) })
-    .sort({ createdAt: -1 })
-    .toArray();
+  const noms = await knex('award_nominations').where({ programId: req.params.id }).orderBy('createdAt', 'desc');
 
-  const enriched = await Promise.all(noms.map(async n => {
-    const nominee   = await findOne('employees', { _id: n.nomineeId }, { projection: { fullName: 1, department: 1, designation: 1 } });
-    const nominator = await findOne('employees', { _id: n.nominatorId }, { projection: { fullName: 1 } });
+  const enriched = await Promise.all(noms.map(async (n) => {
+    const nominee   = await knex('employees').where({ id: n.nomineeId }).select('fullName', 'department', 'designation').first();
+    const nominator = await knex('employees').where({ id: n.nominatorId }).select('fullName').first();
     return { ...n, nominee, nominator };
   }));
 
@@ -631,38 +556,27 @@ const selectWinner = async (req, res) => {
   const { winnerId } = req.body;
   if (!winnerId) return returnFunction(res, 400, false, 'Winner ID required', null);
 
-  const winner = await findOne('employees', { _id: new ObjectId(winnerId) }, { projection: { fullName: 1, department: 1 } });
+  const winner = await knex('employees').where({ id: winnerId }).select('fullName', 'department').first();
 
-  await global.dbo.collection('award_nominations').updateMany(
-    { programId: new ObjectId(req.params.id) },
-    { $set: { isWinner: false } }
-  );
-  await global.dbo.collection('award_nominations').updateOne(
-    { programId: new ObjectId(req.params.id), nomineeId: new ObjectId(winnerId) },
-    { $set: { isWinner: true, announcedAt: new Date() } }
-  );
+  await knex('award_nominations').where({ programId: req.params.id }).update({ isWinner: false });
+  await knex('award_nominations').where({ programId: req.params.id, nomineeId: winnerId }).update({ isWinner: true, announcedAt: new Date() });
 
-  const program = await findOne('award_programs', { _id: new ObjectId(req.params.id) });
+  const program = await knex('award_programs').where({ id: req.params.id }).first();
 
   // Create a feed post announcing the winner
   if (program) {
-    await global.dbo.collection('community_posts').insertOne({
-      companyId: req.user.companyId,
-      communityId: null,
-      authorId: new ObjectId(req.user.id),
-      type: 'announcement',
+    await knex('community_posts').insert({
+      id: newId(), companyId: req.user.companyId ?? null,
+      communityId: null, authorId: req.user.id, type: 'announcement',
       content: `🏆 **${program.name} Winner: ${winner?.fullName}!**\n\nCongratulations ${winner?.fullName} from ${winner?.department || 'our team'}! ${program.description || ''}`,
-      imageUrls: [],
+      imageUrls: JSON.stringify([]),
       isPinned: true,
-      reactions: [],
-      commentCount: 0,
-      viewCount: 0,
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      commentCount: 0, viewCount: 0,
+      createdAt: new Date(), updatedAt: new Date(),
     });
   }
 
-  notifyEmployee(new ObjectId(winnerId), {
+  notifyEmployee(winnerId, {
     title: 'Congratulations — you won an award!',
     body: `You were selected as the winner of "${program?.name || 'this award'}".`,
     type: 'general',
@@ -673,9 +587,12 @@ const selectWinner = async (req, res) => {
 };
 
 // ── RECOGNITION SETTINGS ───────────────────────────────────────────────────────
+// Singleton-per-company row (companyId is always null in real data — see
+// migration file header) — matches the one-row-table pattern established since
+// Phase 0/1's company_settings/tax_config.
 
 const getRecognitionSettings = async (req, res) => {
-  let settings = await findOne('recognition_settings', { companyId: req.user.companyId });
+  let settings = await knex('recognition_settings').where({ companyId: req.user.companyId ?? null }).first();
   if (!settings) {
     settings = {
       pointsEnabled: false, pointsPerKudos: 10, monthlyBudget: 100,
@@ -687,26 +604,23 @@ const getRecognitionSettings = async (req, res) => {
 };
 
 const updateRecognitionSettings = async (req, res) => {
-  const update = { ...req.body, companyId: req.user.companyId, updatedAt: new Date() };
-  await global.dbo.collection('recognition_settings').updateOne(
-    { companyId: req.user.companyId },
-    { $set: update },
-    { upsert: true }
-  );
+  const companyId = req.user.companyId ?? null;
+  const existing = await knex('recognition_settings').where({ companyId }).first();
+  const update = { ...req.body, companyId, updatedAt: new Date() };
+  delete update.id;
+  if (existing) {
+    await knex('recognition_settings').where({ id: existing.id }).update(update);
+  } else {
+    await knex('recognition_settings').insert({ id: newId(), ...update });
+  }
   return returnFunction(res, 200, true, 'Settings saved', null);
 };
 
 const searchColleagues = async (req, res) => {
   const { q = '' } = req.query;
-  const filter = { status: { $ne: 'terminated' } };
-  if (q.trim()) {
-    filter.fullName = { $regex: q.trim(), $options: 'i' };
-  }
-  const employees = await findMany(
-    'employees',
-    filter,
-    { limit: 20, sort: { fullName: 1 }, projection: { fullName: 1, designation: 1, department: 1 } }
-  );
+  let query = knex('employees').whereNot({ status: 'terminated' });
+  if (q.trim()) query = query.whereILike('fullName', `%${q.trim()}%`);
+  const employees = await query.select('id', 'fullName', 'designation', 'department').orderBy('fullName').limit(20);
   return returnFunction(res, 200, true, 'OK', employees);
 };
 

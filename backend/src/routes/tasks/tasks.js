@@ -6,7 +6,7 @@ const { ALL_ROLES } = require('../../constants/roles');
 const {
   getTaskStats, getMyTasks, listTeamTasks, listAllTasks,
   getTaskDetail, createTask, updateTask, deleteTask,
-  completeTask, reopenTask, addComment, addSubtask, toggleSubtask,
+  completeTask, reopenTask, updateTaskStatus, addComment, addSubtask, toggleSubtask,
   exportTasksCSV, getTaskAnalytics,
   searchEmployeesForTask, listEmployeesWithTaskCounts, listTasksByEmployee,
   listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, applyTemplate,
@@ -43,23 +43,11 @@ router.delete('/tasks/:id',                      allowRoles(HR),   AsyncHandler(
 // ── Task actions ──────────────────────────────────────────────────────────────
 router.put('/tasks/:id/complete',                auth, AsyncHandler(completeTask));
 router.put('/tasks/:id/reopen',                  auth, AsyncHandler(reopenTask));
-router.patch('/tasks/:id/status',                auth, AsyncHandler(async (req, res) => {
-  // Quick status patch — used by staff portal
-  const { ObjectId } = require('mongodb');
-  const returnFunction = require('../../functions/returnFunction');
-  const { findOne } = require('../../functions/Database/commonDBFunctions');
-  const VALID = ['not_started', 'in_progress', 'completed', 'overdue', 'blocked'];
-  const { status } = req.body;
-  if (!VALID.includes(status)) return returnFunction(res, 400, false, 'Invalid status.');
-  const task = await findOne('tasks', { _id: new ObjectId(req.params.id) });
-  if (!task) return returnFunction(res, 404, false, 'Task not found.');
-  const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
-  if (!isHR && String(task.assignedTo) !== String(req.user.employeeId)) return returnFunction(res, 403, false, 'Forbidden.');
-  const patch = { status, updatedAt: new Date() };
-  if (status === 'completed') patch.completedAt = new Date();
-  await global.dbo.collection('tasks').updateOne({ _id: task._id }, { $set: patch });
-  return returnFunction(res, 200, true, 'Status updated.');
-}));
+// Quick status patch — used by staff portal. Moved into taskFunctions.js as a
+// real exported handler (was an inline closure here, bypassing that file's
+// shared VALID_STATUSES/auth pattern — the same route-glue-in-the-router smell
+// flagged in earlier phases).
+router.patch('/tasks/:id/status',                auth, AsyncHandler(updateTaskStatus));
 
 router.post('/tasks/:id/comment',                auth, AsyncHandler(addComment));
 router.post('/tasks/:id/subtask',                auth, AsyncHandler(addSubtask));

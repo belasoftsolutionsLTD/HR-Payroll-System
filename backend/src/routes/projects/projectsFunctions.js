@@ -1,11 +1,14 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 9) — projects/project_members/project_invites/
+// project_subtasks/project_notes/project_chat_groups/project_messages/
+// project_time_entries are Postgres now. employees/users have been Postgres
+// since Phase 1.
 const path   = require('path');
 const fs     = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { createInboxItem } = require('../inbox/inboxFunctions');
 const { sendEmail } = require('../../services/emailService');
 const { generateStaffNumber } = require('../../functions/HR/staffNumberGenerator');
@@ -23,10 +26,9 @@ const UPLOAD_BASE = path.join(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function getEmployeeDept(userId) {
-  try {
-    const emp = await findOne('employees', { _id: new ObjectId(String(userId)) });
-    return emp?.department ?? null;
-  } catch { return null; }
+  if (!userId) return null;
+  const emp = await knex('employees').where({ id: String(userId) }).first();
+  return emp?.department ?? null;
 }
 
 function isSupervisor(project, userId) {
@@ -40,37 +42,37 @@ function isSupervisor(project, userId) {
 // to any project's chat by guessing the project id).
 //
 // IMPORTANT: `project_members.employeeId` (and `assignedEmployees.employeeId`) store
-// the EMPLOYEE record's _id, not the USER account's _id — these are different
-// documents in different collections, never equal. `req.user._id` is the user id;
-// `req.user.employeeId` (attached by AuthMiddleware) is the linked employee id. Every
-// membership/department lookup below must use `reqUser.employeeId`, while
-// `isSupervisor` (which compares against `project.createdBy`, itself always a user id)
-// correctly keeps using `reqUser._id`.
+// the EMPLOYEE record's id, not the USER account's id — these are different rows in
+// different tables, never equal. `req.user.id` is the user id; `req.user.employeeId`
+// (attached by AuthMiddleware, a Mongo ObjectId instance — always String()-wrap it) is
+// the linked employee id. Every membership/department lookup below must use
+// `reqUser.employeeId`, while `isSupervisor` (which compares against
+// `project.createdBy`, itself always a user id) correctly keeps using `reqUser.id`.
 async function canAccessProject(project, reqUser) {
   if (HR_ROLES.includes(reqUser.role)) return true;
-  if (isSupervisor(project, reqUser._id)) return true;
+  if (isSupervisor(project, reqUser.id)) return true;
   if (reqUser.employeeId) {
-    const member = await findOne('project_members', { projectId: project._id, employeeId: new ObjectId(String(reqUser.employeeId)) });
+    const member = await knex('project_members').where({ projectId: project.id, employeeId: String(reqUser.employeeId) }).first();
     if (member) return true;
   }
   if (reqUser.role === 'department_head') {
     const dept = await getEmployeeDept(reqUser.employeeId);
-    if (dept && project.departments?.includes(dept)) return true;
+    if (dept && (project.departments || []).includes(dept)) return true;
   }
   return false;
 }
 
 async function notifyProjectMembers(projectId, item, excludeId = null) {
-  const members = await findMany('project_members', { projectId: new ObjectId(String(projectId)) }, { projection: { employeeId: 1 } });
-  const project = await findOne('projects', { _id: new ObjectId(String(projectId)) }, { projection: { createdBy: 1 } });
+  const members = await knex('project_members').where({ projectId: String(projectId) }).select('employeeId');
+  const project = await knex('projects').where({ id: String(projectId) }).select('createdBy').first();
 
-  const recipientIds = new Set(members.map(m => String(m.employeeId)));
+  const recipientIds = new Set(members.map((m) => String(m.employeeId)));
   if (project?.createdBy) recipientIds.add(String(project.createdBy));
   if (excludeId) recipientIds.delete(String(excludeId));
 
   for (const rId of recipientIds) {
     try {
-      await createInboxItem({ ...item, recipientId: new ObjectId(rId), referenceId: new ObjectId(String(projectId)) });
+      await createInboxItem({ ...item, recipientId: rId, referenceId: String(projectId) });
     } catch { /* ignore individual notification failures */ }
   }
 }
@@ -78,59 +80,47 @@ async function notifyProjectMembers(projectId, item, excludeId = null) {
 // ── List Projects ─────────────────────────────────────────────────────────────
 
 const listProjects = async (req, res) => {
-  const userId = req.user._id;
+  const userId = req.user.id;
   const role   = req.user.role;
   const { page, limit, skip } = getPagination(req.query);
 
-  let filter = {};
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.search) {
-    filter.name = { $regex: req.query.search, $options: 'i' };
-  }
+  let query = knex('projects');
+  if (req.query.status) query = query.where({ status: req.query.status });
+  if (req.query.search) query = query.whereILike('name', `%${req.query.search}%`);
 
   if (!HR_ROLES.includes(role)) {
     // Build a filter that includes: projects I created OR I'm a member of OR (dept head) dept is involved.
     // project_members.employeeId is an EMPLOYEE id, not a user id — must match against
-    // req.user.employeeId, never req.user._id (see canAccessProject's comment above).
-    const memberProjects = req.user.employeeId
-      ? await findMany('project_members', { employeeId: new ObjectId(String(req.user.employeeId)) }, { projection: { projectId: 1 } })
+    // req.user.employeeId, never req.user.id (see canAccessProject's comment above).
+    const myEmployeeId = req.user.employeeId ? String(req.user.employeeId) : null;
+    const memberProjects = myEmployeeId
+      ? await knex('project_members').where({ employeeId: myEmployeeId }).select('projectId')
       : [];
-    const memberIds = memberProjects.map(m => m.projectId);
+    const memberIds = memberProjects.map((m) => m.projectId);
 
-    const orClauses = [
-      { createdBy: new ObjectId(String(userId)) },
-      ...(memberIds.length ? [{ _id: { $in: memberIds } }] : []),
-    ];
+    let myDept = null;
+    if (role === 'department_head') myDept = await getEmployeeDept(myEmployeeId);
 
-    if (role === 'department_head') {
-      const dept = await getEmployeeDept(req.user.employeeId);
-      if (dept) orClauses.push({ departments: dept });
-    }
-
-    if (filter.name) {
-      const baseOr = { $or: orClauses };
-      filter = { $and: [{ name: filter.name }, baseOr] };
-    } else {
-      filter.$or = orClauses;
-    }
-    if (filter.status) filter.status = req.query.status;
+    query = query.where((qb) => {
+      qb.where({ createdBy: userId });
+      if (memberIds.length) qb.orWhereIn('id', memberIds);
+      if (myDept) qb.orWhereRaw('departments @> ?', [JSON.stringify([myDept])]);
+    });
   }
 
-  const [total, data] = await Promise.all([
-    countDocuments('projects', filter),
-    findMany('projects', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const data = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  const enriched = await Promise.all(data.map(async p => {
-    const [memberCount, subtaskCount, completedSubtasks] = await Promise.all([
-      countDocuments('project_members', { projectId: p._id }),
-      countDocuments('project_subtasks', { projectId: p._id }),
-      countDocuments('project_subtasks', { projectId: p._id, status: 'completed' }),
+  const enriched = await Promise.all(data.map(async (p) => {
+    const [[{ count: memberCount }], [{ count: subtaskCount }], [{ count: completedSubtasks }]] = await Promise.all([
+      knex('project_members').where({ projectId: p.id }).count('* as count'),
+      knex('project_subtasks').where({ projectId: p.id }).count('* as count'),
+      knex('project_subtasks').where({ projectId: p.id, status: 'completed' }).count('* as count'),
     ]);
-    return { ...p, memberCount, subtaskCount, completedSubtasks };
+    return { ...p, memberCount: Number(memberCount), subtaskCount: Number(subtaskCount), completedSubtasks: Number(completedSubtasks) };
   }));
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 // ── Create Project ────────────────────────────────────────────────────────────
@@ -144,41 +134,42 @@ const createProject = async (req, res) => {
 
   let supervisorName = req.user.name || '';
   if (!supervisorName) {
-    const supEmp = await findOne('employees', { _id: new ObjectId(String(req.user._id)) }, { projection: { fullName: 1 } });
+    const supEmp = await knex('employees').where({ id: req.user.id }).select('fullName').first();
     supervisorName = supEmp?.fullName ?? 'Supervisor';
   }
 
   let teamLeaderName = null;
   if (teamLeaderId) {
-    const tl = await findOne('employees', { _id: new ObjectId(String(teamLeaderId)) }, { projection: { fullName: 1 } });
+    const tl = await knex('employees').where({ id: teamLeaderId }).select('fullName').first();
     teamLeaderName = tl?.fullName ?? null;
   }
 
   const doc = {
+    id: newId(),
     name: name.trim(),
     description: description || null,
     status: 'in_progress',
     startDate:  startDate ? new Date(startDate) : null,
     endDate:    endDate   ? new Date(endDate)   : null,
-    departments: depts,
-    teamLeaderId:   teamLeaderId ? new ObjectId(String(teamLeaderId)) : null,
+    departments: JSON.stringify(depts),
+    teamLeaderId: teamLeaderId || null,
     teamLeaderName,
-    createdBy:      new ObjectId(String(req.user._id)),
+    createdBy: req.user.id,
     supervisorName,
     completedAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
-  const result    = await insertOne('projects', doc);
-  const projectId = result.insertedId;
+  const [saved] = await knex('projects').insert(doc).returning('*');
+  const projectId = saved.id;
 
   // Add team leader as member (role: team_leader)
   const addedIds = new Set();
   if (teamLeaderId) {
-    const tl = await findOne('employees', { _id: new ObjectId(String(teamLeaderId)) }, { projection: { fullName: 1, department: 1 } });
-    await global.dbo.collection('project_members').insertOne({
-      projectId, employeeId: new ObjectId(String(teamLeaderId)),
+    const tl = await knex('employees').where({ id: teamLeaderId }).select('fullName', 'department').first();
+    await knex('project_members').insert({
+      id: newId(), projectId, employeeId: teamLeaderId,
       name: tl?.fullName ?? 'Team Leader', department: tl?.department ?? '',
       role: 'team_leader', addedAt: new Date(),
     });
@@ -188,10 +179,10 @@ const createProject = async (req, res) => {
   // Add remaining members
   for (const empId of members) {
     if (addedIds.has(String(empId))) continue;
-    const emp = await findOne('employees', { _id: new ObjectId(String(empId)) }, { projection: { fullName: 1, department: 1 } });
+    const emp = await knex('employees').where({ id: empId }).select('fullName', 'department').first();
     if (!emp) continue;
-    await global.dbo.collection('project_members').insertOne({
-      projectId, employeeId: new ObjectId(String(empId)),
+    await knex('project_members').insert({
+      id: newId(), projectId, employeeId: empId,
       name: emp.fullName, department: emp.department ?? '',
       role: 'member', addedAt: new Date(),
     });
@@ -202,24 +193,23 @@ const createProject = async (req, res) => {
   const allNotifyIds = [...(teamLeaderId ? [teamLeaderId] : []), ...members];
   for (const empId of allNotifyIds) {
     await createInboxItem({
-      recipientId: new ObjectId(String(empId)),
+      recipientId: empId,
       type: 'project', subType: 'project_assigned',
       title: `You've been added to project: ${name.trim()}`,
       subtitle: `Supervisor: ${supervisorName}`,
       referenceId: projectId, referenceModel: 'projects',
       requiresAction: false, priority: 'normal',
-      triggeredBy: req.user._id,
+      triggeredBy: req.user.id,
     }).catch(() => {});
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: projectId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: projectId });
 };
 
 // ── Get Project ───────────────────────────────────────────────────────────────
 
 const getProject = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
   // Was reachable by any authenticated user regardless of role — the route-level
@@ -233,39 +223,40 @@ const getProject = async (req, res) => {
   }
 
   const [members, subtasks] = await Promise.all([
-    findMany('project_members', { projectId }),
-    findMany('project_subtasks', { projectId }, { sort: { createdAt: 1 } }),
+    knex('project_members').where({ projectId: project.id }),
+    knex('project_subtasks').where({ projectId: project.id }).orderBy('createdAt', 'asc'),
   ]);
 
-  const enrichedMembers = await Promise.all(members.map(async m => {
-    const emp = await findOne('employees', { _id: m.employeeId }, { projection: { fullName: 1, department: 1, jobTitle: 1 } });
+  const enrichedMembers = await Promise.all(members.map(async (m) => {
+    const emp = await knex('employees').where({ id: m.employeeId }).select('fullName', 'department', 'designation').first();
     return { ...m, employee: emp ?? null };
   }));
 
-  const supervisor = await findOne('employees', { _id: project.createdBy }, { projection: { fullName: 1, department: 1, jobTitle: 1 } });
+  const supervisor = await knex('employees').where({ id: project.createdBy }).select('fullName', 'department', 'designation').first();
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const role   = req.user.role;
+  const myEmployeeId = req.user.employeeId ? String(req.user.employeeId) : null;
   let myRole       = null;
   let myDepartment = null;
 
   if (HR_ROLES.includes(role) || isSupervisor(project, userId)) {
     myRole = 'supervisor';
-  } else if (req.user.employeeId) {
-    const member = enrichedMembers.find(m => String(m.employeeId) === String(req.user.employeeId));
+  } else if (myEmployeeId) {
+    const member = enrichedMembers.find((m) => String(m.employeeId) === myEmployeeId);
     myRole = member?.role ?? null;
   }
 
   if (role === 'department_head') {
-    myDepartment = await getEmployeeDept(req.user.employeeId);
+    myDepartment = await getEmployeeDept(myEmployeeId);
   }
 
   const deptProgress = {};
   for (const dept of (project.departments || [])) {
-    const deptSubs = subtasks.filter(s => s.department === dept);
+    const deptSubs = subtasks.filter((s) => s.department === dept);
     deptProgress[dept] = {
       total:     deptSubs.length,
-      completed: deptSubs.filter(s => s.status === 'completed').length,
+      completed: deptSubs.filter((s) => s.status === 'completed').length,
     };
   }
 
@@ -274,7 +265,7 @@ const getProject = async (req, res) => {
     supervisor: supervisor ?? null,
     members: enrichedMembers,
     subtaskCount:       subtasks.length,
-    completedSubtasks:  subtasks.filter(s => s.status === 'completed').length,
+    completedSubtasks:  subtasks.filter((s) => s.status === 'completed').length,
     deptProgress,
     myRole,
     myDepartment,
@@ -284,10 +275,10 @@ const getProject = async (req, res) => {
 // ── Update Project ────────────────────────────────────────────────────────────
 
 const updateProject = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can edit this project.');
   }
 
@@ -298,19 +289,19 @@ const updateProject = async (req, res) => {
   if (startDate   !== undefined) update.startDate   = startDate ? new Date(startDate) : null;
   if (endDate     !== undefined) update.endDate     = endDate   ? new Date(endDate)   : null;
   if (status      !== undefined) update.status      = status;
-  if (departments !== undefined) update.departments = Array.isArray(departments) ? departments : [departments];
+  if (departments !== undefined) update.departments = JSON.stringify(Array.isArray(departments) ? departments : [departments]);
 
-  await updateOne('projects', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('projects').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 // ── Complete Project (supervisor only) ────────────────────────────────────────
 
 const completeProject = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!isSupervisor(project, req.user._id) && !HR_ROLES.includes(req.user.role)) {
+  if (!isSupervisor(project, req.user.id) && !HR_ROLES.includes(req.user.role)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can mark this project as complete.');
   }
   if (project.status === 'completed') {
@@ -318,17 +309,15 @@ const completeProject = async (req, res) => {
   }
 
   const now = new Date();
-  await updateOne('projects', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'completed', completedAt: now, updatedAt: now },
-  });
+  await knex('projects').where({ id: req.params.id }).update({ status: 'completed', completedAt: now, updatedAt: now });
 
   await notifyProjectMembers(req.params.id, {
     type: 'project', subType: 'project_completed',
     title: `Project "${project.name}" has been completed`,
     subtitle: `Marked complete by ${req.user.name || 'Supervisor'}`,
     referenceModel: 'projects', requiresAction: false, priority: 'normal',
-    triggeredBy: req.user._id,
-  }, req.user._id);
+    triggeredBy: req.user.id,
+  }, req.user.id);
 
   return returnFunction(res, 200, true, 'Project marked as completed.');
 };
@@ -336,25 +325,25 @@ const completeProject = async (req, res) => {
 // ── Delete Project ────────────────────────────────────────────────────────────
 
 const deleteProject = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
   // Delete attachments
-  const subtasks = await findMany('project_subtasks', { projectId });
+  const subtasks = await knex('project_subtasks').where({ projectId: project.id });
   for (const s of subtasks) {
     for (const f of [s.attachmentFilename, s.deptHeadReport?.attachmentFilename]) {
       if (f) { try { fs.unlinkSync(path.join(UPLOAD_BASE, f)); } catch { /* ok */ } }
     }
   }
 
-  await Promise.all([
-    global.dbo.collection('projects').deleteOne({ _id: projectId }),
-    global.dbo.collection('project_members').deleteMany({ projectId }),
-    global.dbo.collection('project_subtasks').deleteMany({ projectId }),
-    global.dbo.collection('project_notes').deleteMany({ projectId }),
-    global.dbo.collection('project_messages').deleteMany({ projectId }),
-  ]);
+  await knex('project_time_entries').where({ projectId: project.id }).delete();
+  await knex('project_messages').where({ projectId: project.id }).delete();
+  await knex('project_chat_groups').where({ projectId: project.id }).delete();
+  await knex('project_notes').where({ projectId: project.id }).delete();
+  await knex('project_subtasks').where({ projectId: project.id }).delete();
+  await knex('project_invites').where({ projectId: project.id }).delete();
+  await knex('project_members').where({ projectId: project.id }).delete();
+  await knex('projects').where({ id: project.id }).delete();
 
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
@@ -362,11 +351,10 @@ const deleteProject = async (req, res) => {
 // ── Members ───────────────────────────────────────────────────────────────────
 
 const addMembers = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can add members.');
   }
 
@@ -374,22 +362,22 @@ const addMembers = async (req, res) => {
   const ids = Array.isArray(memberIds) ? memberIds : [memberIds];
 
   for (const empId of ids.filter(Boolean)) {
-    const existing = await findOne('project_members', { projectId, employeeId: new ObjectId(String(empId)) });
+    const existing = await knex('project_members').where({ projectId: project.id, employeeId: empId }).first();
     if (existing) continue;
-    const emp = await findOne('employees', { _id: new ObjectId(String(empId)) }, { projection: { fullName: 1, department: 1 } });
-    await global.dbo.collection('project_members').insertOne({
-      projectId, employeeId: new ObjectId(String(empId)),
+    const emp = await knex('employees').where({ id: empId }).select('fullName', 'department').first();
+    await knex('project_members').insert({
+      id: newId(), projectId: project.id, employeeId: empId,
       name: emp?.fullName ?? '', department: emp?.department ?? '',
       role: memberRole || 'member', addedAt: new Date(),
     });
     await createInboxItem({
-      recipientId: new ObjectId(String(empId)),
+      recipientId: empId,
       type: 'project', subType: 'project_assigned',
       title: `You've been added to project: ${project.name}`,
       subtitle: `You have been assigned as ${memberRole || 'member'}.`,
-      referenceId: projectId, referenceModel: 'projects',
+      referenceId: project.id, referenceModel: 'projects',
       requiresAction: false, priority: 'normal',
-      triggeredBy: req.user._id,
+      triggeredBy: req.user.id,
     }).catch(() => {});
   }
 
@@ -397,17 +385,14 @@ const addMembers = async (req, res) => {
 };
 
 const removeMember = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can remove members.');
   }
 
-  await global.dbo.collection('project_members').deleteOne({
-    projectId, employeeId: new ObjectId(req.params.employeeId),
-  });
+  await knex('project_members').where({ projectId: project.id, employeeId: req.params.employeeId }).delete();
   return returnFunction(res, 200, true, 'Member removed.');
 };
 
@@ -428,11 +413,10 @@ const generateInvitePassword = () => {
 
 const createInvite = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'email', 'contractEndDate'])) return;
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can invite members.');
   }
 
@@ -444,14 +428,14 @@ const createInvite = async (req, res) => {
     return returnFunction(res, 400, false, 'contractEndDate must be a valid future date.');
   }
 
-  const existingUser = await findOne('users', { email });
+  const existingUser = await knex('users').where({ email }).first();
   if (existingUser) {
     return returnFunction(res, 409, false, `${email} already has an account — add them as a regular member instead of inviting them.`);
   }
   // Only a still-live pending invite blocks a re-invite — one that's pending in name
   // only (the invitee never clicked through before expiresAt passed) must not lock HR
   // out of ever inviting that email again.
-  const existingInvite = await findOne('project_invites', { projectId, email, status: 'pending', expiresAt: { $gt: new Date() } });
+  const existingInvite = await knex('project_invites').where({ projectId: project.id, email, status: 'pending' }).where('expiresAt', '>', new Date()).first();
   if (existingInvite) return returnFunction(res, 409, false, 'There is already a pending invite for this email on this project.');
 
   const rawToken = crypto.randomBytes(32).toString('hex');
@@ -459,12 +443,13 @@ const createInvite = async (req, res) => {
   const expiresAt = new Date(now.getTime() + INVITE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 
   const doc = {
-    projectId,
+    id: newId(),
+    projectId: project.id,
     projectName: project.name,
     email, name,
     projectRole,
     contractEndDate,
-    invitedBy: new ObjectId(String(req.user._id)),
+    invitedBy: req.user.id,
     invitedByName: req.user.name || 'Supervisor',
     tokenHash: crypto.createHash('sha256').update(rawToken).digest('hex'),
     status: 'pending',
@@ -473,7 +458,7 @@ const createInvite = async (req, res) => {
     respondedAt: null,
     createdAt: now, updatedAt: now,
   };
-  const result = await insertOne('project_invites', doc);
+  const [saved] = await knex('project_invites').insert(doc).returning('*');
 
   const inviteUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/en/project-invite/${rawToken}`;
   sendEmail({
@@ -490,36 +475,34 @@ const createInvite = async (req, res) => {
     `,
   }).catch(() => {});
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id });
 };
 
 const listInvites = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can view invites.');
   }
 
-  const invites = await findMany('project_invites', { projectId }, { sort: { createdAt: -1 } });
+  const invites = await knex('project_invites').where({ projectId: project.id }).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, invites);
 };
 
 const revokeInvite = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can revoke invites.');
   }
 
-  const invite = await findOne('project_invites', { _id: new ObjectId(req.params.inviteId), projectId });
+  const invite = await knex('project_invites').where({ id: req.params.inviteId, projectId: project.id }).first();
   if (!invite) return returnFunction(res, 404, false, req.locale.notFound);
   if (invite.status !== 'pending') return returnFunction(res, 400, false, 'Only pending invites can be revoked.');
 
-  await updateOne('project_invites', { _id: invite._id }, { $set: { status: 'revoked', updatedAt: new Date() } });
+  await knex('project_invites').where({ id: invite.id }).update({ status: 'revoked', updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Invite revoked.');
 };
 
@@ -527,15 +510,16 @@ const revokeInvite = async (req, res) => {
 // user exists for either action, matching respondToOfferCore's actingUser-less pattern.
 const findInviteByToken = async (rawToken) => {
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-  return findOne('project_invites', { tokenHash });
+  return knex('project_invites').where({ tokenHash }).first();
 };
 
 const acceptInviteCore = async (invite) => {
-  const project = await findOne('projects', { _id: invite.projectId });
+  const project = await knex('projects').where({ id: invite.projectId }).first();
   const hireDate = new Date();
   const staffNumber = await generateStaffNumber(hireDate.getFullYear());
 
   const empDoc = {
+    id: newId(),
     fullName: invite.name,
     firstName: null, lastName: null,
     email: invite.email,
@@ -550,20 +534,21 @@ const acceptInviteCore = async (invite) => {
     contractEndDate: invite.contractEndDate,
     probationEndDate: null, confirmationDate: null,
     terminationDate: null, terminationReason: null,
-    grossPay: null, nextOfKin: null, profilePhoto: null, documents: [],
+    grossPay: null, profilePhoto: null,
     status: 'active',
     createdAt: hireDate, updatedAt: hireDate,
   };
-  const empResult = await insertOne('employees', empDoc);
+  const [savedEmp] = await knex('employees').insert(empDoc).returning('*');
 
   const rawPassword = generateInvitePassword();
   const hashedPassword = await bcrypt.hash(rawPassword, 12);
-  await insertOne('users', {
+  await knex('users').insert({
+    id: newId(),
     name: invite.name,
     email: invite.email,
     password: hashedPassword,
     role: 'staff',
-    employeeId: empResult.insertedId,
+    employeeId: savedEmp.id,
     department: empDoc.department,
     mustResetPassword: true,
     isActive: true,
@@ -571,14 +556,14 @@ const acceptInviteCore = async (invite) => {
     createdAt: hireDate, updatedAt: hireDate,
   });
 
-  await insertOne('project_members', {
-    projectId: invite.projectId, employeeId: empResult.insertedId,
+  await knex('project_members').insert({
+    id: newId(), projectId: invite.projectId, employeeId: savedEmp.id,
     name: invite.name, department: empDoc.department || '',
     role: invite.projectRole || 'member', addedAt: hireDate,
   });
 
-  await updateOne('project_invites', { _id: invite._id }, {
-    $set: { status: 'accepted', respondedAt: hireDate, createdEmployeeId: empResult.insertedId, updatedAt: hireDate },
+  await knex('project_invites').where({ id: invite.id }).update({
+    status: 'accepted', respondedAt: hireDate, createdEmployeeId: savedEmp.id, updatedAt: hireDate,
   });
 
   sendEmail({
@@ -608,13 +593,13 @@ const acceptInviteCore = async (invite) => {
     }).catch(() => {});
   }
 
-  return empResult.insertedId;
+  return savedEmp.id;
 };
 
 const declineInviteCore = async (invite) => {
-  await updateOne('project_invites', { _id: invite._id }, { $set: { status: 'declined', respondedAt: new Date(), updatedAt: new Date() } });
+  await knex('project_invites').where({ id: invite.id }).update({ status: 'declined', respondedAt: new Date(), updatedAt: new Date() });
 
-  const project = await findOne('projects', { _id: invite.projectId }, { projection: { createdBy: 1, name: 1 } });
+  const project = await knex('projects').where({ id: invite.projectId }).select('createdBy', 'name').first();
   if (project?.createdBy) {
     await createInboxItem({
       recipientId: project.createdBy,
@@ -629,37 +614,36 @@ const declineInviteCore = async (invite) => {
 // ── Subtasks ──────────────────────────────────────────────────────────────────
 
 const listSubtasks = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const role   = req.user.role;
-  const filter = { projectId };
+  let query = knex('project_subtasks').where({ projectId: project.id });
 
   if (!HR_ROLES.includes(role) && !isSupervisor(project, userId)) {
     if (role === 'department_head') {
       const dept = await getEmployeeDept(req.user.employeeId);
-      if (dept) filter.department = dept;
+      if (dept) query = query.where({ department: dept });
     } else if (req.user.employeeId) {
       // Staff: see subtasks assigned to them — assignedEmployees.employeeId is an
-      // employee id, must match req.user.employeeId, not req.user._id.
-      filter['assignedEmployees.employeeId'] = new ObjectId(String(req.user.employeeId));
+      // employee id, must match req.user.employeeId, not req.user.id.
+      const myId = String(req.user.employeeId);
+      query = query.whereRaw(`"assignedEmployees" @> ?`, [JSON.stringify([{ employeeId: myId }])]);
     } else {
-      filter._id = null; // no linked employee record — nothing can be assigned to them
+      query = query.whereRaw('1 = 0'); // no linked employee record — nothing can be assigned to them
     }
   }
 
-  const subtasks = await findMany('project_subtasks', filter, { sort: { createdAt: 1 } });
+  const subtasks = await query.orderBy('createdAt', 'asc');
   return returnFunction(res, 200, true, req.locale.success, subtasks);
 };
 
 const createSubtask = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can create subtasks.');
   }
 
@@ -669,46 +653,50 @@ const createSubtask = async (req, res) => {
   }
 
   const doc = {
-    projectId,
+    id: newId(),
+    projectId: project.id,
     title:       title.trim(),
     description: description || null,
     department,
     attachmentFilename:    req.file?.filename     ?? null,
     attachmentOriginalName: req.file?.originalname ?? null,
     status: 'not_started',
-    assignedEmployees: [],
+    assignedEmployees: JSON.stringify([]),
     deptHeadReport: null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
-  const result = await insertOne('project_subtasks', doc);
+  const [saved] = await knex('project_subtasks').insert(doc).returning('*');
 
-  // Notify department heads in the target department
-  const deptHeads = await findMany('employees',
-    { department, role: 'department_head' },
-    { projection: { _id: 1 } }
-  );
+  // Notify department heads in the target department. Fixed forward — the
+  // original query filtered `employees` by a `role` field that only ever
+  // existed on `users` (employees has no role column at all; this silently
+  // matched nothing under Mongo too, a pre-existing dead notification path,
+  // not something this migration introduced — see approvalChain.js's
+  // department_head resolution in lib/spend/ for the same, already-correct
+  // pattern used elsewhere in this project).
+  const deptHeads = await knex('users').where({ department, role: 'department_head' }).select('id');
   for (const dh of deptHeads) {
     await createInboxItem({
-      recipientId: dh._id,
+      recipientId: dh.id,
       type: 'project', subType: 'subtask_assigned',
       title: `New subtask for ${department}: "${title.trim()}"`,
       subtitle: `Project: ${project.name}`,
-      referenceId: projectId, referenceModel: 'projects',
+      referenceId: project.id, referenceModel: 'projects',
       requiresAction: true, priority: 'normal',
-      triggeredBy: req.user._id,
+      triggeredBy: req.user.id,
     }).catch(() => {});
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id });
 };
 
 const updateSubtask = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can edit subtasks.');
   }
 
@@ -719,24 +707,24 @@ const updateSubtask = async (req, res) => {
   if (department  !== undefined) update.department  = department;
   if (status      !== undefined) update.status      = status;
 
-  await updateOne('project_subtasks', { _id: new ObjectId(req.params.subId) }, { $set: update });
+  await knex('project_subtasks').where({ id: req.params.subId }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteSubtask = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user._id)) {
+  if (!HR_ROLES.includes(req.user.role) && !isSupervisor(project, req.user.id)) {
     return returnFunction(res, 403, false, 'Only the project supervisor can delete subtasks.');
   }
 
-  const subtask = await findOne('project_subtasks', { _id: new ObjectId(req.params.subId) });
+  const subtask = await knex('project_subtasks').where({ id: req.params.subId }).first();
   if (subtask) {
     for (const f of [subtask.attachmentFilename, subtask.deptHeadReport?.attachmentFilename]) {
       if (f) { try { fs.unlinkSync(path.join(UPLOAD_BASE, f)); } catch { /* ok */ } }
     }
-    await global.dbo.collection('project_subtasks').deleteOne({ _id: new ObjectId(req.params.subId) });
+    await knex('project_subtasks').where({ id: req.params.subId }).delete();
   }
 
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
@@ -744,13 +732,13 @@ const deleteSubtask = async (req, res) => {
 
 // Dept head assigns employees to their department's subtask
 const assignSubtaskEmployees = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const subtask = await findOne('project_subtasks', { _id: new ObjectId(req.params.subId) });
+  const subtask = await knex('project_subtasks').where({ id: req.params.subId }).first();
   if (!subtask) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId     = String(req.user._id);
+  const userId     = String(req.user.id);
   const isSup      = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
   const isDeptHead = req.user.role === 'department_head';
 
@@ -768,35 +756,35 @@ const assignSubtaskEmployees = async (req, res) => {
 
   const assignedEmployees = [];
   for (const empId of ids) {
-    const emp = await findOne('employees', { _id: new ObjectId(String(empId)) }, { projection: { fullName: 1, department: 1 } });
+    const emp = await knex('employees').where({ id: empId }).select('fullName', 'department').first();
     if (!emp) continue;
-    assignedEmployees.push({ employeeId: new ObjectId(String(empId)), name: emp.fullName, status: 'not_started' });
+    assignedEmployees.push({ employeeId: String(empId), name: emp.fullName, status: 'not_started' });
 
     // A subtask assignee needs to be a real project member — otherwise listProjects
     // never surfaces this project to them at all (they'd have no way to see the
     // project, its chat, or anything else about it, even though work was assigned).
-    const existingMember = await findOne('project_members', { projectId: project._id, employeeId: new ObjectId(String(empId)) });
+    const existingMember = await knex('project_members').where({ projectId: project.id, employeeId: empId }).first();
     if (!existingMember) {
-      await insertOne('project_members', {
-        projectId: project._id, employeeId: new ObjectId(String(empId)),
+      await knex('project_members').insert({
+        id: newId(), projectId: project.id, employeeId: empId,
         name: emp.fullName ?? '', department: emp.department ?? '',
         role: 'member', addedAt: new Date(),
       });
     }
 
     await createInboxItem({
-      recipientId: new ObjectId(String(empId)),
+      recipientId: empId,
       type: 'project', subType: 'subtask_assigned_to_you',
       title: `New subtask assigned to you: "${subtask.title}"`,
       subtitle: `Project: ${project.name}`,
-      referenceId: new ObjectId(req.params.id), referenceModel: 'projects',
+      referenceId: req.params.id, referenceModel: 'projects',
       requiresAction: false, priority: 'normal',
-      triggeredBy: new ObjectId(userId),
+      triggeredBy: userId,
     }).catch(() => {});
   }
 
-  await updateOne('project_subtasks', { _id: new ObjectId(req.params.subId) }, {
-    $set: { assignedEmployees, status: 'in_progress', updatedAt: new Date() },
+  await knex('project_subtasks').where({ id: req.params.subId }).update({
+    assignedEmployees: JSON.stringify(assignedEmployees), status: 'in_progress', updatedAt: new Date(),
   });
 
   return returnFunction(res, 200, true, 'Employees assigned to subtask.');
@@ -804,13 +792,13 @@ const assignSubtaskEmployees = async (req, res) => {
 
 // Dept head submits report back to supervisor
 const submitSubtaskReport = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const subtask = await findOne('project_subtasks', { _id: new ObjectId(req.params.subId) });
+  const subtask = await knex('project_subtasks').where({ id: req.params.subId }).first();
   if (!subtask) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
 
   if (!isSup && req.user.role === 'department_head') {
@@ -824,24 +812,22 @@ const submitSubtaskReport = async (req, res) => {
 
   let submitterName = req.user.name || '';
   if (!submitterName) {
-    const emp = await findOne('employees', { _id: new ObjectId(userId) }, { projection: { fullName: 1 } });
+    const emp = await knex('employees').where({ id: userId }).select('fullName').first();
     submitterName = emp?.fullName ?? 'Department Head';
   }
 
   const now = new Date();
-  await updateOne('project_subtasks', { _id: new ObjectId(req.params.subId) }, {
-    $set: {
-      deptHeadReport: {
-        text:                   req.body.reportText || '',
-        attachmentFilename:     req.file?.filename     ?? null,
-        attachmentOriginalName: req.file?.originalname ?? null,
-        submittedAt:            now,
-        submittedById:          new ObjectId(userId),
-        submittedByName:        submitterName,
-      },
-      status:    'completed',
-      updatedAt: now,
-    },
+  await knex('project_subtasks').where({ id: req.params.subId }).update({
+    deptHeadReport: JSON.stringify({
+      text:                   req.body.reportText || '',
+      attachmentFilename:     req.file?.filename     ?? null,
+      attachmentOriginalName: req.file?.originalname ?? null,
+      submittedAt:            now,
+      submittedById:          userId,
+      submittedByName:        submitterName,
+    }),
+    status:    'completed',
+    updatedAt: now,
   });
 
   // Notify supervisor
@@ -850,9 +836,9 @@ const submitSubtaskReport = async (req, res) => {
     type: 'project', subType: 'subtask_report_submitted',
     title: `Report submitted for subtask: "${subtask.title}"`,
     subtitle: `${submitterName} submitted their team's report for project "${project.name}"`,
-    referenceId: new ObjectId(req.params.id), referenceModel: 'projects',
+    referenceId: req.params.id, referenceModel: 'projects',
     requiresAction: false, priority: 'normal',
-    triggeredBy: new ObjectId(userId),
+    triggeredBy: userId,
   }).catch(() => {});
 
   return returnFunction(res, 200, true, 'Report submitted successfully.');
@@ -861,16 +847,15 @@ const submitSubtaskReport = async (req, res) => {
 // ── Notes ─────────────────────────────────────────────────────────────────────
 
 const listNotes = async (req, res) => {
-  const projectId = new ObjectId(req.params.id);
-  const project   = await findOne('projects', { _id: projectId });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const notes = await findMany('project_notes', { projectId }, { sort: { createdAt: -1 } });
+  const notes = await knex('project_notes').where({ projectId: project.id }).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, notes);
 };
 
 const createNote = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
   const { text } = req.body;
@@ -878,31 +863,32 @@ const createNote = async (req, res) => {
 
   let creatorName = req.user.name || '';
   if (!creatorName) {
-    const emp = await findOne('employees', { _id: new ObjectId(String(req.user._id)) }, { projection: { fullName: 1 } });
+    const emp = await knex('employees').where({ id: req.user.id }).select('fullName').first();
     creatorName = emp?.fullName ?? 'Unknown';
   }
 
   const doc = {
-    projectId: new ObjectId(req.params.id),
+    id: newId(),
+    projectId: project.id,
     text:          text.trim(),
-    createdBy:     new ObjectId(String(req.user._id)),
+    createdBy:     req.user.id,
     createdByName: creatorName,
     createdAt:     new Date(),
   };
 
-  const result = await insertOne('project_notes', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('project_notes').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const deleteNote = async (req, res) => {
-  const note = await findOne('project_notes', { _id: new ObjectId(req.params.noteId) });
+  const note = await knex('project_notes').where({ id: req.params.noteId }).first();
   if (!note) return returnFunction(res, 404, false, req.locale.notFound);
 
-  if (String(note.createdBy) !== String(req.user._id) && !HR_ROLES.includes(req.user.role)) {
+  if (String(note.createdBy) !== String(req.user.id) && !HR_ROLES.includes(req.user.role)) {
     return returnFunction(res, 403, false, 'You can only delete your own notes.');
   }
 
-  await global.dbo.collection('project_notes').deleteOne({ _id: new ObjectId(req.params.noteId) });
+  await knex('project_notes').where({ id: req.params.noteId }).delete();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -913,7 +899,7 @@ const deleteNote = async (req, res) => {
 // people who are already on the project.
 
 async function getValidProjectPersonIds(project) {
-  const members = await findMany('project_members', { projectId: project._id }, { projection: { employeeId: 1 } });
+  const members = await knex('project_members').where({ projectId: project.id }).select('employeeId');
   const ids = new Set(members.map((m) => String(m.employeeId)));
   ids.add(String(project.createdBy)); // supervisor identified by USER id — may have no employee record at all
   return ids;
@@ -921,43 +907,45 @@ async function getValidProjectPersonIds(project) {
 
 // Chat group memberIds mixes two id spaces by construction: the supervisor is stored by
 // their user id (project.createdBy), regular members by employee id (project_members).
-// So "is this logged-in person in this list" must check both req.user._id and
+// So "is this logged-in person in this list" must check both req.user.id and
 // req.user.employeeId, not just one.
 function personMatchesIds(reqUser, idList) {
-  const userIdStr = String(reqUser._id);
+  const userIdStr = String(reqUser.id);
   const empIdStr  = reqUser.employeeId ? String(reqUser.employeeId) : null;
   return (idList || []).some((id) => { const s = String(id); return s === userIdStr || s === empIdStr; });
 }
 
 const listChatGroups = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
 
-  const filter = { projectId: project._id };
+  let query = knex('project_chat_groups').where({ projectId: project.id });
   if (!isSup) {
     // memberIds may hold this person's user id (if they're the group creator) or
     // employee id (if they were invited as a regular member) — check both.
-    const candidateIds = [new ObjectId(userId)];
-    if (req.user.employeeId) candidateIds.push(new ObjectId(String(req.user.employeeId)));
-    filter.memberIds = { $in: candidateIds };
+    const candidateIds = [userId];
+    if (req.user.employeeId) candidateIds.push(String(req.user.employeeId));
+    query = query.where((qb) => {
+      for (const id of candidateIds) qb.orWhereRaw('"memberIds" @> ?', [JSON.stringify([id])]);
+    });
   }
 
-  const groups = await findMany('project_chat_groups', filter, { sort: { createdAt: 1 } });
+  const groups = await query.orderBy('createdAt', 'asc');
   return returnFunction(res, 200, true, req.locale.success, groups);
 };
 
 const createChatGroup = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
   const { name, memberIds } = req.body;
   if (!name?.trim()) return returnFunction(res, 400, false, 'Group name is required.');
   if (!Array.isArray(memberIds) || memberIds.length === 0) return returnFunction(res, 400, false, 'Select at least one member.');
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
   const validIds = await getValidProjectPersonIds(project);
   const empIdStr = req.user.employeeId ? String(req.user.employeeId) : null;
@@ -975,112 +963,107 @@ const createChatGroup = async (req, res) => {
 
   let creatorName = req.user.name || '';
   if (!creatorName) {
-    const emp = await findOne('employees', { _id: new ObjectId(userId) }, { projection: { fullName: 1 } });
+    const emp = await knex('employees').where({ id: userId }).select('fullName').first();
     creatorName = emp?.fullName ?? 'Unknown';
   }
 
   const doc = {
-    projectId:     project._id,
+    id: newId(),
+    projectId:     project.id,
     name:          name.trim(),
-    memberIds:     [...cleanMemberIds].map((id) => new ObjectId(id)),
-    createdBy:     new ObjectId(userId),
+    memberIds:     JSON.stringify([...cleanMemberIds]),
+    createdBy:     userId,
     createdByName: creatorName,
     createdAt:     new Date(),
   };
 
-  const result = await insertOne('project_chat_groups', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('project_chat_groups').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateChatGroup = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const group = await findOne('project_chat_groups', { _id: new ObjectId(req.params.groupId) });
+  const group = await knex('project_chat_groups').where({ id: req.params.groupId }).first();
   if (!group) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
   if (!isSup && String(group.createdBy) !== userId) {
     return returnFunction(res, 403, false, 'Only the group creator can update this group.');
   }
 
-  const $set = { updatedAt: new Date() };
-  if (req.body.name?.trim()) $set.name = req.body.name.trim();
+  const update = { updatedAt: new Date() };
+  if (req.body.name?.trim()) update.name = req.body.name.trim();
   if (Array.isArray(req.body.memberIds)) {
     const validIds = await getValidProjectPersonIds(project);
     const cleanMemberIds = new Set(req.body.memberIds.map(String).filter((id) => validIds.has(id)));
     cleanMemberIds.add(String(group.createdBy));
-    $set.memberIds = [...cleanMemberIds].map((id) => new ObjectId(id));
+    update.memberIds = JSON.stringify([...cleanMemberIds]);
   }
 
-  await updateOne('project_chat_groups', { _id: group._id }, { $set });
+  await knex('project_chat_groups').where({ id: group.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteChatGroup = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const group = await findOne('project_chat_groups', { _id: new ObjectId(req.params.groupId) });
+  const group = await knex('project_chat_groups').where({ id: req.params.groupId }).first();
   if (!group) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
   if (!isSup && String(group.createdBy) !== userId) {
     return returnFunction(res, 403, false, 'Only the group creator can delete this group.');
   }
 
-  await global.dbo.collection('project_chat_groups').deleteOne({ _id: group._id });
-  await global.dbo.collection('project_messages').deleteMany({ groupId: group._id });
+  await knex('project_messages').where({ groupId: group.id }).delete();
+  await knex('project_chat_groups').where({ id: group.id }).delete();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 // ── Chat / Messages ───────────────────────────────────────────────────────────
 
 const getMessages = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
-  const userId = String(req.user._id);
-  const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
+  const isSup  = isSupervisor(project, req.user.id) || HR_ROLES.includes(req.user.role);
   if (!(await canAccessProject(project, req.user))) {
     return returnFunction(res, 403, false, 'You do not have access to this project.');
   }
 
   let groupId = null;
   if (req.query.groupId) {
-    const group = await findOne('project_chat_groups', { _id: new ObjectId(req.query.groupId) });
+    const group = await knex('project_chat_groups').where({ id: req.query.groupId }).first();
     if (!group) return returnFunction(res, 404, false, req.locale.notFound);
     if (!isSup && !personMatchesIds(req.user, group.memberIds)) {
       return returnFunction(res, 403, false, 'Not a member of this chat group.');
     }
-    groupId = group._id;
+    groupId = group.id;
   }
 
   const limit  = Math.min(Number(req.query.limit) || 60, 100);
-  const filter = { projectId: new ObjectId(req.params.id), groupId };
-  if (req.query.before) {
-    try { filter._id = { $lt: new ObjectId(req.query.before) }; } catch { /* ignore invalid id */ }
-  }
+  let query = knex('project_messages').where({ projectId: req.params.id });
+  query = groupId ? query.where({ groupId }) : query.whereNull('groupId');
+  if (req.query.before) query = query.where('id', '<', req.query.before);
 
-  const messages = await global.dbo.collection('project_messages')
-    .find(filter)
-    .sort({ _id: -1 })
-    .limit(limit)
-    .toArray();
+  const messages = await query.orderBy('id', 'desc').limit(limit);
 
   return returnFunction(res, 200, true, req.locale.success, messages.reverse());
 };
 
 const sendMessage = async (req, res) => {
-  const project = await findOne('projects', { _id: new ObjectId(req.params.id) });
+  const project = await knex('projects').where({ id: req.params.id }).first();
   if (!project) return returnFunction(res, 404, false, req.locale.notFound);
 
   const { message } = req.body;
   if (!message?.trim() && !req.file) return returnFunction(res, 400, false, 'Message or attachment is required.');
 
-  const userId = String(req.user._id);
+  const userId = String(req.user.id);
   const isSup  = isSupervisor(project, userId) || HR_ROLES.includes(req.user.role);
   if (!(await canAccessProject(project, req.user))) {
     return returnFunction(res, 403, false, 'You do not have access to this project.');
@@ -1088,17 +1071,17 @@ const sendMessage = async (req, res) => {
 
   let groupId = null;
   if (req.body.groupId) {
-    const group = await findOne('project_chat_groups', { _id: new ObjectId(req.body.groupId) });
+    const group = await knex('project_chat_groups').where({ id: req.body.groupId }).first();
     if (!group) return returnFunction(res, 404, false, req.locale.notFound);
     if (!isSup && !personMatchesIds(req.user, group.memberIds)) {
       return returnFunction(res, 403, false, 'Not a member of this chat group.');
     }
-    groupId = group._id;
+    groupId = group.id;
   }
 
   let senderName = req.user.name || '';
   if (!senderName) {
-    const emp = await findOne('employees', { _id: new ObjectId(userId) }, { projection: { fullName: 1 } });
+    const emp = await knex('employees').where({ id: userId }).select('fullName').first();
     senderName = emp?.fullName ?? 'Unknown';
   }
 
@@ -1106,16 +1089,17 @@ const sendMessage = async (req, res) => {
   if (isSup) {
     senderRole = 'supervisor';
   } else if (req.user.employeeId) {
-    const member = await findOne('project_members', { projectId: new ObjectId(req.params.id), employeeId: new ObjectId(String(req.user.employeeId)) });
+    const member = await knex('project_members').where({ projectId: req.params.id, employeeId: String(req.user.employeeId) }).first();
     senderRole = member?.role ?? req.user.role ?? 'member';
   } else {
     senderRole = req.user.role ?? 'member';
   }
 
   const doc = {
-    projectId:  new ObjectId(req.params.id),
+    id: newId(),
+    projectId:  req.params.id,
     groupId,
-    senderId:   new ObjectId(userId),
+    senderId:   userId,
     senderName,
     senderRole,
     message:    message?.trim() ?? '',
@@ -1125,8 +1109,44 @@ const sendMessage = async (req, res) => {
     createdAt:  new Date(),
   };
 
-  const result = await insertOne('project_messages', doc);
-  return returnFunction(res, 201, true, 'Message sent.', { _id: result.insertedId, ...doc });
+  const [saved] = await knex('project_messages').insert(doc).returning('*');
+  return returnFunction(res, 201, true, 'Message sent.', saved);
+};
+
+// ── Time Entries ──────────────────────────────────────────────────────────────
+// NEW this phase — meFunctions.js's getMyProjects already reads project_time_entries
+// (aggregated hours + recent entries) but no write endpoint existed anywhere; the
+// staff portal's "log time" button has always 404'd against POST /projects/:id/
+// time-entries. Built for real here.
+
+const createTimeEntry = async (req, res) => {
+  const project = await knex('projects').where({ id: req.params.id }).first();
+  if (!project) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!(await canAccessProject(project, req.user))) {
+    return returnFunction(res, 403, false, 'You do not have access to this project.');
+  }
+  if (!req.user.employeeId) {
+    return returnFunction(res, 400, false, 'Your account is not linked to an employee profile.');
+  }
+
+  const { hours, date, task, description, billable } = req.body;
+  if (!hours || Number(hours) <= 0) return returnFunction(res, 400, false, 'hours must be a positive number.');
+  if (!date) return returnFunction(res, 400, false, 'date is required.');
+
+  const doc = {
+    id: newId(),
+    projectId: project.id,
+    employeeId: String(req.user.employeeId),
+    hours: Number(hours),
+    date: new Date(date),
+    task: task || null,
+    description: description || null,
+    billable: Boolean(billable),
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  const [saved] = await knex('project_time_entries').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 module.exports = {
@@ -1138,4 +1158,5 @@ module.exports = {
   listNotes, createNote, deleteNote,
   listChatGroups, createChatGroup, updateChatGroup, deleteChatGroup,
   getMessages, sendMessage,
+  createTimeEntry,
 };

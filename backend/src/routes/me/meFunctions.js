@@ -5,11 +5,11 @@ const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users/job_history/staff_notes (Phase 1), attendance_records (Phase 3b),
-// job_requisitions/candidates/applications (Phase 4), and appraisal_records/goals/
-// reviews/review_cycles (Phase 5) now live in Postgres; everything else this file
-// touches (employee_awards, scheduled_events, project_members/projects/
-// project_time_entries, tasks) is unmigrated and stays on the Mongo helpers via
-// commonDBFunctions/global.dbo, imported separately below.
+// job_requisitions/candidates/applications (Phase 4), appraisal_records/goals/
+// reviews/review_cycles (Phase 5), and employee_awards/project_members/projects/
+// project_time_entries/tasks (Phase 9) now live in Postgres; everything else this
+// file touches (scheduled_events) is still unmigrated and stays on the Mongo
+// helpers via commonDBFunctions/global.dbo, imported separately below.
 const { findMany, findOne, updateOne, insertOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -315,14 +315,11 @@ const getMyPerformance = async (req, res) => {
 };
 
 // ── Awards ────────────────────────────────────────────────────────────────────
-// employee_awards is unmigrated (Phase 9) — stays Mongo.
+// employee_awards is Postgres now (Phase 9).
 const getMyAwards = async (req, res) => {
   const empId = myEmployeeId(req);
   if (!empId) return returnFunction(res, 200, true, 'OK', []);
-  const awards = await findMany('employee_awards',
-    { employeeId: new ObjectId(empId) },
-    { sort: { awardedAt: -1 } }
-  );
+  const awards = await pgDB.knex('employee_awards').where({ employeeId: empId }).orderBy('awardedAt', 'desc');
   return returnFunction(res, 200, true, 'OK', awards);
 };
 
@@ -391,33 +388,25 @@ const serveMyProfilePhoto = async (req, res) => {
 
 
 // ── My Projects ────────────────────────────────────────────────────────────────
-// project_members/projects/project_time_entries are unmigrated (Phase 9) — stay Mongo.
+// project_members/projects/project_time_entries are Postgres now (Phase 9).
 const getMyProjects = async (req, res) => {
   const empId = myEmployeeId(req);
   if (!empId) return returnFunction(res, 200, true, 'OK', []);
-  const empObjectId = new ObjectId(empId);
 
-  const memberships = await findMany('project_members', { employeeId: empObjectId });
+  const memberships = await pgDB.knex('project_members').where({ employeeId: empId });
   if (!memberships.length) return returnFunction(res, 200, true, 'OK', []);
 
-  const projectIds = memberships.map(m => m.projectId);
-  const projects = await findMany('projects', { _id: { $in: projectIds } }, { sort: { createdAt: -1 } });
+  const projectIds = memberships.map((m) => m.projectId);
+  const projects = await pgDB.knex('projects').whereIn('id', projectIds).orderBy('createdAt', 'desc');
 
-  const enriched = await Promise.all(projects.map(async p => {
-    const membership = memberships.find(m => String(m.projectId) === String(p._id));
-    const [timeResult] = await global.dbo.collection('project_time_entries').aggregate([
-      { $match: { projectId: p._id, employeeId: empObjectId } },
-      { $group: { _id: null, totalHours: { $sum: '$hours' } } },
-    ]).toArray();
-    const recentEntries = await findMany(
-      'project_time_entries',
-      { projectId: p._id, employeeId: empObjectId },
-      { sort: { date: -1 }, limit: 5 }
-    );
+  const enriched = await Promise.all(projects.map(async (p) => {
+    const membership = memberships.find((m) => String(m.projectId) === String(p.id));
+    const [{ totalHours }] = await pgDB.knex('project_time_entries').where({ projectId: p.id, employeeId: empId }).sum('hours as totalHours');
+    const recentEntries = await pgDB.knex('project_time_entries').where({ projectId: p.id, employeeId: empId }).orderBy('date', 'desc').limit(5);
     return {
       ...p,
       myRole:         membership?.role ?? 'member',
-      myHours:        timeResult?.totalHours ?? 0,
+      myHours:        Number(totalHours) || 0,
       myRecentEntries: recentEntries,
     };
   }));
@@ -426,15 +415,11 @@ const getMyProjects = async (req, res) => {
 };
 
 // ── My Tasks ───────────────────────────────────────────────────────────────────
-// tasks is unmigrated (Phase 9) — stays Mongo.
+// tasks is Postgres now (Phase 9).
 const getMyTasks = async (req, res) => {
   const empId = myEmployeeId(req);
   if (!empId) return returnFunction(res, 200, true, 'OK', []);
-  const tasks = await findMany(
-    'tasks',
-    { assignedTo: new ObjectId(empId) },
-    { sort: { dueDate: 1, createdAt: -1 }, limit: 100 }
-  );
+  const tasks = await pgDB.knex('tasks').where({ assignedTo: empId }).orderBy('dueDate', 'asc').orderBy('createdAt', 'desc').limit(100);
   return returnFunction(res, 200, true, 'OK', tasks);
 };
 

@@ -1,93 +1,73 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 9) — conversations/messages (+ child tables
+// conversation_participants/message_reads) are Postgres now. employees/users
+// have been Postgres since Phase 1.
 const fs   = require('fs');
 const path = require('path');
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, findOne } = require('../../functions/Database/commonDBFunctions');
-
-// Helper: ensure ObjectId
-const oid = (id) => new ObjectId(id);
+const { notifyUser } = require('../../functions/HR/notifyUser');
 
 // ── Get contacts you can message ──────────────────────────────────────────────
 const getContacts = async (req, res) => {
-  const { _id: userId, role } = req.user;
+  const { id: userId, role } = req.user;
   const forGroup = req.query.forGroup === 'true';
 
   // For group creation, return all users so anyone can be added to any group
   if (forGroup) {
-    const everyone = await findMany('users',
-      { _id: { $ne: oid(userId) }, role: { $in: ['staff', 'department_head', 'hr_manager', 'super_admin'] } },
-      { projection: { _id: 1, name: 1, role: 1 }, sort: { name: 1 } }
-    );
+    const everyone = await knex('users').whereNot({ id: userId }).whereIn('role', ['staff', 'department_head', 'hr_manager', 'super_admin'])
+      .select('id', 'name', 'role').orderBy('name');
     return returnFunction(res, 200, true, 'OK', everyone);
   }
 
-  const emp = req.user.employeeId
-    ? await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1 } })
-    : null;
+  const emp = req.user.employeeId ? await knex('employees').where({ id: String(req.user.employeeId) }).select('department').first() : null;
   const dept = emp?.department;
 
-  let userFilter = {};
-
-  if (role === 'staff') {
-    userFilter = { role: { $in: ['hr_manager', 'super_admin', 'department_head'] } };
-  } else if (role === 'department_head') {
+  if (role === 'department_head') {
     if (dept) {
-      const deptEmployees = await findMany('employees',
-        { department: dept, status: { $in: ['active', 'on_leave'] } },
-        { projection: { _id: 1 } }
-      );
-      const empIds = deptEmployees.map(e => e._id);
-      const staffUsers = await global.dbo.collection('users')
-        .find({ employeeId: { $in: empIds }, role: 'staff' })
-        .project({ _id: 1, name: 1, role: 1, employeeId: 1 })
-        .toArray();
-      const hrUsers = await findMany('users',
-        { role: { $in: ['hr_manager', 'super_admin'] } },
-        { projection: { _id: 1, name: 1, role: 1 } }
-      );
-      const all = [...hrUsers, ...staffUsers].filter(u => String(u._id) !== String(userId));
+      const deptEmployees = await knex('employees').where({ department: dept }).whereIn('status', ['active', 'on_leave']).select('id');
+      const empIds = deptEmployees.map((e) => e.id);
+      const staffUsers = empIds.length ? await knex('users').whereIn('employeeId', empIds).where({ role: 'staff' }).select('id', 'name', 'role', 'employeeId') : [];
+      const hrUsers = await knex('users').whereIn('role', ['hr_manager', 'super_admin']).select('id', 'name', 'role');
+      const all = [...hrUsers, ...staffUsers].filter((u) => String(u.id) !== String(userId));
       return returnFunction(res, 200, true, 'OK', all);
     }
-    userFilter = { role: { $in: ['hr_manager', 'super_admin'] } };
-  } else {
-    userFilter = { role: { $in: ['staff', 'department_head', 'hr_manager', 'super_admin'] } };
+    const contacts = await knex('users').whereIn('role', ['hr_manager', 'super_admin']).whereNot({ id: userId }).select('id', 'name', 'role').orderBy('name');
+    return returnFunction(res, 200, true, 'OK', contacts);
   }
 
-  const contacts = await findMany('users', { ...userFilter, _id: { $ne: oid(userId) } },
-    { projection: { _id: 1, name: 1, role: 1 }, sort: { name: 1 } }
-  );
+  const roles = role === 'staff' ? ['hr_manager', 'super_admin', 'department_head'] : ['staff', 'department_head', 'hr_manager', 'super_admin'];
+  const contacts = await knex('users').whereIn('role', roles).whereNot({ id: userId }).select('id', 'name', 'role').orderBy('name');
   return returnFunction(res, 200, true, 'OK', contacts);
 };
 
 // ── List conversations for current user ───────────────────────────────────────
 const getConversations = async (req, res) => {
-  const userId = oid(req.user._id);
-  const convos = await global.dbo.collection('conversations')
-    .find({ participants: userId })
-    .sort({ lastMessageAt: -1 })
-    .limit(50)
-    .toArray();
+  const userId = req.user.id;
+  const myConvoRows = await knex('conversation_participants').where({ userId }).select('conversationId', 'isAdmin');
+  const convoIds = myConvoRows.map((r) => r.conversationId);
+  if (!convoIds.length) return returnFunction(res, 200, true, 'OK', []);
+  const adminOf = new Set(myConvoRows.filter((r) => r.isAdmin).map((r) => r.conversationId));
+
+  const convos = await knex('conversations').whereIn('id', convoIds).orderBy('lastMessageAt', 'desc').limit(50);
 
   const enriched = await Promise.all(convos.map(async (c) => {
     let other = null;
+    let participantCount;
     if (!c.isGroup) {
-      const otherId = c.participants.find(p => String(p) !== String(userId));
-      other = otherId
-        ? await findOne('users', { _id: otherId }, { projection: { name: 1, role: 1 } })
-        : null;
+      const participants = await knex('conversation_participants').where({ conversationId: c.id }).select('userId');
+      participantCount = participants.length;
+      const otherRow = participants.find((p) => String(p.userId) !== String(userId));
+      other = otherRow ? await knex('users').where({ id: otherRow.userId }).select('name', 'role').first() : null;
+    } else {
+      const [{ count }] = await knex('conversation_participants').where({ conversationId: c.id }).count('* as count');
+      participantCount = Number(count);
     }
 
-    const unread = await global.dbo.collection('messages').countDocuments({
-      conversationId: c._id,
-      senderId: { $ne: userId },
-      readBy: { $ne: userId },
-    });
+    const [{ count: unread }] = await knex('messages').where({ conversationId: c.id }).whereNot({ senderId: userId })
+      .whereNotExists(knex('message_reads').whereRaw('"message_reads"."messageId" = "messages"."id"').andWhere('message_reads.userId', userId))
+      .count('* as count');
 
-    const isAdmin = c.isGroup
-      ? (c.admins ?? []).some(a => String(a) === String(userId))
-      : false;
-
-    return { ...c, other, unread, participantCount: c.participants?.length ?? 0, isAdmin };
+    return { ...c, other, unread: Number(unread), participantCount, isAdmin: adminOf.has(c.id) };
   }));
 
   return returnFunction(res, 200, true, 'OK', enriched);
@@ -95,22 +75,33 @@ const getConversations = async (req, res) => {
 
 // ── Get or create conversation with a user ────────────────────────────────────
 const getOrCreateConversation = async (req, res) => {
-  const userId = oid(req.user._id);
-  const recipientId = oid(req.body.recipientId || req.params.recipientId);
+  const userId = req.user.id;
+  const recipientId = req.body.recipientId || req.params.recipientId;
 
-  // Look for existing convo between these two
-  let convo = await global.dbo.collection('conversations').findOne({
-    participants: { $all: [userId, recipientId], $size: 2 },
-  });
+  // Look for existing 1:1 (non-group) convo between these two — a conversation
+  // whose full participant set is exactly {userId, recipientId}.
+  const mine = await knex('conversation_participants').where({ userId }).select('conversationId');
+  let convo = null;
+  for (const row of mine) {
+    const c = await knex('conversations').where({ id: row.conversationId, isGroup: false }).first();
+    if (!c) continue;
+    const participants = await knex('conversation_participants').where({ conversationId: c.id }).select('userId');
+    if (participants.length === 2 && participants.some((p) => String(p.userId) === String(recipientId))) {
+      convo = c;
+      break;
+    }
+  }
 
   if (!convo) {
-    const result = await global.dbo.collection('conversations').insertOne({
-      participants: [userId, recipientId],
-      lastMessage: '',
-      lastMessageAt: new Date(),
-      createdAt: new Date(),
-    });
-    convo = await global.dbo.collection('conversations').findOne({ _id: result.insertedId });
+    const now = new Date();
+    const [saved] = await knex('conversations').insert({
+      id: newId(), isGroup: false, lastMessage: '', lastMessageAt: now, createdAt: now,
+    }).returning('*');
+    await knex('conversation_participants').insert([
+      { conversationId: saved.id, userId, isAdmin: false, joinedAt: now },
+      { conversationId: saved.id, userId: recipientId, isAdmin: false, joinedAt: now },
+    ]);
+    convo = saved;
   }
 
   return returnFunction(res, 200, true, 'OK', convo);
@@ -118,26 +109,26 @@ const getOrCreateConversation = async (req, res) => {
 
 // ── Get messages in a conversation ────────────────────────────────────────────
 const getMessages = async (req, res) => {
-  const userId = oid(req.user._id);
-  const convoId = oid(req.params.id);
+  const userId = req.user.id;
+  const convoId = req.params.id;
 
   // Verify user is a participant
-  const convo = await global.dbo.collection('conversations').findOne({
-    _id: convoId, participants: userId,
-  });
-  if (!convo) return returnFunction(res, 403, false, 'Forbidden');
+  const isParticipant = await knex('conversation_participants').where({ conversationId: convoId, userId }).first();
+  if (!isParticipant) return returnFunction(res, 403, false, 'Forbidden');
 
-  const messages = await global.dbo.collection('messages')
-    .find({ conversationId: convoId })
-    .sort({ createdAt: 1 })
-    .limit(100)
-    .toArray();
+  const messages = await knex('messages').where({ conversationId: convoId }).orderBy('createdAt', 'asc').limit(100);
 
   // Mark all unread as read
-  await global.dbo.collection('messages').updateMany(
-    { conversationId: convoId, senderId: { $ne: userId }, readBy: { $ne: userId } },
-    { $addToSet: { readBy: userId } }
-  );
+  const unreadIds = [];
+  for (const m of messages) {
+    if (String(m.senderId) === String(userId)) continue;
+    const already = await knex('message_reads').where({ messageId: m.id, userId }).first();
+    if (!already) unreadIds.push(m.id);
+  }
+  if (unreadIds.length) {
+    await knex('message_reads').insert(unreadIds.map((messageId) => ({ messageId, userId, readAt: new Date() })))
+      .onConflict(['messageId', 'userId']).ignore();
+  }
 
   return returnFunction(res, 200, true, 'OK', messages);
 };
@@ -151,15 +142,13 @@ const sendMessage = async (req, res) => {
     return returnFunction(res, 400, false, 'Message must have text or an attachment.');
   }
 
-  const userId  = oid(req.user._id);
-  const convoId = oid(req.params.id);
+  const userId  = req.user.id;
+  const convoId = req.params.id;
 
-  const convo = await global.dbo.collection('conversations').findOne({
-    _id: convoId, participants: userId,
-  });
-  if (!convo) return returnFunction(res, 403, false, 'Forbidden');
+  const isParticipant = await knex('conversation_participants').where({ conversationId: convoId, userId }).first();
+  if (!isParticipant) return returnFunction(res, 403, false, 'Forbidden');
 
-  const attachments = files.map(f => ({
+  const attachments = files.map((f) => ({
     filename:     f.filename,
     originalName: f.originalname,
     mimetype:     f.mimetype,
@@ -167,107 +156,85 @@ const sendMessage = async (req, res) => {
   }));
 
   const msg = {
+    id: newId(),
     conversationId: convoId,
     senderId:   userId,
     senderName: req.user.name || 'Unknown',
     content,
-    attachments,
-    readBy:    [userId],
+    attachments: JSON.stringify(attachments),
+    isSystem: false,
     createdAt: new Date(),
   };
 
-  const result = await global.dbo.collection('messages').insertOne(msg);
+  const [saved] = await knex('messages').insert(msg).returning('*');
+  await knex('message_reads').insert({ messageId: saved.id, userId, readAt: new Date() }); // sender has implicitly "read" their own message
 
   const preview = content || (attachments.length ? `📎 ${attachments[0].originalName}` : '');
-  await global.dbo.collection('conversations').updateOne(
-    { _id: convoId },
-    { $set: { lastMessage: preview.substring(0, 80), lastMessageAt: new Date() } }
-  );
+  await knex('conversations').where({ id: convoId }).update({ lastMessage: preview.substring(0, 80), lastMessageAt: new Date() });
 
-  return returnFunction(res, 201, true, 'Sent', { _id: result.insertedId, ...msg });
+  return returnFunction(res, 201, true, 'Sent', saved);
 };
 
 // ── Create a group conversation ───────────────────────────────────────────────
 const createGroup = async (req, res) => {
-  const userId = oid(req.user._id);
+  const userId = req.user.id;
   const { groupName, participantIds } = req.body;
 
   if (!groupName?.trim()) return returnFunction(res, 400, false, 'Group name is required.');
   if (!Array.isArray(participantIds) || participantIds.length === 0)
     return returnFunction(res, 400, false, 'At least one other participant is required.');
 
-  const rawIds = [userId, ...participantIds.map(id => oid(id))];
-  // deduplicate by string representation
+  const rawIds = [userId, ...participantIds];
   const seen = new Set();
-  const participants = rawIds.filter(p => { const k = String(p); return seen.has(k) ? false : (seen.add(k), true); });
+  const participants = rawIds.filter((p) => { const k = String(p); return seen.has(k) ? false : (seen.add(k), true); });
 
   const now = new Date();
   const systemText = `${req.user.name} created the group "${groupName.trim()}"`;
 
-  const result = await global.dbo.collection('conversations').insertOne({
-    isGroup:       true,
-    groupName:     groupName.trim(),
-    participants,
-    admins:        [userId],
-    createdBy:     userId,
-    lastMessage:   systemText,
-    lastMessageAt: now,
-    createdAt:     now,
-  });
+  const [convo] = await knex('conversations').insert({
+    id: newId(), isGroup: true, groupName: groupName.trim(), lastMessage: systemText, lastMessageAt: now,
+    createdBy: userId, createdAt: now,
+  }).returning('*');
 
-  const convoId = result.insertedId;
+  await knex('conversation_participants').insert(
+    participants.map((p) => ({ conversationId: convo.id, userId: p, isAdmin: String(p) === String(userId), joinedAt: now }))
+  );
 
   // Post a system message so the timeline shows who created the group
-  await global.dbo.collection('messages').insertOne({
-    conversationId: convoId,
-    senderId:       null,
-    senderName:     'System',
-    content:        systemText,
-    isSystem:       true,
-    attachments:    [],
-    readBy:         participants,
-    createdAt:      now,
-  });
+  const [sysMsg] = await knex('messages').insert({
+    id: newId(), conversationId: convo.id, senderId: null, senderName: 'System', content: systemText,
+    isSystem: true, attachments: JSON.stringify([]), createdAt: now,
+  }).returning('*');
+  await knex('message_reads').insert(participants.map((p) => ({ messageId: sysMsg.id, userId: p, readAt: now })));
 
   // Notify every participant except the creator
-  const others = participants.filter(p => String(p) !== String(userId));
-  if (others.length > 0) {
-    await global.dbo.collection('notifications').insertMany(
-      others.map(uid => ({
-        userId:    uid,
-        title:     `Added to group: ${groupName.trim()}`,
-        message:   `${req.user.name} added you to the group "${groupName.trim()}".`,
-        type:      'group_chat',
-        read:      false,
-        createdAt: now,
-      }))
-    );
+  const others = participants.filter((p) => String(p) !== String(userId));
+  for (const uid of others) {
+    notifyUser(uid, { title: `Added to group: ${groupName.trim()}`, body: `${req.user.name} added you to the group "${groupName.trim()}".`, type: 'group_chat' }).catch(() => {});
   }
 
-  const convo = await global.dbo.collection('conversations').findOne({ _id: convoId });
   return returnFunction(res, 201, true, 'Group created', convo);
 };
 
 // ── Get group info (full member list) ─────────────────────────────────────────
 const getGroupInfo = async (req, res) => {
-  const userId  = oid(req.user._id);
-  const convoId = oid(req.params.id);
+  const userId  = req.user.id;
+  const convoId = req.params.id;
 
-  const convo = await global.dbo.collection('conversations').findOne({
-    _id: convoId, isGroup: true, participants: userId,
-  });
+  const convo = await knex('conversations').where({ id: convoId, isGroup: true }).first();
   if (!convo) return returnFunction(res, 404, false, 'Group not found.');
+  const myRow = await knex('conversation_participants').where({ conversationId: convoId, userId }).first();
+  if (!myRow) return returnFunction(res, 404, false, 'Group not found.');
 
-  const members = await global.dbo.collection('users')
-    .find({ _id: { $in: convo.participants } })
-    .project({ _id: 1, name: 1, role: 1 })
-    .toArray();
+  const participantRows = await knex('conversation_participants').where({ conversationId: convoId });
+  const userIds = participantRows.map((p) => p.userId);
+  const members = userIds.length ? await knex('users').whereIn('id', userIds).select('id', 'name', 'role') : [];
 
-  const adminSet = new Set((convo.admins ?? []).map(String));
-  const enrichedMembers = members.map(m => ({
+  const adminSet = new Set(participantRows.filter((p) => p.isAdmin).map((p) => String(p.userId)));
+  const enrichedMembers = members.map((m) => ({
     ...m,
-    isAdmin: adminSet.has(String(m._id)),
-    isMe:    String(m._id) === String(userId),
+    isAdmin: adminSet.has(String(m.id)),
+    isMe:    String(m.id) === String(userId),
   }));
 
   return returnFunction(res, 200, true, 'OK', {
@@ -279,113 +246,74 @@ const getGroupInfo = async (req, res) => {
 
 // ── Update group (rename / add / remove members) — admin only ─────────────────
 const updateGroup = async (req, res) => {
-  const userId  = oid(req.user._id);
-  const convoId = oid(req.params.id);
+  const userId  = req.user.id;
+  const convoId = req.params.id;
 
-  const convo = await global.dbo.collection('conversations').findOne({
-    _id: convoId, isGroup: true, participants: userId,
-  });
+  const convo = await knex('conversations').where({ id: convoId, isGroup: true }).first();
   if (!convo) return returnFunction(res, 404, false, 'Group not found.');
-
-  const isAdmin = (convo.admins ?? []).some(a => String(a) === String(userId));
-  if (!isAdmin) return returnFunction(res, 403, false, 'Only admins can update the group.');
+  const myRow = await knex('conversation_participants').where({ conversationId: convoId, userId }).first();
+  if (!myRow) return returnFunction(res, 404, false, 'Group not found.');
+  if (!myRow.isAdmin) return returnFunction(res, 403, false, 'Only admins can update the group.');
 
   const sets = {};
   if (req.body.groupName?.trim()) sets.groupName = req.body.groupName.trim();
-
-  if (Object.keys(sets).length) {
-    await global.dbo.collection('conversations').updateOne({ _id: convoId }, { $set: sets });
-  }
+  if (Object.keys(sets).length) await knex('conversations').where({ id: convoId }).update(sets);
 
   const now = new Date();
 
   if (Array.isArray(req.body.addMembers) && req.body.addMembers.length > 0) {
-    const newIds = req.body.addMembers.map(id => oid(id));
-    await global.dbo.collection('conversations').updateOne(
-      { _id: convoId },
-      { $addToSet: { participants: { $each: newIds } } }
-    );
+    const newIds = req.body.addMembers;
+    await knex('conversation_participants').insert(newIds.map((uid) => ({ conversationId: convoId, userId: uid, isAdmin: false, joinedAt: now })))
+      .onConflict(['conversationId', 'userId']).ignore();
 
-    // System message + notifications for each newly added member
-    const addedUsers = await global.dbo.collection('users')
-      .find({ _id: { $in: newIds } })
-      .project({ _id: 1, name: 1 })
-      .toArray();
+    const addedUsers = await knex('users').whereIn('id', newIds).select('id', 'name');
 
     for (const u of addedUsers) {
       const text = `${req.user.name} added ${u.name} to the group`;
-      await global.dbo.collection('messages').insertOne({
-        conversationId: convoId,
-        senderId:       null,
-        senderName:     'System',
-        content:        text,
-        isSystem:       true,
-        attachments:    [],
-        readBy:         [userId],
-        createdAt:      now,
-      });
-      await global.dbo.collection('notifications').insertOne({
-        userId:    u._id,
-        title:     `Added to group: ${convo.groupName}`,
-        message:   `${req.user.name} added you to the group "${convo.groupName}".`,
-        type:      'group_chat',
-        read:      false,
-        createdAt: now,
-      });
+      const [sysMsg] = await knex('messages').insert({
+        id: newId(), conversationId: convoId, senderId: null, senderName: 'System', content: text,
+        isSystem: true, attachments: JSON.stringify([]), createdAt: now,
+      }).returning('*');
+      await knex('message_reads').insert({ messageId: sysMsg.id, userId, readAt: now }).onConflict(['messageId', 'userId']).ignore();
+      notifyUser(u.id, { title: `Added to group: ${convo.groupName}`, body: `${req.user.name} added you to the group "${convo.groupName}".`, type: 'group_chat' }).catch(() => {});
     }
 
-    await global.dbo.collection('conversations').updateOne(
-      { _id: convoId },
-      { $set: { lastMessage: `${req.user.name} added ${addedUsers.map(u => u.name).join(', ')}`, lastMessageAt: now } }
-    );
+    await knex('conversations').where({ id: convoId }).update({
+      lastMessage: `${req.user.name} added ${addedUsers.map((u) => u.name).join(', ')}`, lastMessageAt: now,
+    });
   }
 
   if (Array.isArray(req.body.removeMembers) && req.body.removeMembers.length > 0) {
-    const removeIds = req.body.removeMembers.map(id => oid(id));
+    const removeIds = req.body.removeMembers;
+    const removedUsers = await knex('users').whereIn('id', removeIds).select('id', 'name');
 
-    const removedUsers = await global.dbo.collection('users')
-      .find({ _id: { $in: removeIds } })
-      .project({ _id: 1, name: 1 })
-      .toArray();
-
-    await global.dbo.collection('conversations').updateOne(
-      { _id: convoId },
-      { $pull: { participants: { $in: removeIds }, admins: { $in: removeIds } } }
-    );
+    await knex('conversation_participants').where({ conversationId: convoId }).whereIn('userId', removeIds).delete();
 
     for (const u of removedUsers) {
       const text = `${req.user.name} removed ${u.name} from the group`;
-      await global.dbo.collection('messages').insertOne({
-        conversationId: convoId,
-        senderId:       null,
-        senderName:     'System',
-        content:        text,
-        isSystem:       true,
-        attachments:    [],
-        readBy:         [userId],
-        createdAt:      now,
-      });
+      const [sysMsg] = await knex('messages').insert({
+        id: newId(), conversationId: convoId, senderId: null, senderName: 'System', content: text,
+        isSystem: true, attachments: JSON.stringify([]), createdAt: now,
+      }).returning('*');
+      await knex('message_reads').insert({ messageId: sysMsg.id, userId, readAt: now }).onConflict(['messageId', 'userId']).ignore();
     }
   }
 
-  const updated = await global.dbo.collection('conversations').findOne({ _id: convoId });
+  const updated = await knex('conversations').where({ id: convoId }).first();
   return returnFunction(res, 200, true, 'Updated', updated);
 };
 
 // ── Leave group ───────────────────────────────────────────────────────────────
 const leaveGroup = async (req, res) => {
-  const userId  = oid(req.user._id);
-  const convoId = oid(req.params.id);
+  const userId  = req.user.id;
+  const convoId = req.params.id;
 
-  const convo = await global.dbo.collection('conversations').findOne({
-    _id: convoId, isGroup: true, participants: userId,
-  });
+  const convo = await knex('conversations').where({ id: convoId, isGroup: true }).first();
   if (!convo) return returnFunction(res, 404, false, 'Group not found.');
+  const myRow = await knex('conversation_participants').where({ conversationId: convoId, userId }).first();
+  if (!myRow) return returnFunction(res, 404, false, 'Group not found.');
 
-  await global.dbo.collection('conversations').updateOne(
-    { _id: convoId },
-    { $pull: { participants: userId, admins: userId } }
-  );
+  await knex('conversation_participants').where({ conversationId: convoId, userId }).delete();
 
   return returnFunction(res, 200, true, 'Left group.');
 };
@@ -411,20 +339,16 @@ const serveAttachment = async (req, res) => {
 
 // ── Unread count across all conversations ─────────────────────────────────────
 const getUnreadCount = async (req, res) => {
-  const userId = oid(req.user._id);
-  const myConvos = await global.dbo.collection('conversations')
-    .find({ participants: userId })
-    .project({ _id: 1 })
-    .toArray();
-  const convoIds = myConvos.map(c => c._id);
+  const userId = req.user.id;
+  const myConvos = await knex('conversation_participants').where({ userId }).select('conversationId');
+  const convoIds = myConvos.map((c) => c.conversationId);
+  if (!convoIds.length) return returnFunction(res, 200, true, 'OK', { count: 0 });
 
-  const count = await global.dbo.collection('messages').countDocuments({
-    conversationId: { $in: convoIds },
-    senderId: { $ne: userId },
-    readBy: { $ne: userId },
-  });
+  const [{ count }] = await knex('messages').whereIn('conversationId', convoIds).whereNot({ senderId: userId })
+    .whereNotExists(knex('message_reads').whereRaw('"message_reads"."messageId" = "messages"."id"').andWhere('message_reads.userId', userId))
+    .count('* as count');
 
-  return returnFunction(res, 200, true, 'OK', { count });
+  return returnFunction(res, 200, true, 'OK', { count: Number(count) });
 };
 
 module.exports = {

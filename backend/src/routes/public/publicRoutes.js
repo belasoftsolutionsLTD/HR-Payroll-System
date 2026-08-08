@@ -6,7 +6,9 @@ const router = express.Router();
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const crypto = require('crypto');
-// company_settings/project_invites are unmigrated and stay on the Mongo helpers below.
+// company_settings is unmigrated and stays on the Mongo helpers below.
+// project_invites is Postgres now (Phase 9) — see findInviteByToken/
+// acceptInviteCore/declineInviteCore in projectsFunctions.js.
 const { findOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
 // Phase 4) — jobRequisitions/candidates/applications now live in Postgres. `users`
@@ -390,7 +392,7 @@ router.get('/project-invites/:token', AsyncHandler(async (req, res) => {
   const invite = await findInviteByToken(req.params.token);
   if (!invite) return returnFunction(res, 404, false, 'Invite not found or link is invalid.');
   if (invite.status === 'pending' && new Date(invite.expiresAt) < new Date()) {
-    await updateOne('project_invites', { _id: invite._id }, { $set: { status: 'expired', updatedAt: new Date() } });
+    await knex('project_invites').where({ id: invite.id }).update({ status: 'expired', updatedAt: new Date() });
     return returnFunction(res, 410, false, 'This invite has expired.');
   }
 
