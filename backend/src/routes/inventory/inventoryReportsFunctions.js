@@ -1,6 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_stock_levels/inventory_items/
+// inventory_locations/inventory_lots/inventory_stock_movements are all Postgres now.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany } = require('../../functions/Database/commonDBFunctions');
 const { getInventoryAccessLevel, getScopedLocationFilter } = require('../../lib/inventory/inventoryAccess');
 
 // Valuation (current stock × weighted-average cost) — admin-only per the module's role
@@ -13,37 +14,37 @@ const getValuationReport = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Valuation reports are restricted to inventory admins.');
 
-  const stockFilter = { quantity: { $gt: 0 } };
-  if (req.query.locationId) stockFilter.locationId = new ObjectId(req.query.locationId);
-  const stockLevels = await findMany('inventory_stock_levels', stockFilter, {});
+  let query = knex('inventory_stock_levels').where('quantity', '>', 0);
+  if (req.query.locationId) query = query.where({ locationId: req.query.locationId });
+  const stockLevels = await query;
   if (!stockLevels.length) return returnFunction(res, 200, true, req.locale.success, { total: 0, byLocation: [], byItem: [] });
 
-  const itemIds = [...new Set(stockLevels.map((s) => String(s.itemId)))].map((id) => new ObjectId(id));
-  const locIds = [...new Set(stockLevels.map((s) => String(s.locationId)))].map((id) => new ObjectId(id));
+  const itemIds = [...new Set(stockLevels.map((s) => s.itemId))];
+  const locIds = [...new Set(stockLevels.map((s) => s.locationId))];
   const [items, locations] = await Promise.all([
-    findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { sku: 1, name: 1, avgCost: 1, category: 1 } }),
-    findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } }),
+    knex('inventory_items').whereIn('id', itemIds).select('id', 'sku', 'name', 'avgCost', 'category'),
+    knex('inventory_locations').whereIn('id', locIds).select('id', 'name'),
   ]);
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
 
   let total = 0;
   const byLocationMap = {};
   const byItemMap = {};
 
   for (const s of stockLevels) {
-    const item = itemMap[String(s.itemId)];
+    const item = itemMap[s.itemId];
     if (!item) continue;
     if (req.query.category && item.category !== req.query.category) continue;
     const value = (s.quantity || 0) * (item.avgCost || 0);
     total += value;
 
-    const locKey = String(s.locationId);
+    const locKey = s.locationId;
     byLocationMap[locKey] ??= { locationId: s.locationId, location: locMap[locKey] || null, quantity: 0, value: 0 };
     byLocationMap[locKey].quantity += s.quantity || 0;
     byLocationMap[locKey].value += value;
 
-    const itemKey = String(s.itemId);
+    const itemKey = s.itemId;
     byItemMap[itemKey] ??= { itemId: s.itemId, item, quantity: 0, value: 0 };
     byItemMap[itemKey].quantity += s.quantity || 0;
     byItemMap[itemKey].value += value;
@@ -65,32 +66,32 @@ const getStockByCategoryReport = async (req, res) => {
 
   let locationIds = null;
   if (scopeFilter) {
-    const scopedLocations = await findMany('inventory_locations', scopeFilter, { projection: { _id: 1 } });
-    locationIds = scopedLocations.map((l) => l._id);
+    const scopedLocations = await knex('inventory_locations').where(scopeFilter).select('id');
+    locationIds = scopedLocations.map((l) => l.id);
   }
 
   // No date-range filter here (or on valuation/low-stock) — inventory_stock_levels is a
   // running current-state snapshot, not an event log, so "as of a past date" would need
   // to replay inventory_stock_movements, which is real scope beyond what was asked.
-  const filter = {};
-  if (req.query.locationId) filter.locationId = new ObjectId(req.query.locationId);
-  else if (locationIds) filter.locationId = { $in: locationIds };
-  const stockLevels = await findMany('inventory_stock_levels', filter, {});
+  let query = knex('inventory_stock_levels');
+  if (req.query.locationId) query = query.where({ locationId: req.query.locationId });
+  else if (locationIds) query = query.whereIn('locationId', locationIds);
+  const stockLevels = await query;
   if (!stockLevels.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const itemIds = [...new Set(stockLevels.map((s) => String(s.itemId)))].map((id) => new ObjectId(id));
-  const items = await findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { category: 1, unitOfMeasure: 1 } });
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
+  const itemIds = [...new Set(stockLevels.map((s) => s.itemId))];
+  const items = await knex('inventory_items').whereIn('id', itemIds).select('id', 'category', 'unitOfMeasure');
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
 
   const byCategory = {};
   for (const s of stockLevels) {
-    const item = itemMap[String(s.itemId)];
+    const item = itemMap[s.itemId];
     if (!item) continue;
     const cat = item.category || 'Uncategorized';
     if (req.query.category && cat !== req.query.category) continue;
     byCategory[cat] ??= { category: cat, quantity: 0, itemCount: new Set() };
     byCategory[cat].quantity += s.quantity || 0;
-    byCategory[cat].itemCount.add(String(s.itemId));
+    byCategory[cat].itemCount.add(s.itemId);
   }
 
   const result = Object.values(byCategory)
@@ -115,27 +116,28 @@ const getInventoryInsights = async (req, res) => {
   const since60 = new Date(now.getTime() - 60 * 86400000);
 
   // ── Nearing expiry with high remaining quantity ──
-  const nearExpiryLots = await findMany('inventory_lots', { expiryDate: { $ne: null, $gte: now, $lte: in30Days }, quantityRemaining: { $gt: 0 } }, {});
+  const nearExpiryLots = await knex('inventory_lots')
+    .whereNotNull('expiryDate').where('expiryDate', '>=', now).where('expiryDate', '<=', in30Days).where('quantityRemaining', '>', 0);
   let nearExpiry = [];
   if (nearExpiryLots.length) {
-    const itemIds = [...new Set(nearExpiryLots.map((l) => String(l.itemId)))].map((id) => new ObjectId(id));
-    const allLotsForItems = await findMany('inventory_lots', { itemId: { $in: itemIds } }, { projection: { itemId: 1, quantityRemaining: 1 } });
+    const itemIds = [...new Set(nearExpiryLots.map((l) => l.itemId))];
+    const allLotsForItems = await knex('inventory_lots').whereIn('itemId', itemIds).select('itemId', 'quantityRemaining');
     const avgByItem = {};
     for (const l of allLotsForItems) {
-      const k = String(l.itemId);
+      const k = l.itemId;
       avgByItem[k] ??= { sum: 0, count: 0 };
       avgByItem[k].sum += l.quantityRemaining || 0;
       avgByItem[k].count += 1;
     }
-    const items = await findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { sku: 1, name: 1 } });
-    const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
+    const items = await knex('inventory_items').whereIn('id', itemIds).select('id', 'sku', 'name');
+    const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
     nearExpiry = nearExpiryLots
       .filter((l) => {
-        const avg = avgByItem[String(l.itemId)];
+        const avg = avgByItem[l.itemId];
         return avg && avg.count > 0 && l.quantityRemaining >= (avg.sum / avg.count);
       })
       .map((l) => ({
-        itemId: l.itemId, item: itemMap[String(l.itemId)] || null, lotNumber: l.lotNumber,
+        itemId: l.itemId, item: itemMap[l.itemId] || null, lotNumber: l.lotNumber,
         quantityRemaining: l.quantityRemaining, expiryDate: l.expiryDate,
         daysUntilExpiry: Math.ceil((new Date(l.expiryDate) - now) / 86400000),
       }))
@@ -144,12 +146,12 @@ const getInventoryInsights = async (req, res) => {
 
   // ── Declining 30-day sale velocity per item ──
   const [recentSales, priorSales] = await Promise.all([
-    findMany('inventory_stock_movements', { movementType: 'sale', createdAt: { $gte: since30 } }, { projection: { itemId: 1, quantityChange: 1 } }),
-    findMany('inventory_stock_movements', { movementType: 'sale', createdAt: { $gte: since60, $lt: since30 } }, { projection: { itemId: 1, quantityChange: 1 } }),
+    knex('inventory_stock_movements').where({ movementType: 'sale' }).where('createdAt', '>=', since30).select('itemId', 'quantityChange'),
+    knex('inventory_stock_movements').where({ movementType: 'sale' }).where('createdAt', '>=', since60).where('createdAt', '<', since30).select('itemId', 'quantityChange'),
   ]);
   const sumByItem = (rows) => {
     const m = {};
-    for (const r of rows) { const k = String(r.itemId); m[k] = (m[k] || 0) + Math.abs(r.quantityChange || 0); }
+    for (const r of rows) { const k = r.itemId; m[k] = (m[k] || 0) + Math.abs(r.quantityChange || 0); }
     return m;
   };
   const recentByItem = sumByItem(recentSales);
@@ -157,8 +159,8 @@ const getInventoryInsights = async (req, res) => {
   const decliningItemIds = Object.keys(priorByItem).filter((k) => priorByItem[k] > 0 && (recentByItem[k] || 0) < priorByItem[k] * 0.5);
   let decliningVelocity = [];
   if (decliningItemIds.length) {
-    const items = await findMany('inventory_items', { _id: { $in: decliningItemIds.map((id) => new ObjectId(id)) } }, { projection: { sku: 1, name: 1 } });
-    const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
+    const items = await knex('inventory_items').whereIn('id', decliningItemIds).select('id', 'sku', 'name');
+    const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
     decliningVelocity = decliningItemIds
       .filter((k) => itemMap[k])
       .map((k) => ({
@@ -173,16 +175,16 @@ const getInventoryInsights = async (req, res) => {
   // ── Valuation concentration (no historical snapshot exists to diff a real "swing"
   // against, so this flags categories that make up a disproportionate share of total
   // value today, rather than fabricating a week-over-week trend) ──
-  const stockLevels = await findMany('inventory_stock_levels', { quantity: { $gt: 0 } }, {});
+  const stockLevels = await knex('inventory_stock_levels').where('quantity', '>', 0);
   let valuationConcentration = [];
   if (stockLevels.length) {
-    const itemIds = [...new Set(stockLevels.map((s) => String(s.itemId)))].map((id) => new ObjectId(id));
-    const items = await findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { avgCost: 1, category: 1 } });
-    const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
+    const itemIds = [...new Set(stockLevels.map((s) => s.itemId))];
+    const items = await knex('inventory_items').whereIn('id', itemIds).select('id', 'avgCost', 'category');
+    const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
     const byCategory = {};
     let total = 0;
     for (const s of stockLevels) {
-      const item = itemMap[String(s.itemId)];
+      const item = itemMap[s.itemId];
       if (!item) continue;
       const value = (s.quantity || 0) * (item.avgCost || 0);
       total += value;

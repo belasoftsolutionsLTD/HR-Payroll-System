@@ -1,4 +1,8 @@
-const { findOne, findMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 6) — employees has been Postgres since Phase 1; this file was still reading
+// it off the Mongo helper (found while sweeping for Phase 6, same gap as
+// lib/inventory/inventoryAccess.js). inventory_locations now lives in Postgres too.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { DEPT_HEAD, STAFF, HR_ROLES } = require('../../constants/roles');
 
 // Mirrors Inventory's access model exactly (lib/inventory/inventoryAccess.js) — same
@@ -10,7 +14,7 @@ const { DEPT_HEAD, STAFF, HR_ROLES } = require('../../constants/roles');
 //               attendance/inventory all use). Full checkout at their department's
 //               location(s), can void/refund same-day sales there.
 //   'staff'   — a plain staff account, checkout-only, and ONLY at locations explicitly
-//               assigned via users.posLocationIds (a new POS-owned field — Inventory has
+//               assigned via users.posLocationIds (a POS-owned field — Inventory has
 //               no equivalent concept, a cashier isn't necessarily a department manager).
 //               Cannot void or refund at all — that's manager/admin only.
 //   null      — no POS access.
@@ -20,7 +24,7 @@ const getPosAccessLevel = async (user) => {
   if (user.role === DEPT_HEAD) return 'manager';
   if (user.role === STAFF) {
     if (user.employeeId) {
-      const directReport = await findOne('employees', { managerId: user.employeeId }, { projection: { _id: 1 } });
+      const directReport = await knex('employees').where({ managerId: String(user.employeeId) }).select('id').first();
       if (directReport) return 'manager';
     }
     return 'staff';
@@ -33,12 +37,12 @@ const getScopedPosLocationIds = async (user, level) => {
   if (level === 'admin') return null;
   if (level === 'manager') {
     if (!user.department) return [];
-    const locations = await findMany('inventory_locations', { department: user.department, isActive: { $ne: false } }, { projection: { _id: 1 } });
-    return locations.map((l) => l._id);
+    const locations = await knex('inventory_locations').where({ department: user.department }).whereNot({ isActive: false }).select('id');
+    return locations.map((l) => l.id);
   }
   // 'staff' — explicit assignment only, no department fallback (a cashier must be
   // deliberately assigned, unlike a manager who inherits their whole department).
-  return (user.posLocationIds || []).map((id) => (typeof id === 'string' ? id : id));
+  return user.posLocationIds || [];
 };
 
 const canSellAtLocation = async (user, level, locationId) => {

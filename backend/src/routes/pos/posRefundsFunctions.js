@@ -1,6 +1,9 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — pos_refunds/pos_sales/inventory_locations/
+// inventory_stock_movements are all Postgres now. sale.items is a JSONB array (whole
+// read-modify-write, incrementing items[].refundedQuantity in JS then writing the whole
+// array back — same idiom used throughout this phase).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { returnStockFromSale } = require('../../lib/inventory/inventoryIntegration');
 const { getPosAccessLevel } = require('../../lib/pos/posAccess');
 const { getMyOpenSession } = require('./posRegisterFunctions');
@@ -18,11 +21,11 @@ const POS_PAYMENT_SYSTEM_KEYS = { cash: 'cash', card: 'pos_card_clearing', mpesa
 // so the expense reversal matches exactly what was originally recognized.
 async function postRefundJournalEntry(refundDoc, refundId, saleId, postedBy) {
   const [location, saleMovements] = await Promise.all([
-    findOne('inventory_locations', { _id: refundDoc.locationId }, { projection: { department: 1 } }),
-    findMany('inventory_stock_movements', { referenceId: saleId, referenceModel: 'pos_sale', movementType: 'sale' }, {}),
+    knex('inventory_locations').where({ id: refundDoc.locationId }).select('department').first(),
+    knex('inventory_stock_movements').where({ referenceId: saleId, referenceModel: 'pos_sale', movementType: 'sale' }),
   ]);
-  const unitCostByItem = Object.fromEntries(saleMovements.map((m) => [String(m.itemId), m.unitCost || 0]));
-  const cogsAmount = round2(refundDoc.items.reduce((s, l) => s + l.quantity * (unitCostByItem[String(l.itemId)] || 0), 0));
+  const unitCostByItem = Object.fromEntries(saleMovements.map((m) => [m.itemId, m.unitCost || 0]));
+  const cogsAmount = round2(refundDoc.items.reduce((s, l) => s + l.quantity * (unitCostByItem[l.itemId] || 0), 0));
 
   const returnsAcct = await resolveSystemAccount('sales_returns');
   const paymentAcct = await resolveSystemAccount(POS_PAYMENT_SYSTEM_KEYS[refundDoc.method] || 'cash');
@@ -61,7 +64,7 @@ const createRefund = async (req, res) => {
     return returnFunction(res, 400, false, 'saleId, items, and a refund method (cash/card) are required.');
   }
 
-  const sale = await findOne('pos_sales', { _id: new ObjectId(saleId) });
+  const sale = await knex('pos_sales').where({ id: saleId }).first();
   if (!sale) return returnFunction(res, 404, false, req.locale.notFound);
   if (!['completed', 'partially_refunded'].includes(sale.status)) {
     return returnFunction(res, 400, false, 'Only a completed (or partially refunded) sale can be refunded further.');
@@ -88,42 +91,45 @@ const createRefund = async (req, res) => {
   }
   refundAmount = round2(refundAmount);
 
-  const session = await getMyOpenSession(req.user._id);
-  const refundDoc = {
-    saleId: sale._id,
+  const session = await getMyOpenSession(req.user.id);
+  const refundId = newId();
+  const refundRow = {
+    id: refundId,
+    saleId: sale.id,
     saleNumber: sale.saleNumber,
     locationId: sale.locationId,
-    registerSessionId: session?._id || null,
-    items: refundLines,
+    registerSessionId: session?.id || null,
+    items: JSON.stringify(refundLines),
     amount: refundAmount,
     method,
     reason: reason || null,
-    refundedBy: req.user._id,
+    refundedBy: req.user.id,
     refundedByName: req.user.name,
     createdAt: new Date(),
   };
-  const result = await insertOne('pos_refunds', refundDoc);
+  await knex('pos_refunds').insert(refundRow);
+  const refundDoc = { ...refundRow, items: refundLines };
 
   for (const line of refundLines) {
-    await returnStockFromSale(line.itemId, sale.locationId, line.quantity, sale._id, req.user._id).catch(() => {});
+    await returnStockFromSale(line.itemId, sale.locationId, line.quantity, sale.id, req.user.id).catch(() => {});
   }
 
-  await postRefundJournalEntry(refundDoc, result.insertedId, sale._id, req.user._id);
+  await postRefundJournalEntry(refundDoc, refundId, sale.id, req.user._id);
 
   const allRefunded = updatedLines.every((l) => l.refundedQuantity >= l.quantity);
   const status = allRefunded ? 'refunded' : 'partially_refunded';
-  await updateOne('pos_sales', { _id: sale._id }, { $set: { items: updatedLines, status, updatedAt: new Date() } });
+  await knex('pos_sales').where({ id: sale.id }).update({ items: JSON.stringify(updatedLines), status, updatedAt: new Date() });
 
-  return returnFunction(res, 201, true, 'Refund processed and stock restored.', { _id: result.insertedId, ...refundDoc, saleStatus: status });
+  return returnFunction(res, 201, true, 'Refund processed and stock restored.', { ...refundDoc, saleStatus: status });
 };
 
 const listRefunds = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const filter = {};
-  if (req.query.saleId) filter.saleId = new ObjectId(req.query.saleId);
-  if (req.query.locationId) filter.locationId = new ObjectId(req.query.locationId);
-  const refunds = await findMany('pos_refunds', filter, { sort: { createdAt: -1 }, limit: 100 });
+  let query = knex('pos_refunds');
+  if (req.query.saleId) query = query.where({ saleId: req.query.saleId });
+  if (req.query.locationId) query = query.where({ locationId: req.query.locationId });
+  const refunds = await query.orderBy('createdAt', 'desc').limit(100);
   return returnFunction(res, 200, true, req.locale.success, refunds);
 };
 

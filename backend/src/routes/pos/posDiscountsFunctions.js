@@ -1,7 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — pos_promo_codes is Postgres now.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 
 // Promo codes are optional and configured per business (not every industry using
 // Workfola needs them) — a plain admin-managed lookup, resolved at checkout time by code.
@@ -10,10 +10,11 @@ const listPromoCodes = async (req, res) => {
   // Plain listing (admin Settings panel) shows everything, including inactive/expired
   // codes, so they can still be managed/deleted. ?activeOnly=true is for the checkout
   // screen — a cashier should only ever be shown codes that would actually apply.
-  const filter = req.query.activeOnly === 'true'
-    ? { isActive: { $ne: false }, $or: [{ expiresAt: null }, { expiresAt: { $gte: new Date() } }] }
-    : {};
-  const codes = await findMany('pos_promo_codes', filter, { sort: { code: 1 } });
+  let query = knex('pos_promo_codes');
+  if (req.query.activeOnly === 'true') {
+    query = query.whereNot({ isActive: false }).where((qb) => qb.whereNull('expiresAt').orWhere('expiresAt', '>=', new Date()));
+  }
+  const codes = await query.orderBy('code');
   return returnFunction(res, 200, true, req.locale.success, codes);
 };
 
@@ -23,10 +24,11 @@ const createPromoCode = async (req, res) => {
     return returnFunction(res, 400, false, "discountType must be 'percentage' or 'fixed'.");
   }
   const code = req.body.code.trim().toUpperCase();
-  const existing = await findOne('pos_promo_codes', { code });
+  const existing = await knex('pos_promo_codes').where({ code }).first();
   if (existing) return returnFunction(res, 409, false, 'A promo code with this code already exists.');
 
   const doc = {
+    id: newId(),
     code,
     discountType: req.body.discountType,
     discountValue: Number(req.body.discountValue),
@@ -35,8 +37,8 @@ const createPromoCode = async (req, res) => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('pos_promo_codes', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('pos_promo_codes').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updatePromoCode = async (req, res) => {
@@ -45,12 +47,12 @@ const updatePromoCode = async (req, res) => {
   if (req.body.discountValue !== undefined) update.discountValue = Number(req.body.discountValue);
   if (req.body.expiresAt !== undefined) update.expiresAt = req.body.expiresAt ? new Date(req.body.expiresAt) : null;
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('pos_promo_codes', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('pos_promo_codes').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deletePromoCode = async (req, res) => {
-  await updateOne('pos_promo_codes', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('pos_promo_codes').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
@@ -58,7 +60,7 @@ const deletePromoCode = async (req, res) => {
 // "apply code" lookup the register screen can call for instant feedback.
 const resolvePromoCode = async (rawCode) => {
   if (!rawCode) return null;
-  const code = await findOne('pos_promo_codes', { code: String(rawCode).trim().toUpperCase(), isActive: { $ne: false } });
+  const code = await knex('pos_promo_codes').where({ code: String(rawCode).trim().toUpperCase() }).whereNot({ isActive: false }).first();
   if (!code) return null;
   if (code.expiresAt && code.expiresAt < new Date()) return null;
   return code;

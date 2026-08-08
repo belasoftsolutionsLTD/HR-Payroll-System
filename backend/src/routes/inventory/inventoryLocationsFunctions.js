@@ -1,7 +1,12 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_locations/inventory_stock_levels/
+// inventory_items are now Postgres. Two Mongo-only patterns needed real translation:
+// setReorderPoint's $setOnInsert+upsert → knex .insert().onConflict().merge() against
+// the new UNIQUE(locationId, itemId) constraint; getLowStockLevels' $expr quantity<=
+// reorderPoint comparison → a raw SQL column-to-column comparison (Knex has no
+// column-vs-column .where() shorthand for this).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { getInventoryAccessLevel, getScopedLocationFilter } = require('../../lib/inventory/inventoryAccess');
 
 // ── Locations ─────────────────────────────────────────────────────────────────
@@ -10,14 +15,16 @@ const listLocations = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   const scopeFilter = await getScopedLocationFilter(req.user, level);
-  const filter = { isActive: { $ne: false }, ...(scopeFilter || {}) };
-  const locations = await findMany('inventory_locations', filter, { sort: { name: 1 } });
+  let query = knex('inventory_locations').whereNot({ isActive: false });
+  if (scopeFilter) query = query.where(scopeFilter);
+  const locations = await query.orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, locations);
 };
 
 const createLocation = async (req, res) => {
   if (!validateRequiredFields(req, res, ['name', 'type'])) return;
   const doc = {
+    id: newId(),
     name: req.body.name.trim(),
     type: req.body.type, // 'warehouse' | 'store' | 'room' | 'other'
     address: req.body.address?.trim() || '',
@@ -26,8 +33,8 @@ const createLocation = async (req, res) => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('inventory_locations', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('inventory_locations').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateLocation = async (req, res) => {
@@ -36,12 +43,12 @@ const updateLocation = async (req, res) => {
   if (req.body.type !== undefined) update.type = req.body.type;
   if (req.body.address !== undefined) update.address = req.body.address.trim();
   if (req.body.department !== undefined) update.department = req.body.department || null;
-  await updateOne('inventory_locations', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('inventory_locations').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteLocation = async (req, res) => {
-  await updateOne('inventory_locations', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('inventory_locations').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
@@ -55,33 +62,33 @@ const listStockLevels = async (req, res) => {
 
   let locationIds = null;
   if (scopeFilter) {
-    const scopedLocations = await findMany('inventory_locations', scopeFilter, { projection: { _id: 1 } });
-    locationIds = scopedLocations.map((l) => l._id);
+    const scopedLocations = await knex('inventory_locations').where(scopeFilter).select('id');
+    locationIds = scopedLocations.map((l) => l.id);
   }
 
-  const filter = {};
+  let query = knex('inventory_stock_levels');
   if (req.query.locationId) {
-    filter.locationId = new ObjectId(req.query.locationId);
+    query = query.where({ locationId: req.query.locationId });
   } else if (locationIds) {
-    filter.locationId = { $in: locationIds };
+    query = query.whereIn('locationId', locationIds);
   }
-  if (req.query.itemId) filter.itemId = new ObjectId(req.query.itemId);
+  if (req.query.itemId) query = query.where({ itemId: req.query.itemId });
 
-  const stockLevels = await findMany('inventory_stock_levels', filter, {});
+  const stockLevels = await query;
   if (!stockLevels.length) return returnFunction(res, 200, true, req.locale.success, []);
 
-  const itemIds = [...new Set(stockLevels.map((s) => String(s.itemId)))].map((id) => new ObjectId(id));
-  const locIds = [...new Set(stockLevels.map((s) => String(s.locationId)))].map((id) => new ObjectId(id));
+  const itemIds = [...new Set(stockLevels.map((s) => s.itemId))];
+  const locIds = [...new Set(stockLevels.map((s) => s.locationId))];
   const [items, locations] = await Promise.all([
-    findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { sku: 1, name: 1, category: 1, unitOfMeasure: 1 } }),
-    findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1, type: 1 } }),
+    knex('inventory_items').whereIn('id', itemIds).select('id', 'sku', 'name', 'category', 'unitOfMeasure'),
+    knex('inventory_locations').whereIn('id', locIds).select('id', 'name', 'type'),
   ]);
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
 
   const enriched = stockLevels
-    .filter((s) => itemMap[String(s.itemId)]) // drop rows for archived items
-    .map((s) => ({ ...s, item: itemMap[String(s.itemId)] || null, location: locMap[String(s.locationId)] || null }));
+    .filter((s) => itemMap[s.itemId]) // drop rows for archived items
+    .map((s) => ({ ...s, item: itemMap[s.itemId] || null, location: locMap[s.locationId] || null }));
 
   return returnFunction(res, 200, true, req.locale.success, enriched);
 };
@@ -89,8 +96,8 @@ const listStockLevels = async (req, res) => {
 // Consolidated total-across-all-locations view for one item — the "total stock" number
 // shown on the item detail page, separate from the per-location breakdown above.
 const getItemTotalStock = async (req, res) => {
-  const itemId = new ObjectId(req.params.itemId);
-  const levels = await findMany('inventory_stock_levels', { itemId }, {});
+  const itemId = req.params.itemId;
+  const levels = await knex('inventory_stock_levels').where({ itemId });
   const totalQuantity = levels.reduce((sum, l) => sum + (l.quantity || 0), 0);
   return returnFunction(res, 200, true, req.locale.success, { itemId, totalQuantity, byLocation: levels });
 };
@@ -100,12 +107,11 @@ const setReorderPoint = async (req, res) => {
   const reorderPoint = Number(req.body.reorderPoint);
   if (isNaN(reorderPoint) || reorderPoint < 0) return returnFunction(res, 400, false, 'reorderPoint must be a non-negative number.');
 
-  await updateOne(
-    'inventory_stock_levels',
-    { itemId: new ObjectId(req.body.itemId), locationId: new ObjectId(req.body.locationId) },
-    { $set: { reorderPoint, updatedAt: new Date() }, $setOnInsert: { quantity: 0 } },
-    { upsert: true }
-  );
+  const updatedAt = new Date();
+  await knex('inventory_stock_levels')
+    .insert({ id: newId(), itemId: req.body.itemId, locationId: req.body.locationId, quantity: 0, reorderPoint, updatedAt })
+    .onConflict(['locationId', 'itemId'])
+    .merge({ reorderPoint, updatedAt }); // merge deliberately omits `quantity` — preserves the existing ledger-derived value on conflict, only $setOnInsert's it to 0 for a brand-new row
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -119,29 +125,29 @@ const getLowStockLevels = async (userForScope, extraFilters = {}) => {
 
   let locationIds = null;
   if (scopeFilter) {
-    const scopedLocations = await findMany('inventory_locations', scopeFilter, { projection: { _id: 1 } });
-    locationIds = scopedLocations.map((l) => l._id);
+    const scopedLocations = await knex('inventory_locations').where(scopeFilter).select('id');
+    locationIds = scopedLocations.map((l) => l.id);
   }
 
-  const filter = { reorderPoint: { $gt: 0 }, $expr: { $lte: ['$quantity', '$reorderPoint'] } };
-  if (extraFilters.locationId) filter.locationId = new ObjectId(extraFilters.locationId);
-  else if (locationIds) filter.locationId = { $in: locationIds };
+  let query = knex('inventory_stock_levels').where('reorderPoint', '>', 0).whereRaw('"quantity" <= "reorderPoint"');
+  if (extraFilters.locationId) query = query.where({ locationId: extraFilters.locationId });
+  else if (locationIds) query = query.whereIn('locationId', locationIds);
 
-  const lowLevels = await findMany('inventory_stock_levels', filter, {});
+  const lowLevels = await query;
   if (!lowLevels.length) return [];
 
-  const itemIds = [...new Set(lowLevels.map((s) => String(s.itemId)))].map((id) => new ObjectId(id));
-  const locIds = [...new Set(lowLevels.map((s) => String(s.locationId)))].map((id) => new ObjectId(id));
+  const itemIds = [...new Set(lowLevels.map((s) => s.itemId))];
+  const locIds = [...new Set(lowLevels.map((s) => s.locationId))];
   const [items, locations] = await Promise.all([
-    findMany('inventory_items', { _id: { $in: itemIds }, isActive: { $ne: false } }, { projection: { sku: 1, name: 1, unitOfMeasure: 1, category: 1 } }),
-    findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } }),
+    knex('inventory_items').whereIn('id', itemIds).whereNot({ isActive: false }).select('id', 'sku', 'name', 'unitOfMeasure', 'category'),
+    knex('inventory_locations').whereIn('id', locIds).select('id', 'name'),
   ]);
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
 
   return lowLevels
-    .filter((s) => itemMap[String(s.itemId)] && (!extraFilters.category || itemMap[String(s.itemId)].category === extraFilters.category))
-    .map((s) => ({ ...s, item: itemMap[String(s.itemId)], location: locMap[String(s.locationId)] || null }));
+    .filter((s) => itemMap[s.itemId] && (!extraFilters.category || itemMap[s.itemId].category === extraFilters.category))
+    .map((s) => ({ ...s, item: itemMap[s.itemId], location: locMap[s.locationId] || null }));
 };
 
 const getLowStockReport = async (req, res) => {

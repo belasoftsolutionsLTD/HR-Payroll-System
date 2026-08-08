@@ -1,7 +1,9 @@
-const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md,
+// Phase 6) — inventory_categories/brands/units_of_measure/custom_field_defs/items
+// now live in Postgres.
+const { knex, newId, insertOne } = require('../../functions/Database/pgDBFunctions');
 const { getInventoryAccessLevel } = require('../../lib/inventory/inventoryAccess');
 
 // ── Categories (simple, admin-managed) ──────────────────────────────────────────
@@ -9,7 +11,7 @@ const { getInventoryAccessLevel } = require('../../lib/inventory/inventoryAccess
 const listCategories = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const categories = await findMany('inventory_categories', { isActive: { $ne: false } }, { sort: { name: 1 } });
+  const categories = await knex('inventory_categories').whereNot({ isActive: false }).orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, categories);
 };
 
@@ -17,23 +19,23 @@ const createCategory = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
   if (!validateRequiredFields(req, res, ['name'])) return;
-  const existing = await findOne('inventory_categories', { name: req.body.name.trim() });
+  const existing = await knex('inventory_categories').where({ name: req.body.name.trim() }).first();
   if (existing) return returnFunction(res, 409, false, 'A category with this name already exists.');
-  const doc = { name: req.body.name.trim(), isActive: true, createdAt: new Date(), updatedAt: new Date() };
+  const doc = { id: newId(), name: req.body.name.trim(), isActive: true, createdAt: new Date(), updatedAt: new Date() };
   const result = await insertOne('inventory_categories', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...doc });
 };
 
 const updateCategory = async (req, res) => {
   const update = { updatedAt: new Date() };
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('inventory_categories', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('inventory_categories').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteCategory = async (req, res) => {
-  await updateOne('inventory_categories', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('inventory_categories').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
@@ -43,7 +45,7 @@ const deleteCategory = async (req, res) => {
 const listBrands = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const brands = await findMany('inventory_brands', { isActive: { $ne: false } }, { sort: { name: 1 } });
+  const brands = await knex('inventory_brands').whereNot({ isActive: false }).orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, brands);
 };
 
@@ -51,23 +53,23 @@ const createBrand = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
   if (!validateRequiredFields(req, res, ['name'])) return;
-  const existing = await findOne('inventory_brands', { name: req.body.name.trim() });
+  const existing = await knex('inventory_brands').where({ name: req.body.name.trim() }).first();
   if (existing) return returnFunction(res, 409, false, 'A brand with this name already exists.');
-  const doc = { name: req.body.name.trim(), isActive: true, createdAt: new Date(), updatedAt: new Date() };
+  const doc = { id: newId(), name: req.body.name.trim(), isActive: true, createdAt: new Date(), updatedAt: new Date() };
   const result = await insertOne('inventory_brands', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...doc });
 };
 
 const updateBrand = async (req, res) => {
   const update = { updatedAt: new Date() };
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('inventory_brands', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('inventory_brands').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteBrand = async (req, res) => {
-  await updateOne('inventory_brands', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('inventory_brands').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
@@ -77,7 +79,7 @@ const deleteBrand = async (req, res) => {
 const listUnitsOfMeasure = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const units = await findMany('inventory_units_of_measure', { isActive: { $ne: false } }, { sort: { name: 1 } });
+  const units = await knex('inventory_units_of_measure').whereNot({ isActive: false }).orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, units);
 };
 
@@ -85,30 +87,30 @@ const createUnitOfMeasure = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
   if (!validateRequiredFields(req, res, ['name'])) return;
-  const existing = await findOne('inventory_units_of_measure', { name: req.body.name.trim() });
+  const existing = await knex('inventory_units_of_measure').where({ name: req.body.name.trim() }).first();
   if (existing) return returnFunction(res, 409, false, 'A unit of measure with this name already exists.');
-  const doc = { name: req.body.name.trim(), isActive: true, createdAt: new Date(), updatedAt: new Date() };
+  const doc = { id: newId(), name: req.body.name.trim(), isActive: true, createdAt: new Date(), updatedAt: new Date() };
   const result = await insertOne('inventory_units_of_measure', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...doc });
 };
 
 const updateUnitOfMeasure = async (req, res) => {
   const update = { updatedAt: new Date() };
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('inventory_units_of_measure', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('inventory_units_of_measure').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteUnitOfMeasure = async (req, res) => {
-  await updateOne('inventory_units_of_measure', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('inventory_units_of_measure').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
-// ── Custom field definitions (admin-managed, item docs store values keyed by _id) ─
+// ── Custom field definitions (admin-managed, item docs store values keyed by id) ─
 
 const listCustomFieldDefs = async (req, res) => {
-  const defs = await findMany('inventory_custom_field_defs', { isActive: { $ne: false } }, { sort: { name: 1 } });
+  const defs = await knex('inventory_custom_field_defs').whereNot({ isActive: false }).orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, defs);
 };
 
@@ -118,6 +120,7 @@ const createCustomFieldDef = async (req, res) => {
     return returnFunction(res, 400, false, "fieldType must be 'text', 'number', 'date', or 'select'.");
   }
   const doc = {
+    id: newId(),
     name: req.body.name.trim(),
     fieldType: req.body.fieldType,
     options: req.body.fieldType === 'select' ? (Array.isArray(req.body.options) ? req.body.options.map(String) : []) : [],
@@ -126,7 +129,7 @@ const createCustomFieldDef = async (req, res) => {
     updatedAt: new Date(),
   };
   const result = await insertOne('inventory_custom_field_defs', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...doc });
 };
 
 const updateCustomFieldDef = async (req, res) => {
@@ -134,12 +137,12 @@ const updateCustomFieldDef = async (req, res) => {
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (Array.isArray(req.body.options)) update.options = req.body.options.map(String);
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('inventory_custom_field_defs', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('inventory_custom_field_defs').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteCustomFieldDef = async (req, res) => {
-  await updateOne('inventory_custom_field_defs', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('inventory_custom_field_defs').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
@@ -158,8 +161,8 @@ const suggestSku = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   const prefix = skuPrefix(req.query.category, req.query.brand);
-  const count = await countDocuments('inventory_items', { sku: { $regex: `^${prefix}-` } });
-  const sku = `${prefix}-${String(count + 1).padStart(4, '0')}`;
+  const [{ count }] = await knex('inventory_items').where('sku', 'like', `${prefix}-%`).count('* as count');
+  const sku = `${prefix}-${String(Number(count) + 1).padStart(4, '0')}`;
   return returnFunction(res, 200, true, req.locale.success, { sku });
 };
 
@@ -169,35 +172,29 @@ const listItems = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   const { page, limit, skip } = getPagination(req.query);
-  const filter = { isActive: { $ne: false } };
-  if (req.query.category) filter.category = req.query.category;
-  if (req.query.isTracked !== undefined) filter.isTracked = req.query.isTracked === 'true';
+  let query = knex('inventory_items').whereNot({ isActive: false });
+  if (req.query.category) query = query.where({ category: req.query.category });
+  if (req.query.isTracked !== undefined) query = query.where({ isTracked: req.query.isTracked === 'true' });
   if (req.query.search) {
-    const q = req.query.search.trim();
-    filter.$or = [
-      { name: { $regex: q, $options: 'i' } },
-      { sku: { $regex: q, $options: 'i' } },
-      { barcode: { $regex: q, $options: 'i' } },
-    ];
+    const q = `%${req.query.search.trim()}%`;
+    query = query.where((qb) => qb.whereILike('name', q).orWhereILike('sku', q).orWhereILike('barcode', q));
   }
-  const [total, items] = await Promise.all([
-    countDocuments('inventory_items', filter),
-    findMany('inventory_items', filter, { skip, limit, sort: { name: 1 } }),
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items, total, page, limit));
+  const [{ count }] = await query.clone().count('* as count');
+  const items = await query.orderBy('name').limit(limit).offset(skip);
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(items, Number(count), page, limit));
 };
 
 const getItem = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const item = await findOne('inventory_items', { _id: new ObjectId(req.params.id) });
+  const item = await knex('inventory_items').where({ id: req.params.id }).first();
   if (!item) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, item);
 };
 
 const createItem = async (req, res) => {
   if (!validateRequiredFields(req, res, ['sku', 'name', 'unitOfMeasure'])) return;
-  const existing = await findOne('inventory_items', { sku: req.body.sku.trim() });
+  const existing = await knex('inventory_items').where({ sku: req.body.sku.trim() }).first();
   if (existing) return returnFunction(res, 409, false, 'An item with this SKU already exists.');
 
   const isTracked = req.body.isTracked !== false; // default true — most items track stock
@@ -205,6 +202,7 @@ const createItem = async (req, res) => {
   const discountType = ['percentage', 'fixed'].includes(req.body.discountType) ? req.body.discountType : null;
   const taxCategory = ['standard', 'zero_rated', 'exempt'].includes(req.body.taxCategory) ? req.body.taxCategory : 'standard';
   const doc = {
+    id: newId(),
     sku: req.body.sku.trim(),
     name: req.body.name.trim(),
     description: req.body.description?.trim() || '',
@@ -229,18 +227,18 @@ const createItem = async (req, res) => {
     // zero-rated and exempt are numerically the same (0%) but distinct legal categories
     // — Kenya VAT: 16% standard, 0% for zero-rated goods, exempt is separate from zero-rated.
     taxRate: taxCategory === 'standard' ? (Number(req.body.taxRate) || 16) : 0,
-    customFieldValues: req.body.customFieldValues && typeof req.body.customFieldValues === 'object' ? req.body.customFieldValues : {},
+    customFieldValues: JSON.stringify(req.body.customFieldValues && typeof req.body.customFieldValues === 'object' ? req.body.customFieldValues : {}),
     isActive: true,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
   const result = await insertOne('inventory_items', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.id, ...result });
 };
 
 const updateItem = async (req, res) => {
-  const existing = await findOne('inventory_items', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('inventory_items').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
 
   const update = { updatedAt: new Date() };
@@ -252,7 +250,7 @@ const updateItem = async (req, res) => {
   if (req.body.salePrice !== undefined) update.salePrice = Number(req.body.salePrice) || 0;
   if (req.body.barcode !== undefined) update.barcode = req.body.barcode?.trim() || null;
   if (req.body.expiryTrackingEnabled !== undefined) update.expiryTrackingEnabled = Boolean(req.body.expiryTrackingEnabled);
-  if (req.body.customFieldValues && typeof req.body.customFieldValues === 'object') update.customFieldValues = req.body.customFieldValues;
+  if (req.body.customFieldValues && typeof req.body.customFieldValues === 'object') update.customFieldValues = JSON.stringify(req.body.customFieldValues);
   if (req.body.discountType !== undefined) {
     update.discountType = ['percentage', 'fixed'].includes(req.body.discountType) ? req.body.discountType : null;
     update.discountValue = update.discountType ? Number(req.body.discountValue) || 0 : null;
@@ -266,19 +264,19 @@ const updateItem = async (req, res) => {
   // inventoryMovementsFunctions.recordReceiptCost), and changing tracking mode after
   // stock/lots exist would silently orphan traceability data.
 
-  await updateOne('inventory_items', { _id: existing._id }, { $set: update });
+  await knex('inventory_items').where({ id: existing.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const archiveItem = async (req, res) => {
-  await updateOne('inventory_items', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('inventory_items').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Archived.');
 };
 
 const uploadItemImage = async (req, res) => {
   if (!req.file) return returnFunction(res, 400, false, 'No image uploaded.');
   const imageUrl = req.file.path;
-  await updateOne('inventory_items', { _id: new ObjectId(req.params.id) }, { $set: { imageUrl, updatedAt: new Date() } });
+  await knex('inventory_items').where({ id: req.params.id }).update({ imageUrl, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully, { imageUrl });
 };
 

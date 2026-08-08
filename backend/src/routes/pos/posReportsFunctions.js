@@ -1,6 +1,10 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — pos_sales/inventory_locations are Postgres now.
+// items/payments are JSONB arrays, iterated in JS exactly as before (no $unwind
+// aggregation needed for these two reports — getDailySummary/exportSalesCSV already
+// read the whole array per sale in JS either way). getSalesByStaff's Mongo $group
+// becomes a real SQL GROUP BY.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, aggregate } = require('../../functions/Database/commonDBFunctions');
 const { getPosAccessLevel, getScopedPosLocationIds } = require('../../lib/pos/posAccess');
 
 const dayBounds = (dateStr) => {
@@ -10,15 +14,17 @@ const dayBounds = (dateStr) => {
   return { start, end };
 };
 
-const buildLocationFilter = async (req, level) => {
-  const filter = {};
-  if (req.query.locationId) {
-    filter.locationId = new ObjectId(req.query.locationId);
-  } else {
-    const scoped = await getScopedPosLocationIds(req.user, level);
-    if (scoped) filter.locationId = { $in: scoped.map((id) => new ObjectId(id)) };
-  }
-  return filter;
+// Resolves the same "explicit locationId, else POS-access-scoped locations" filter used
+// throughout this file. Deliberately NOT a "take a query builder, return a query builder"
+// helper — an async function that returns a knex builder is a trap: `await`ing its call
+// site adopts the builder's own `.then()` (thenable assimilation), which executes the
+// query immediately and hands back rows instead of the still-chainable builder, breaking
+// every `.select()/.where()/...` call added after it (caught live during Phase 6
+// verification — getSalesByStaff crashed with "query.select is not a function").
+// Returning a plain array of ids (or null) sidesteps the trap entirely.
+const resolveLocationFilterIds = async (req, level) => {
+  if (req.query.locationId) return [req.query.locationId];
+  return getScopedPosLocationIds(req.user, level); // array, or null = unrestricted
 };
 
 // End-of-day summary — total sales, transaction count, payment-method breakdown, top
@@ -38,9 +44,11 @@ const getDailySummary = async (req, res) => {
   } else {
     ({ start, end } = dayBounds(req.query.date));
   }
-  const filter = { ...(await buildLocationFilter(req, level)), createdAt: { $gte: start, $lte: end }, status: { $ne: 'failed' } };
+  let query = knex('pos_sales').where('createdAt', '>=', start).where('createdAt', '<=', end).whereNot({ status: 'failed' });
+  const locationIds = await resolveLocationFilterIds(req, level);
+  if (locationIds) query = query.whereIn('locationId', locationIds);
 
-  const sales = await findMany('pos_sales', filter, {});
+  const sales = await query;
   const totalSales = sales.reduce((sum, s) => sum + s.total, 0);
   const totalDiscounts = sales.reduce((sum, s) => sum + (s.lineDiscountTotal || 0) + (s.cartDiscountAmount || 0), 0);
   // Kept separate from totalDiscounts — a voucher is a company-funded expense, not a
@@ -55,9 +63,9 @@ const getDailySummary = async (req, res) => {
   const itemTotals = {};
   for (const s of sales) {
     for (const line of s.items) {
-      itemTotals[String(line.itemId)] ??= { itemId: line.itemId, sku: line.sku, name: line.name, quantity: 0, revenue: 0 };
-      itemTotals[String(line.itemId)].quantity += line.quantity;
-      itemTotals[String(line.itemId)].revenue += line.lineTotal;
+      itemTotals[line.itemId] ??= { itemId: line.itemId, sku: line.sku, name: line.name, quantity: 0, revenue: 0 };
+      itemTotals[line.itemId].quantity += line.quantity;
+      itemTotals[line.itemId].revenue += line.lineTotal;
     }
   }
   const topItems = Object.values(itemTotals).sort((a, b) => b.quantity - a.quantity).slice(0, 10);
@@ -81,20 +89,22 @@ const getSalesByStaff = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = await buildLocationFilter(req, level);
-  filter.status = { $ne: 'failed' };
-  if (req.query.startDate || req.query.endDate) {
-    filter.createdAt = {};
-    if (req.query.startDate) filter.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate);
-  }
+  let query = knex('pos_sales').whereNot({ status: 'failed' });
+  const locationIds = await resolveLocationFilterIds(req, level);
+  if (locationIds) query = query.whereIn('locationId', locationIds);
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
 
-  const rows = await aggregate('pos_sales', [
-    { $match: filter },
-    { $group: { _id: '$staffId', staffName: { $first: '$staffName' }, totalSales: { $sum: '$total' }, transactionCount: { $sum: 1 } } },
-    { $sort: { totalSales: -1 } },
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, rows.map((r) => ({ staffId: r._id, staffName: r.staffName, totalSales: Math.round(r.totalSales * 100) / 100, transactionCount: r.transactionCount })));
+  const rows = await query
+    .select('staffId')
+    .max('staffName as staffName')
+    .sum('total as totalSales')
+    .count('* as transactionCount')
+    .groupBy('staffId')
+    .orderBy('totalSales', 'desc');
+  return returnFunction(res, 200, true, req.locale.success, rows.map((r) => ({
+    staffId: r.staffId, staffName: r.staffName, totalSales: Math.round(Number(r.totalSales) * 100) / 100, transactionCount: Number(r.transactionCount),
+  })));
 };
 
 const csvEscape = (v) => {
@@ -106,21 +116,20 @@ const exportSalesCSV = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = await buildLocationFilter(req, level);
-  if (req.query.startDate || req.query.endDate) {
-    filter.createdAt = {};
-    if (req.query.startDate) filter.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate);
-  }
+  let query = knex('pos_sales');
+  const locationIds = await resolveLocationFilterIds(req, level);
+  if (locationIds) query = query.whereIn('locationId', locationIds);
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
 
-  const sales = await findMany('pos_sales', filter, { sort: { createdAt: -1 } });
-  const locIds = [...new Set(sales.map((s) => String(s.locationId)))].map((id) => new ObjectId(id));
-  const locations = await findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } });
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const sales = await query.orderBy('createdAt', 'desc');
+  const locIds = [...new Set(sales.map((s) => s.locationId))];
+  const locations = await knex('inventory_locations').whereIn('id', locIds).select('id', 'name');
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
 
   const header = 'SaleNumber,Date,Location,Staff,Subtotal,Discounts,Total,Payments,Status';
   const rows = sales.map((s) => [
-    s.saleNumber, s.createdAt.toISOString(), locMap[String(s.locationId)]?.name || '', s.staffName,
+    s.saleNumber, s.createdAt.toISOString(), locMap[s.locationId]?.name || '', s.staffName,
     s.subtotal, (s.lineDiscountTotal || 0) + (s.cartDiscountAmount || 0), s.total,
     s.payments.map((p) => `${p.method}:${p.amount}`).join('; '), s.status,
   ].map(csvEscape).join(','));

@@ -1,6 +1,9 @@
 const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany } = require('../../functions/Database/commonDBFunctions');
+// pos_sales is Postgres now (Phase 6) — found while sweeping CRM; crm_contacts stays
+// Mongo, CRM's own phase (7).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getCrmAccessLevel, canAccessAssignee } = require('../../lib/crm/crmAccess');
 
 // A focused list of one contact's real POS purchases — used by the "confirm this deal
@@ -14,7 +17,7 @@ const getContactSales = async (req, res) => {
   if (!contact) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, contact.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const sales = await findMany('pos_sales', { contactId: contact._id, status: { $ne: 'failed' } }, { sort: { createdAt: -1 } });
+  const sales = await knex('pos_sales').where({ contactId: String(contact._id) }).whereNot({ status: 'failed' }).orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, sales);
 };
 

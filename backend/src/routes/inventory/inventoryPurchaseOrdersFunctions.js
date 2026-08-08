@@ -1,7 +1,12 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_purchase_orders/inventory_suppliers/
+// inventory_locations/inventory_items are Postgres now. The `counters` table stays the
+// same transactional-upsert pattern established in Phase 1 (staffNumberGenerator.js),
+// not the old Mongo findOneAndUpdate($inc). `company_settings` (used by sendPurchaseOrder
+// for PDF branding) is still Mongo — Phase 10 — left untouched.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
+const { findOne } = require('../../functions/Database/commonDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { createStockMovement } = require('./inventoryMovementsFunctions');
 const { receiveLotStock } = require('./inventoryLotsFunctions');
 const { sendEmail } = require('../../services/emailService');
@@ -11,14 +16,19 @@ const { logPostingFailure } = require('../accounting/accountingPostingFailuresFu
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
+const nextCounterSeq = async (key) => {
+  const [row] = await knex('counters')
+    .insert({ id: key, seq: 1 })
+    .onConflict('id')
+    .merge({ seq: knex.raw('"counters"."seq" + 1') })
+    .returning('*');
+  return row.seq;
+};
+
 const generatePONumber = async () => {
   const year = new Date().getFullYear();
-  const result = await global.dbo.collection('counters').findOneAndUpdate(
-    { _id: `inventory_po_number_${year}` },
-    { $inc: { seq: 1 } },
-    { upsert: true, returnDocument: 'after' }
-  );
-  return `PO-${year}-${String(result.seq).padStart(5, '0')}`;
+  const seq = await nextCounterSeq(`inventory_po_number_${year}`);
+  return `PO-${year}-${String(seq).padStart(5, '0')}`;
 };
 
 // Short, scannable location code for the invoice-numbering scheme below —
@@ -38,49 +48,45 @@ function locationCode(name) {
 // location": PO-MW-2026-00001.
 const generatePOInvoiceNumber = async (locationName) => {
   const year = new Date().getFullYear();
-  const result = await global.dbo.collection('counters').findOneAndUpdate(
-    { _id: `inventory_po_invoice_number_${year}` }, { $inc: { seq: 1 } }, { upsert: true, returnDocument: 'after' }
-  );
-  return `PO-${locationCode(locationName)}-${year}-${String(result.seq).padStart(5, '0')}`;
+  const seq = await nextCounterSeq(`inventory_po_invoice_number_${year}`);
+  return `PO-${locationCode(locationName)}-${year}-${String(seq).padStart(5, '0')}`;
 };
 
 const listPurchaseOrders = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.supplierId) filter.supplierId = new ObjectId(req.query.supplierId);
+  let query = knex('inventory_purchase_orders');
+  if (req.query.status) query = query.where({ status: req.query.status });
+  if (req.query.supplierId) query = query.where({ supplierId: req.query.supplierId });
 
-  const [total, pos] = await Promise.all([
-    countDocuments('inventory_purchase_orders', filter),
-    findMany('inventory_purchase_orders', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const pos = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  const supplierIds = [...new Set(pos.map((p) => String(p.supplierId)))].map((id) => new ObjectId(id));
+  const supplierIds = [...new Set(pos.map((p) => p.supplierId))];
   const suppliers = supplierIds.length
-    ? await findMany('inventory_suppliers', { _id: { $in: supplierIds } }, { projection: { name: 1 } })
+    ? await knex('inventory_suppliers').whereIn('id', supplierIds).select('id', 'name')
     : [];
-  const supplierMap = Object.fromEntries(suppliers.map((s) => [String(s._id), s]));
-  const enriched = pos.map((p) => ({ ...p, supplier: supplierMap[String(p.supplierId)] || null }));
+  const supplierMap = Object.fromEntries(suppliers.map((s) => [s.id, s]));
+  const enriched = pos.map((p) => ({ ...p, supplier: supplierMap[p.supplierId] || null }));
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 const getPurchaseOrder = async (req, res) => {
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
 
   const [supplier, location, items] = await Promise.all([
-    findOne('inventory_suppliers', { _id: po.supplierId }, { projection: { name: 1, leadTimeDays: 1 } }),
-    findOne('inventory_locations', { _id: po.locationId }, { projection: { name: 1 } }),
-    findMany('inventory_items', { _id: { $in: po.items.map((i) => i.itemId) } }, { projection: { sku: 1, name: 1, unitOfMeasure: 1, trackingMode: 1 } }),
+    knex('inventory_suppliers').where({ id: po.supplierId }).select('name', 'leadTimeDays').first(),
+    knex('inventory_locations').where({ id: po.locationId }).select('name').first(),
+    knex('inventory_items').whereIn('id', po.items.map((i) => i.itemId)).select('id', 'sku', 'name', 'unitOfMeasure', 'trackingMode'),
   ]);
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
 
   return returnFunction(res, 200, true, req.locale.success, {
     ...po,
     supplier: supplier || null,
     location: location || null,
-    items: po.items.map((line) => ({ ...line, item: itemMap[String(line.itemId)] || null })),
+    items: po.items.map((line) => ({ ...line, item: itemMap[line.itemId] || null })),
   });
 };
 
@@ -97,62 +103,63 @@ const createPurchaseOrder = async (req, res) => {
 
   const poNumber = await generatePONumber();
   const doc = {
+    id: newId(),
     poNumber,
-    supplierId: new ObjectId(req.body.supplierId),
-    locationId: new ObjectId(req.body.locationId),
-    items: req.body.items.map((line) => ({
-      itemId: new ObjectId(line.itemId),
+    supplierId: req.body.supplierId,
+    locationId: req.body.locationId,
+    items: JSON.stringify(req.body.items.map((line) => ({
+      itemId: line.itemId,
       quantityOrdered: Number(line.quantityOrdered),
       quantityReceived: 0,
       unitCost: Number(line.unitCost) || 0,
-    })),
+    }))),
     status: 'draft',
     expectedDeliveryDate: req.body.expectedDeliveryDate ? new Date(req.body.expectedDeliveryDate) : null,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('inventory_purchase_orders', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('inventory_purchase_orders').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updatePurchaseOrder = async (req, res) => {
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (po.status !== 'draft') return returnFunction(res, 400, false, 'Only a draft purchase order can be edited.');
 
   const update = { updatedAt: new Date() };
-  if (req.body.supplierId) update.supplierId = new ObjectId(req.body.supplierId);
-  if (req.body.locationId) update.locationId = new ObjectId(req.body.locationId);
+  if (req.body.supplierId) update.supplierId = req.body.supplierId;
+  if (req.body.locationId) update.locationId = req.body.locationId;
   if (req.body.expectedDeliveryDate !== undefined) update.expectedDeliveryDate = req.body.expectedDeliveryDate ? new Date(req.body.expectedDeliveryDate) : null;
   if (Array.isArray(req.body.items) && req.body.items.length) {
-    update.items = req.body.items.map((line) => ({
-      itemId: new ObjectId(line.itemId),
+    update.items = JSON.stringify(req.body.items.map((line) => ({
+      itemId: line.itemId,
       quantityOrdered: Number(line.quantityOrdered),
       quantityReceived: 0,
       unitCost: Number(line.unitCost) || 0,
-    }));
+    })));
   }
-  await updateOne('inventory_purchase_orders', { _id: po._id }, { $set: update });
+  await knex('inventory_purchase_orders').where({ id: po.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const sendPurchaseOrder = async (req, res) => {
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (po.status !== 'draft') return returnFunction(res, 400, false, 'Only a draft purchase order can be sent.');
-  await updateOne('inventory_purchase_orders', { _id: po._id }, { $set: { status: 'pending', sentAt: new Date(), updatedAt: new Date() } });
+  await knex('inventory_purchase_orders').where({ id: po.id }).update({ status: 'pending', sentAt: new Date(), updatedAt: new Date() });
 
   const [supplier, location, itemDocs] = await Promise.all([
-    findOne('inventory_suppliers', { _id: po.supplierId }),
-    findOne('inventory_locations', { _id: po.locationId }, { projection: { name: 1, address: 1 } }),
-    findMany('inventory_items', { _id: { $in: po.items.map((l) => l.itemId) } }, { projection: { sku: 1, name: 1, unitOfMeasure: 1 } }),
+    knex('inventory_suppliers').where({ id: po.supplierId }).first(),
+    knex('inventory_locations').where({ id: po.locationId }).select('name', 'address').first(),
+    knex('inventory_items').whereIn('id', po.items.map((l) => l.itemId)).select('id', 'sku', 'name', 'unitOfMeasure'),
   ]);
 
   if (supplier?.email) {
-    const itemById = Object.fromEntries(itemDocs.map((i) => [String(i._id), i]));
+    const itemById = Object.fromEntries(itemDocs.map((i) => [i.id, i]));
     const rows = po.items.map((line) => {
-      const item = itemById[String(line.itemId)];
+      const item = itemById[line.itemId];
       const lineTotal = line.quantityOrdered * line.unitCost;
       return `<tr><td>${item?.name || 'Item'}${item?.sku ? ` (${item.sku})` : ''}</td><td>${line.quantityOrdered} ${item?.unitOfMeasure || ''}</td><td>${line.unitCost.toLocaleString()}</td><td>${lineTotal.toLocaleString()}</td></tr>`;
     }).join('');
@@ -186,27 +193,25 @@ const sendPurchaseOrder = async (req, res) => {
 // (nothing to receive until they've confirmed what they're billing us for and shipping).
 const logSupplierInvoice = async (req, res) => {
   if (!validateRequiredFields(req, res, ['invoiceNumber'])) return;
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (po.status !== 'pending') return returnFunction(res, 400, false, 'Only a pending purchase order can have a supplier invoice logged.');
 
-  const location = await findOne('inventory_locations', { _id: po.locationId }, { projection: { name: 1 } });
+  const location = await knex('inventory_locations').where({ id: po.locationId }).select('name').first();
   const poInvoiceNumber = await generatePOInvoiceNumber(location?.name);
   const invoiceAmount = req.body.invoiceAmount !== undefined && req.body.invoiceAmount !== '' ? Number(req.body.invoiceAmount) : null;
   const invoiceDueDate = req.body.invoiceDueDate ? new Date(req.body.invoiceDueDate) : null;
 
-  await updateOne('inventory_purchase_orders', { _id: po._id }, {
-    $set: {
-      status: 'pending_delivery',
-      invoiceNumber: req.body.invoiceNumber,
-      poInvoiceNumber,
-      invoiceReceivedAt: new Date(),
-      invoiceAmount, invoiceDueDate,
-      updatedAt: new Date(),
-    },
+  await knex('inventory_purchase_orders').where({ id: po.id }).update({
+    status: 'pending_delivery',
+    invoiceNumber: req.body.invoiceNumber,
+    poInvoiceNumber,
+    invoiceReceivedAt: new Date(),
+    invoiceAmount, invoiceDueDate,
+    updatedAt: new Date(),
   });
 
-  const supplier = await findOne('inventory_suppliers', { _id: po.supplierId });
+  const supplier = await knex('inventory_suppliers').where({ id: po.supplierId }).first();
   if (supplier?.email) {
     sendEmail({
       to: supplier.email,
@@ -223,7 +228,7 @@ const logSupplierInvoice = async (req, res) => {
 // revalues the item's weighted-average cost) and, for lot/serial-tracked items, a lot
 // record. quantityReceived accumulates across multiple partial receipts.
 const receivePurchaseOrder = async (req, res) => {
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (!['pending_delivery', 'partially_received'].includes(po.status)) {
     return returnFunction(res, 400, false, 'This purchase order is not awaiting receipt — a supplier invoice must be logged first.');
@@ -232,8 +237,8 @@ const receivePurchaseOrder = async (req, res) => {
     return returnFunction(res, 400, false, 'receipts array is required — one entry per line being received.');
   }
 
-  const itemDocs = await findMany('inventory_items', { _id: { $in: po.items.map((l) => l.itemId) } }, {});
-  const itemById = Object.fromEntries(itemDocs.map((i) => [String(i._id), i]));
+  const itemDocs = await knex('inventory_items').whereIn('id', po.items.map((l) => l.itemId));
+  const itemById = Object.fromEntries(itemDocs.map((i) => [i.id, i]));
 
   const updatedLines = po.items.map((line) => ({ ...line }));
   const receivedSummary = [];
@@ -248,22 +253,22 @@ const receivePurchaseOrder = async (req, res) => {
       return returnFunction(res, 400, false, `Cannot receive more than ordered for item ${receipt.itemId}.`);
     }
 
-    const item = itemById[String(line.itemId)];
+    const item = itemById[line.itemId];
     const unitCost = receipt.unitCost !== undefined ? Number(receipt.unitCost) : line.unitCost;
 
     let lotId = null;
     if (item?.isTracked && item.trackingMode !== 'none' && receipt.lotNumber) {
       const lot = await receiveLotStock({
         itemId: line.itemId, locationId: po.locationId, lotNumber: String(receipt.lotNumber),
-        quantity: qty, expiryDate: receipt.expiryDate || null, poId: po._id,
+        quantity: qty, expiryDate: receipt.expiryDate || null, poId: po.id,
       });
-      lotId = lot._id;
+      lotId = lot.id;
     }
 
     if (item?.isTracked) {
       await createStockMovement({
         itemId: line.itemId, locationId: po.locationId, quantityChange: qty, movementType: 'receipt',
-        referenceId: po._id, referenceModel: 'purchase_order', unitCost, lotId, performedBy: req.user._id,
+        referenceId: po.id, referenceModel: 'purchase_order', unitCost, lotId, performedBy: req.user.id,
       });
     }
 
@@ -277,18 +282,18 @@ const receivePurchaseOrder = async (req, res) => {
   const anyReceived = updatedLines.some((l) => l.quantityReceived > 0);
   const status = allReceived ? 'received' : anyReceived ? 'partially_received' : po.status;
 
-  await updateOne('inventory_purchase_orders', { _id: po._id }, {
-    $set: { items: updatedLines, status, updatedAt: new Date(), ...(allReceived ? { receivedAt: new Date() } : {}) },
+  await knex('inventory_purchase_orders').where({ id: po.id }).update({
+    items: JSON.stringify(updatedLines), status, updatedAt: new Date(), ...(allReceived ? { receivedAt: new Date() } : {}),
   });
 
   // Goods received but not yet paid for = a real liability, recognized right here rather
   // than at logSupplierInvoice (whose invoiceAmount is optional/manually typed and
   // unreliable) — never blocks the receipt itself, queues to gl_posting_failures on error.
   if (receiptValue > 0) {
-    const location = await findOne('inventory_locations', { _id: po.locationId }, { projection: { department: 1 } });
+    const location = await knex('inventory_locations').where({ id: po.locationId }).select('department').first();
     const payload = {
       date: new Date(), description: `Goods received — PO ${po.poNumber}`, source: 'inventory_po_receipt', sourceModule: 'inventory',
-      referenceId: po._id, referenceModel: 'inventory_purchase_orders', department: location?.department || null,
+      referenceId: po.id, referenceModel: 'inventory_purchase_orders', department: location?.department || null,
       lines: [], // filled below once accounts resolve
     };
     try {
@@ -297,14 +302,14 @@ const receivePurchaseOrder = async (req, res) => {
       payload.lines = [{ accountId: invAcct._id, debit: receiptValue }, { accountId: apAcct._id, credit: receiptValue }];
       await postJournalEntry({ ...payload, postedBy: req.user._id });
     } catch (err) {
-      await logPostingFailure({ source: 'inventory_po_receipt', sourceModule: 'inventory', referenceId: po._id, referenceModel: 'inventory_purchase_orders', attemptedPayload: payload, error: err });
+      await logPostingFailure({ source: 'inventory_po_receipt', sourceModule: 'inventory', referenceId: po.id, referenceModel: 'inventory_purchase_orders', attemptedPayload: payload, error: err });
     }
   }
 
   // Acknowledge delivery back to the supplier by email — the counterpart to the
   // invoice-received email sent in logSupplierInvoice, closing the loop on both ends.
   if (receivedSummary.length) {
-    const supplier = await findOne('inventory_suppliers', { _id: po.supplierId });
+    const supplier = await knex('inventory_suppliers').where({ id: po.supplierId }).first();
     if (supplier?.email) {
       const lines = receivedSummary.map((s) => `<li>${s}</li>`).join('');
       sendEmail({
@@ -340,33 +345,31 @@ const requestPoPayment = async (req, res) => {
     return returnFunction(res, 400, false, 'Provide a payment reference or a proof-of-payment file — at least one is required to request payment.');
   }
 
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (po.status !== 'received') return returnFunction(res, 400, false, 'Only a fully-received purchase order can have payment requested.');
 
-  await updateOne('inventory_purchase_orders', { _id: po._id }, {
-    $set: {
-      status: 'pending_payment_approval',
-      paymentStatus: 'pending_approval',
-      paymentMethod: req.body.paymentMethod,
-      paymentReference,
-      paymentEvidenceFilename: req.file?.filename || null,
-      paymentEvidenceOriginalName: req.file?.originalname || null,
-      paymentRequestedBy: req.user._id,
-      paymentRequestedAt: new Date(),
-      paymentRejectionReason: null,
-      updatedAt: new Date(),
-    },
+  await knex('inventory_purchase_orders').where({ id: po.id }).update({
+    status: 'pending_payment_approval',
+    paymentStatus: 'pending_approval',
+    paymentMethod: req.body.paymentMethod,
+    paymentReference,
+    paymentEvidenceFilename: req.file?.filename || null,
+    paymentEvidenceOriginalName: req.file?.originalname || null,
+    paymentRequestedBy: req.user.id,
+    paymentRequestedAt: new Date(),
+    paymentRejectionReason: null,
+    updatedAt: new Date(),
   });
 
   return returnFunction(res, 200, true, 'Payment requested — awaiting Accounting approval.');
 };
 
 const deletePurchaseOrder = async (req, res) => {
-  const po = await findOne('inventory_purchase_orders', { _id: new ObjectId(req.params.id) });
+  const po = await knex('inventory_purchase_orders').where({ id: req.params.id }).first();
   if (!po) return returnFunction(res, 404, false, req.locale.notFound);
   if (po.status !== 'draft') return returnFunction(res, 400, false, 'Only a draft purchase order can be deleted.');
-  await global.dbo.collection('inventory_purchase_orders').deleteOne({ _id: po._id });
+  await knex('inventory_purchase_orders').where({ id: po.id }).del();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 

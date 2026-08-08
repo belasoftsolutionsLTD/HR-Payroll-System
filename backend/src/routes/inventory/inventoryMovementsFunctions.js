@@ -1,7 +1,12 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_items/inventory_stock_levels/
+// inventory_stock_movements/inventory_locations are all Postgres now. Accounting
+// (gl_accounts/gl_journal_entries) is still Mongo — Phase 7, not touched here — so
+// glEngine's postJournalEntry/resolveSystemAccount calls are left exactly as they were;
+// they never assumed anything about inventory's storage engine to begin with
+// (referenceId is stored as an opaque string, never ObjectId-cast).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments, aggregate } = require('../../functions/Database/commonDBFunctions');
 const { getInventoryAccessLevel, getScopedLocationFilter } = require('../../lib/inventory/inventoryAccess');
 const { postJournalEntry, resolveSystemAccount } = require('../../lib/accounting/glEngine');
 const { logPostingFailure } = require('../accounting/accountingPostingFailuresFunctions');
@@ -24,17 +29,18 @@ async function createStockMovement({
   if (!MOVEMENT_TYPES.includes(movementType)) throw new Error(`Invalid movementType: ${movementType}`);
   if (!quantityChange || typeof quantityChange !== 'number') throw new Error('quantityChange must be a non-zero number.');
 
-  const item = await findOne('inventory_items', { _id: itemId });
+  const item = await knex('inventory_items').where({ id: itemId }).first();
   if (!item) throw new Error('Item not found.');
   if (!item.isTracked) throw new Error('This item does not track stock quantity.');
 
-  const existingLevel = await findOne('inventory_stock_levels', { itemId, locationId });
+  const existingLevel = await knex('inventory_stock_levels').where({ itemId, locationId }).first();
   const priorQty = existingLevel?.quantity || 0;
   const balanceAfter = priorQty + quantityChange;
   if (balanceAfter < 0) throw new Error('This movement would take stock below zero at this location.');
 
   const now = new Date();
   const movementDoc = {
+    id: newId(),
     itemId, locationId, quantityChange, movementType,
     referenceId, referenceModel,
     unitCost: unitCost !== null ? Number(unitCost) : null,
@@ -44,14 +50,12 @@ async function createStockMovement({
     notes,
     createdAt: now,
   };
-  const result = await insertOne('inventory_stock_movements', movementDoc);
+  const [saved] = await knex('inventory_stock_movements').insert(movementDoc).returning('*');
 
-  await updateOne(
-    'inventory_stock_levels',
-    { itemId, locationId },
-    { $inc: { quantity: quantityChange }, $set: { updatedAt: now }, $setOnInsert: { reorderPoint: 0 } },
-    { upsert: true }
-  );
+  await knex('inventory_stock_levels')
+    .insert({ id: newId(), itemId, locationId, quantity: quantityChange, reorderPoint: 0, updatedAt: now })
+    .onConflict(['itemId', 'locationId'])
+    .merge({ quantity: knex.raw('"inventory_stock_levels"."quantity" + ?', [quantityChange]), updatedAt: now });
 
   // Weighted-average revaluation — inbound movements with a known unit cost only.
   // Averaged across total stock company-wide (not per-location), matching the
@@ -59,17 +63,17 @@ async function createStockMovement({
   // costingMethod stays on the item doc so a future FIFO item type is a additive change,
   // not a rewrite of this function.
   if (quantityChange > 0 && unitCost !== null && item.costingMethod === 'weighted_average') {
-    const allLevels = await findMany('inventory_stock_levels', { itemId }, {});
+    const allLevels = await knex('inventory_stock_levels').where({ itemId });
     const totalQtyBefore = allLevels.reduce((sum, l) => sum + (l.quantity || 0), 0) - quantityChange; // pre-movement total
     const oldAvgCost = item.avgCost || 0;
     const newTotalQty = totalQtyBefore + quantityChange;
     const newAvgCost = newTotalQty > 0
       ? ((totalQtyBefore * oldAvgCost) + (quantityChange * Number(unitCost))) / newTotalQty
       : Number(unitCost);
-    await updateOne('inventory_items', { _id: itemId }, { $set: { avgCost: Math.round(newAvgCost * 10000) / 10000, updatedAt: now } });
+    await knex('inventory_items').where({ id: itemId }).update({ avgCost: Math.round(newAvgCost * 10000) / 10000, updatedAt: now });
   }
 
-  return { _id: result.insertedId, ...movementDoc };
+  return saved;
 }
 
 const listMovements = async (req, res) => {
@@ -78,46 +82,41 @@ const listMovements = async (req, res) => {
   const scopeFilter = await getScopedLocationFilter(req.user, level);
 
   const { page, limit, skip } = getPagination(req.query);
-  const filter = {};
-  if (req.query.itemId) filter.itemId = new ObjectId(req.query.itemId);
-  if (req.query.movementType) filter.movementType = req.query.movementType;
-  if (req.query.startDate || req.query.endDate) {
-    filter.createdAt = {};
-    if (req.query.startDate) filter.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate);
-  }
+  let query = knex('inventory_stock_movements');
+  if (req.query.itemId) query = query.where({ itemId: req.query.itemId });
+  if (req.query.movementType) query = query.where({ movementType: req.query.movementType });
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
   if (req.query.locationId) {
-    filter.locationId = new ObjectId(req.query.locationId);
+    query = query.where({ locationId: req.query.locationId });
   } else if (scopeFilter) {
-    const scopedLocations = await findMany('inventory_locations', scopeFilter, { projection: { _id: 1 } });
-    filter.locationId = { $in: scopedLocations.map((l) => l._id) };
+    const scopedLocations = await knex('inventory_locations').where(scopeFilter).select('id');
+    query = query.whereIn('locationId', scopedLocations.map((l) => l.id));
   }
 
-  const [total, movements] = await Promise.all([
-    countDocuments('inventory_stock_movements', filter),
-    findMany('inventory_stock_movements', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const movements = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  const itemIds = [...new Set(movements.map((m) => String(m.itemId)))].map((id) => new ObjectId(id));
-  const locIds = [...new Set(movements.map((m) => String(m.locationId)))].map((id) => new ObjectId(id));
-  const userIds = [...new Set(movements.filter((m) => m.performedBy).map((m) => String(m.performedBy)))].map((id) => new ObjectId(id));
+  const itemIds = [...new Set(movements.map((m) => m.itemId))];
+  const locIds = [...new Set(movements.map((m) => m.locationId))];
+  const userIds = [...new Set(movements.filter((m) => m.performedBy).map((m) => m.performedBy))];
   const [items, locations, users] = await Promise.all([
-    findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { sku: 1, name: 1, unitOfMeasure: 1 } }),
-    findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } }),
-    userIds.length ? findMany('users', { _id: { $in: userIds } }, { projection: { name: 1 } }) : [],
+    knex('inventory_items').whereIn('id', itemIds).select('id', 'sku', 'name', 'unitOfMeasure'),
+    knex('inventory_locations').whereIn('id', locIds).select('id', 'name'),
+    userIds.length ? knex('users').whereIn('id', userIds).select('id', 'name') : [],
   ]);
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
-  const userMap = Object.fromEntries(users.map((u) => [String(u._id), u]));
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
+  const userMap = Object.fromEntries(users.map((u) => [u.id, u]));
 
   const enriched = movements.map((m) => ({
     ...m,
-    item: itemMap[String(m.itemId)] || null,
-    location: locMap[String(m.locationId)] || null,
-    performedByName: m.performedBy ? (userMap[String(m.performedBy)]?.name || 'Unknown') : 'System',
+    item: itemMap[m.itemId] || null,
+    location: locMap[m.locationId] || null,
+    performedByName: m.performedBy ? (userMap[m.performedBy]?.name || 'Unknown') : 'System',
   }));
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 const csvEscape = (v) => {
@@ -130,35 +129,32 @@ const exportMovementsCSV = async (req, res) => {
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   const scopeFilter = await getScopedLocationFilter(req.user, level);
 
-  const filter = {};
-  if (req.query.itemId) filter.itemId = new ObjectId(req.query.itemId);
-  if (req.query.movementType) filter.movementType = req.query.movementType;
-  if (req.query.startDate || req.query.endDate) {
-    filter.createdAt = {};
-    if (req.query.startDate) filter.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate);
-  }
+  let query = knex('inventory_stock_movements');
+  if (req.query.itemId) query = query.where({ itemId: req.query.itemId });
+  if (req.query.movementType) query = query.where({ movementType: req.query.movementType });
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
   if (scopeFilter) {
-    const scopedLocations = await findMany('inventory_locations', scopeFilter, { projection: { _id: 1 } });
-    filter.locationId = { $in: scopedLocations.map((l) => l._id) };
+    const scopedLocations = await knex('inventory_locations').where(scopeFilter).select('id');
+    query = query.whereIn('locationId', scopedLocations.map((l) => l.id));
   }
 
-  const movements = await findMany('inventory_stock_movements', filter, { sort: { createdAt: -1 } });
-  const itemIds = [...new Set(movements.map((m) => String(m.itemId)))].map((id) => new ObjectId(id));
-  const locIds = [...new Set(movements.map((m) => String(m.locationId)))].map((id) => new ObjectId(id));
+  const movements = await query.orderBy('createdAt', 'desc');
+  const itemIds = [...new Set(movements.map((m) => m.itemId))];
+  const locIds = [...new Set(movements.map((m) => m.locationId))];
   const [items, locations] = await Promise.all([
-    findMany('inventory_items', { _id: { $in: itemIds } }, { projection: { sku: 1, name: 1 } }),
-    findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } }),
+    knex('inventory_items').whereIn('id', itemIds).select('id', 'sku', 'name'),
+    knex('inventory_locations').whereIn('id', locIds).select('id', 'name'),
   ]);
-  const itemMap = Object.fromEntries(items.map((i) => [String(i._id), i]));
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
 
   const header = 'Date,SKU,Item,Location,MovementType,QuantityChange,BalanceAfter,UnitCost,Reference,Notes';
   const rows = movements.map((m) => [
     m.createdAt.toISOString(),
-    itemMap[String(m.itemId)]?.sku || '',
-    itemMap[String(m.itemId)]?.name || '',
-    locMap[String(m.locationId)]?.name || '',
+    itemMap[m.itemId]?.sku || '',
+    itemMap[m.itemId]?.name || '',
+    locMap[m.locationId]?.name || '',
     m.movementType,
     m.quantityChange,
     m.balanceAfter,
@@ -185,9 +181,9 @@ const createAdjustment = async (req, res) => {
   }
   try {
     const movement = await createStockMovement({
-      itemId: new ObjectId(itemId), locationId: new ObjectId(locationId),
+      itemId, locationId,
       quantityChange: Number(quantityChange), movementType: 'adjustment',
-      performedBy: req.user._id, notes: notes || null,
+      performedBy: req.user.id, notes: notes || null,
     });
 
     // Only a negative adjustment is a real loss (shrinkage/damage) — a positive one is a
@@ -195,13 +191,13 @@ const createAdjustment = async (req, res) => {
     // at write time (per design decision), so this values the loss at the item's CURRENT
     // avgCost rather than inventing a historical figure the schema doesn't have.
     if (Number(quantityChange) < 0) {
-      const item = await findOne('inventory_items', { _id: new ObjectId(itemId) });
+      const item = await knex('inventory_items').where({ id: itemId }).first();
       const shrinkageValue = round2(Math.abs(Number(quantityChange)) * (item?.avgCost || 0));
       if (shrinkageValue > 0) {
-        const location = await findOne('inventory_locations', { _id: new ObjectId(locationId) }, { projection: { department: 1 } });
+        const location = await knex('inventory_locations').where({ id: locationId }).select('department').first();
         const payload = {
           date: new Date(), description: `Stock adjustment — ${item?.name || itemId}${notes ? `: ${notes}` : ''}`,
-          source: 'inventory_adjustment', sourceModule: 'inventory', referenceId: movement?._id || null,
+          source: 'inventory_adjustment', sourceModule: 'inventory', referenceId: movement?.id || null,
           referenceModel: 'inventory_stock_movements', department: location?.department || null, lines: [],
         };
         try {
@@ -210,7 +206,7 @@ const createAdjustment = async (req, res) => {
           payload.lines = [{ accountId: shrinkAcct._id, debit: shrinkageValue }, { accountId: invAcct._id, credit: shrinkageValue }];
           await postJournalEntry({ ...payload, postedBy: req.user._id });
         } catch (err) {
-          await logPostingFailure({ source: 'inventory_adjustment', sourceModule: 'inventory', referenceId: movement?._id || null, referenceModel: 'inventory_stock_movements', attemptedPayload: payload, error: err });
+          await logPostingFailure({ source: 'inventory_adjustment', sourceModule: 'inventory', referenceId: movement?.id || null, referenceModel: 'inventory_stock_movements', attemptedPayload: payload, error: err });
         }
       }
     }
@@ -228,18 +224,18 @@ const recomputeStockLevelsFromLedger = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
 
-  const totals = await aggregate('inventory_stock_movements', [
-    { $group: { _id: { itemId: '$itemId', locationId: '$locationId' }, quantity: { $sum: '$quantityChange' } } },
-  ]);
+  const totals = await knex('inventory_stock_movements')
+    .select('itemId', 'locationId')
+    .sum('quantityChange as quantity')
+    .groupBy('itemId', 'locationId');
 
+  const now = new Date();
   let updated = 0;
   for (const t of totals) {
-    await updateOne(
-      'inventory_stock_levels',
-      { itemId: t._id.itemId, locationId: t._id.locationId },
-      { $set: { quantity: t.quantity, updatedAt: new Date() }, $setOnInsert: { reorderPoint: 0 } },
-      { upsert: true }
-    );
+    await knex('inventory_stock_levels')
+      .insert({ id: newId(), itemId: t.itemId, locationId: t.locationId, quantity: t.quantity, reorderPoint: 0, updatedAt: now })
+      .onConflict(['itemId', 'locationId'])
+      .merge({ quantity: t.quantity, updatedAt: now });
     updated++;
   }
   return returnFunction(res, 200, true, `Recomputed ${updated} stock level record(s) from the movement ledger.`);

@@ -1038,6 +1038,171 @@ async function main() {
     );
     counts.pip_check_ins = await upsertBatched('pip_check_ins', pipCheckInRows);
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  PHASE 6 — Inventory, POS
+    // ══════════════════════════════════════════════════════════════════════
+
+    // users.isInventoryClerk/posLocationIds — Phase 6's own new columns on Phase 1's
+    // users table (see the migration file's own comment on why). Applied as a targeted
+    // update rather than re-running the full users upsert.
+    const usersWithInvOrPosFlags = await dbo.collection('users').find({
+      $or: [{ isInventoryClerk: { $exists: true } }, { posLocationIds: { $exists: true } }],
+    }).toArray();
+    let invPosFlagCount = 0;
+    if (!DRY_RUN) {
+      for (const u of usersWithInvOrPosFlags) {
+        await knex('users').where({ id: idStr(u._id) }).update({
+          isInventoryClerk: u.isInventoryClerk === true,
+          posLocationIds: (u.posLocationIds || []).map(idStr),
+        });
+        invPosFlagCount += 1;
+      }
+    } else {
+      invPosFlagCount = usersWithInvOrPosFlags.length;
+    }
+    counts['users.isInventoryClerk/posLocationIds'] = invPosFlagCount;
+
+    // ── Inventory lookups ────────────────────────────────────────────────────
+    const invCategories = await dbo.collection('inventory_categories').find({}).toArray();
+    counts.inventory_categories = await upsertBatched('inventory_categories', invCategories.map((c) => ({
+      id: idStr(c._id), name: c.name ?? null, isActive: c.isActive ?? true, createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    const invBrands = await dbo.collection('inventory_brands').find({}).toArray();
+    counts.inventory_brands = await upsertBatched('inventory_brands', invBrands.map((b) => ({
+      id: idStr(b._id), name: b.name ?? null, isActive: b.isActive ?? true, createdAt: toDate(b.createdAt), updatedAt: toDate(b.updatedAt),
+    })));
+
+    const invUoms = await dbo.collection('inventory_units_of_measure').find({}).toArray();
+    counts.inventory_units_of_measure = await upsertBatched('inventory_units_of_measure', invUoms.map((u) => ({
+      id: idStr(u._id), name: u.name ?? null, isActive: u.isActive ?? true, createdAt: toDate(u.createdAt), updatedAt: toDate(u.updatedAt),
+    })));
+
+    const invCustomFields = await dbo.collection('inventory_custom_field_defs').find({}).toArray();
+    counts.inventory_custom_field_defs = await upsertBatched('inventory_custom_field_defs', invCustomFields.map((f) => ({
+      id: idStr(f._id), name: f.name ?? null, fieldType: f.fieldType ?? null, options: f.options || [],
+      isActive: f.isActive ?? true, createdAt: toDate(f.createdAt), updatedAt: toDate(f.updatedAt),
+    })));
+
+    const invLocations = await dbo.collection('inventory_locations').find({}).toArray();
+    counts.inventory_locations = await upsertBatched('inventory_locations', invLocations.map((l) => ({
+      id: idStr(l._id), name: l.name ?? null, type: l.type ?? null, address: l.address ?? null, department: l.department ?? null,
+      isActive: l.isActive ?? true, createdAt: toDate(l.createdAt), updatedAt: toDate(l.updatedAt),
+    })));
+
+    const invSuppliers = await dbo.collection('inventory_suppliers').find({}).toArray();
+    counts.inventory_suppliers = await upsertBatched('inventory_suppliers', invSuppliers.map((s) => ({
+      id: idStr(s._id), name: s.name ?? null, contactPerson: s.contactPerson ?? null, phone: s.phone ?? null, email: s.email ?? null,
+      address: s.address ?? null, linkedItemIds: (s.linkedItemIds || []).map(idStr), leadTimeDays: s.leadTimeDays ?? null,
+      isActive: s.isActive ?? true, createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    // ── Items, purchase orders, lots, stock ──────────────────────────────────
+    const invItems = await dbo.collection('inventory_items').find({}).toArray();
+    counts.inventory_items = await upsertBatched('inventory_items', invItems.map((i) => ({
+      id: idStr(i._id), sku: i.sku ?? null, name: i.name ?? null, description: i.description ?? null, barcode: i.barcode ?? null,
+      category: i.category ?? null, brand: i.brand ?? null, unitOfMeasure: i.unitOfMeasure ?? null,
+      costPrice: i.costPrice ?? null, salePrice: i.salePrice ?? null, avgCost: i.avgCost ?? null, costingMethod: i.costingMethod ?? null,
+      expiryTrackingEnabled: i.expiryTrackingEnabled ?? false, isTracked: i.isTracked ?? true, trackingMode: i.trackingMode ?? null,
+      discountType: i.discountType ?? null, discountValue: i.discountValue ?? null, taxCategory: i.taxCategory ?? null, taxRate: i.taxRate ?? null,
+      imageUrl: i.imageUrl ?? null, customFieldValues: i.customFieldValues ? JSON.stringify(i.customFieldValues) : null,
+      isActive: i.isActive ?? true, createdBy: idStr(i.createdBy), createdAt: toDate(i.createdAt), updatedAt: toDate(i.updatedAt),
+    })));
+
+    // purchase_orders must exist before lots (FK) — written next.
+    const invPOs = await dbo.collection('inventory_purchase_orders').find({}).toArray();
+    counts.inventory_purchase_orders = await upsertBatched('inventory_purchase_orders', invPOs.map((p) => ({
+      id: idStr(p._id), poNumber: p.poNumber ?? null, supplierId: idStr(p.supplierId), locationId: idStr(p.locationId),
+      items: p.items ? JSON.stringify(p.items) : null, status: p.status ?? null, expectedDeliveryDate: toDate(p.expectedDeliveryDate),
+      createdBy: idStr(p.createdBy), createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+      sentAt: toDate(p.sentAt), receivedAt: toDate(p.receivedAt), closedAt: toDate(p.closedAt),
+      invoiceNumber: p.invoiceNumber ?? null, poInvoiceNumber: p.poInvoiceNumber ?? null, invoiceAmount: p.invoiceAmount ?? null,
+      invoiceDueDate: toDate(p.invoiceDueDate), invoiceReceivedAt: toDate(p.invoiceReceivedAt),
+      paymentStatus: p.paymentStatus ?? null, paymentMethod: p.paymentMethod ?? null, paymentReference: p.paymentReference ?? null,
+      paidAt: toDate(p.paidAt), paymentEvidenceFilename: p.paymentEvidenceFilename ?? null, paymentEvidenceOriginalName: p.paymentEvidenceOriginalName ?? null,
+      // The rest of the payment-request/approve/reject workflow — missed on the first pass
+      // of this table, found while rewriting inventoryPurchaseOrdersFunctions.js/
+      // accountingPoPaymentsFunctions.js.
+      paymentRequestedBy: idStr(p.paymentRequestedBy), paymentRequestedAt: toDate(p.paymentRequestedAt),
+      paymentRejectionReason: p.paymentRejectionReason ?? null,
+      paymentApprovedBy: idStr(p.paymentApprovedBy), paymentApprovedAt: toDate(p.paymentApprovedAt),
+      paymentRejectedBy: idStr(p.paymentRejectedBy), paymentRejectedAt: toDate(p.paymentRejectedAt),
+    })));
+
+    const invLots = await dbo.collection('inventory_lots').find({}).toArray();
+    counts.inventory_lots = await upsertBatched('inventory_lots', invLots.map((l) => ({
+      id: idStr(l._id), itemId: idStr(l.itemId), locationId: idStr(l.locationId), lotNumber: l.lotNumber ?? null,
+      quantityRemaining: l.quantityRemaining ?? null, expiryDate: toDate(l.expiryDate), poId: idStr(l.poId),
+      receivedAt: toDate(l.receivedAt), createdAt: toDate(l.createdAt), updatedAt: toDate(l.updatedAt),
+    })));
+
+    const invStockLevels = await dbo.collection('inventory_stock_levels').find({}).toArray();
+    counts.inventory_stock_levels = await upsertBatched('inventory_stock_levels', invStockLevels.map((s) => ({
+      id: idStr(s._id), locationId: idStr(s.locationId), itemId: idStr(s.itemId), quantity: s.quantity ?? 0,
+      reorderPoint: s.reorderPoint ?? null, updatedAt: toDate(s.updatedAt), lastLowStockAlertAt: toDate(s.lastLowStockAlertAt),
+    })));
+
+    // lots must exist before stock_movements (FK on lotId) — written above.
+    const invMovements = await dbo.collection('inventory_stock_movements').find({}).toArray();
+    counts.inventory_stock_movements = await upsertBatched('inventory_stock_movements', invMovements.map((m) => ({
+      id: idStr(m._id), itemId: idStr(m.itemId), locationId: idStr(m.locationId), quantityChange: m.quantityChange ?? null,
+      movementType: m.movementType ?? null, referenceId: idStr(m.referenceId), referenceModel: m.referenceModel ?? null,
+      unitCost: m.unitCost ?? null, lotId: idStr(m.lotId), balanceAfter: m.balanceAfter ?? null, performedBy: idStr(m.performedBy),
+      notes: m.notes ?? null, createdAt: toDate(m.createdAt),
+    })));
+
+    const invTransfers = await dbo.collection('inventory_transfers').find({}).toArray();
+    counts.inventory_transfers = await upsertBatched('inventory_transfers', invTransfers.map((t) => ({
+      id: idStr(t._id), fromLocationId: idStr(t.fromLocationId), toLocationId: idStr(t.toLocationId),
+      items: t.items ? JSON.stringify(t.items) : null, status: t.status ?? null, requestNotes: t.requestNotes ?? null,
+      requestedBy: idStr(t.requestedBy), approvedBy: idStr(t.approvedBy), approvedAt: toDate(t.approvedAt),
+      rejectedBy: idStr(t.rejectedBy), rejectionReason: t.rejectionReason ?? null, receivedBy: idStr(t.receivedBy),
+      receivedAt: toDate(t.receivedAt), createdAt: toDate(t.createdAt), updatedAt: toDate(t.updatedAt),
+    })));
+
+    // ── POS ──────────────────────────────────────────────────────────────────
+    const posRegisterSessions = await dbo.collection('pos_register_sessions').find({}).toArray();
+    counts.pos_register_sessions = await upsertBatched('pos_register_sessions', posRegisterSessions.map((r) => ({
+      id: idStr(r._id), locationId: idStr(r.locationId), openedBy: idStr(r.openedBy), openedAt: toDate(r.openedAt),
+      openingFloat: r.openingFloat ?? null, status: r.status ?? null, cashRefunds: r.cashRefunds ?? null, cashSales: r.cashSales ?? null,
+      closedAt: toDate(r.closedAt), closedBy: idStr(r.closedBy), closingCount: r.closingCount ?? null, expectedCash: r.expectedCash ?? null,
+      variance: r.variance ?? null, createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // register_sessions must exist before pos_sales (FK) — written above.
+    const posSales = await dbo.collection('pos_sales').find({}).toArray();
+    counts.pos_sales = await upsertBatched('pos_sales', posSales.map((s) => ({
+      id: idStr(s._id), saleNumber: s.saleNumber ?? null, locationId: idStr(s.locationId), registerSessionId: idStr(s.registerSessionId),
+      contactId: idStr(s.contactId), items: s.items ? JSON.stringify(s.items) : null, cartDiscount: s.cartDiscount ? JSON.stringify(s.cartDiscount) : null,
+      promoCode: s.promoCode ?? null, subtotal: s.subtotal ?? null, lineDiscountTotal: s.lineDiscountTotal ?? null,
+      cartDiscountAmount: s.cartDiscountAmount ?? null, autoDiscountTotal: s.autoDiscountTotal ?? null, taxTotal: s.taxTotal ?? null,
+      total: s.total ?? null, payments: s.payments ? JSON.stringify(s.payments) : null, voucherCode: s.voucherCode ?? null,
+      voucherAmount: s.voucherAmount ?? null, status: s.status ?? null, staffId: idStr(s.staffId), staffName: s.staffName ?? null,
+      voidReason: s.voidReason ?? null, voidedAt: toDate(s.voidedAt), voidedBy: idStr(s.voidedBy),
+      createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    // pos_sales must exist before pos_refunds (FK) — written above.
+    const posRefunds = await dbo.collection('pos_refunds').find({}).toArray();
+    counts.pos_refunds = await upsertBatched('pos_refunds', posRefunds.map((r) => ({
+      id: idStr(r._id), saleId: idStr(r.saleId), saleNumber: r.saleNumber ?? null, locationId: idStr(r.locationId),
+      registerSessionId: idStr(r.registerSessionId), items: r.items ? JSON.stringify(r.items) : null, amount: r.amount ?? null,
+      method: r.method ?? null, reason: r.reason ?? null, refundedBy: idStr(r.refundedBy), refundedByName: r.refundedByName ?? null,
+      createdAt: toDate(r.createdAt),
+    })));
+
+    const posPromoCodes = await dbo.collection('pos_promo_codes').find({}).toArray();
+    counts.pos_promo_codes = await upsertBatched('pos_promo_codes', posPromoCodes.map((c) => ({
+      id: idStr(c._id), code: c.code ?? null, discountType: c.discountType ?? null, discountValue: c.discountValue ?? null,
+      expiresAt: toDate(c.expiresAt), isActive: c.isActive ?? true, createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    const posVouchers = await dbo.collection('pos_vouchers').find({}).toArray();
+    counts.pos_vouchers = await upsertBatched('pos_vouchers', posVouchers.map((v) => ({
+      id: idStr(v._id), code: v.code ?? null, value: v.value ?? null, expiresAt: toDate(v.expiresAt), isActive: v.isActive ?? true,
+      redeemedAt: toDate(v.redeemedAt), redeemedSaleId: idStr(v.redeemedSaleId), createdAt: toDate(v.createdAt), updatedAt: toDate(v.updatedAt),
+    })));
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

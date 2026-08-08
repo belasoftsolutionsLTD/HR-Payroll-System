@@ -2,6 +2,12 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// inventory_items is Postgres now (Phase 6) — found while sweeping Logistics;
+// logistics_work_orders/logistics_vehicles stay Mongo, Logistics' own phase (8). Parts
+// recorded on a work order now carry plain string itemId/locationId (matching Postgres'
+// ids) instead of Mongo ObjectIds, so they pass straight through to createStockMovement
+// (also Postgres) at completeWorkOrder time.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getLogisticsAccessLevel } = require('../../lib/logistics/logisticsAccess');
 const { createStockMovement } = require('../inventory/inventoryMovementsFunctions');
 const { postJournalEntry, resolveSystemAccount } = require('../../lib/accounting/glEngine');
@@ -75,13 +81,13 @@ const addPartUsed = async (req, res) => {
   if (!order) return returnFunction(res, 404, false, req.locale.notFound);
   if (order.status === 'completed') return returnFunction(res, 400, false, 'This work order is already completed.');
 
-  const item = await findOne('inventory_items', { _id: new ObjectId(req.body.itemId) });
+  const item = await knex('inventory_items').where({ id: req.body.itemId }).first();
   if (!item) return returnFunction(res, 400, false, 'Inventory item not found.');
   if (!req.body.locationId) return returnFunction(res, 400, false, 'locationId is required to know which stock location the part comes from.');
 
   const line = {
-    itemId: item._id, itemName: item.name, sku: item.sku,
-    locationId: new ObjectId(req.body.locationId),
+    itemId: item.id, itemName: item.name, sku: item.sku,
+    locationId: String(req.body.locationId),
     quantity: Number(req.body.quantity),
     unitCost: item.avgCost || 0,
   };
@@ -109,7 +115,7 @@ const completeWorkOrder = async (req, res) => {
   const totalCost = round2(partsCost + laborCost + otherCost);
 
   for (const part of order.partsUsed) {
-    const item = await findOne('inventory_items', { _id: part.itemId });
+    const item = await knex('inventory_items').where({ id: part.itemId }).first();
     if (!item?.isTracked) continue;
     try {
       await createStockMovement({

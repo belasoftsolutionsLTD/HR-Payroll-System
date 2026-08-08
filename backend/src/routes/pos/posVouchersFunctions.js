@@ -1,7 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — pos_vouchers is Postgres now.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 
 // Vouchers are company-funded (the business pays for them, e.g. a promotional giveaway
 // or a goodwill gesture) — kept in a separate collection from pos_promo_codes so their
@@ -14,10 +14,12 @@ const listVouchers = async (req, res) => {
   // Plain listing (admin Settings panel) shows everything, including redeemed/expired
   // vouchers, so they stay auditable. ?activeOnly=true is for the checkout screen — a
   // cashier should only ever be offered vouchers that can actually still be redeemed.
-  const filter = req.query.activeOnly === 'true'
-    ? { isActive: { $ne: false }, redeemedAt: null, $or: [{ expiresAt: null }, { expiresAt: { $gte: new Date() } }] }
-    : {};
-  const vouchers = await findMany('pos_vouchers', filter, { sort: { code: 1 } });
+  let query = knex('pos_vouchers');
+  if (req.query.activeOnly === 'true') {
+    query = query.whereNot({ isActive: false }).whereNull('redeemedAt')
+      .where((qb) => qb.whereNull('expiresAt').orWhere('expiresAt', '>=', new Date()));
+  }
+  const vouchers = await query.orderBy('code');
   return returnFunction(res, 200, true, req.locale.success, vouchers);
 };
 
@@ -25,10 +27,11 @@ const createVoucher = async (req, res) => {
   if (!validateRequiredFields(req, res, ['code', 'value'])) return;
   if (!(Number(req.body.value) > 0)) return returnFunction(res, 400, false, 'value must be a positive number.');
   const code = req.body.code.trim().toUpperCase();
-  const existing = await findOne('pos_vouchers', { code });
+  const existing = await knex('pos_vouchers').where({ code }).first();
   if (existing) return returnFunction(res, 409, false, 'A voucher with this code already exists.');
 
   const doc = {
+    id: newId(),
     code,
     value: Number(req.body.value),
     expiresAt: req.body.expiresAt ? new Date(req.body.expiresAt) : null,
@@ -38,8 +41,8 @@ const createVoucher = async (req, res) => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('pos_vouchers', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('pos_vouchers').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateVoucher = async (req, res) => {
@@ -47,19 +50,19 @@ const updateVoucher = async (req, res) => {
   if (req.body.value !== undefined) update.value = Number(req.body.value);
   if (req.body.expiresAt !== undefined) update.expiresAt = req.body.expiresAt ? new Date(req.body.expiresAt) : null;
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('pos_vouchers', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('pos_vouchers').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteVoucher = async (req, res) => {
-  await updateOne('pos_vouchers', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('pos_vouchers').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 
 // Used both by createSale (authoritative) and checkVoucher (a cashier-facing pre-check).
 const resolveVoucher = async (rawCode) => {
   if (!rawCode) return null;
-  const voucher = await findOne('pos_vouchers', { code: String(rawCode).trim().toUpperCase(), isActive: { $ne: false }, redeemedAt: null });
+  const voucher = await knex('pos_vouchers').where({ code: String(rawCode).trim().toUpperCase() }).whereNot({ isActive: false }).whereNull('redeemedAt').first();
   if (!voucher) return null;
   if (voucher.expiresAt && voucher.expiresAt < new Date()) return null;
   return voucher;

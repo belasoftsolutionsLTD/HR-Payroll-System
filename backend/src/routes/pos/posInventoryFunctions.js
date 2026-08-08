@@ -1,6 +1,6 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_locations/inventory_items are Postgres now.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany } = require('../../functions/Database/commonDBFunctions');
 const { getStockLevel } = require('../../lib/inventory/inventoryIntegration');
 const { getPosAccessLevel, getScopedPosLocationIds, canSellAtLocation } = require('../../lib/pos/posAccess');
 
@@ -17,10 +17,10 @@ const listLocations = async (req, res) => {
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
   const scoped = await getScopedPosLocationIds(req.user, level);
-  const filter = { isActive: { $ne: false } };
-  if (scoped) filter._id = { $in: scoped.map((id) => new ObjectId(id)) };
+  let query = knex('inventory_locations').whereNot({ isActive: false });
+  if (scoped) query = query.whereIn('id', scoped);
 
-  const locations = await findMany('inventory_locations', filter, { sort: { name: 1 } });
+  const locations = await query.orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, locations);
 };
 
@@ -36,15 +36,14 @@ const listStockLevelsForLocation = async (req, res) => {
     return returnFunction(res, 403, false, 'You are not assigned to this location.');
   }
 
-  const locationId = new ObjectId(req.query.locationId);
-  const items = await findMany('inventory_items', { isActive: { $ne: false }, isTracked: true }, {
-    projection: { sku: 1, name: 1, category: 1, unitOfMeasure: 1 },
-  });
+  const locationId = req.query.locationId;
+  const items = await knex('inventory_items').whereNot({ isActive: false }).where({ isTracked: true })
+    .select('id', 'sku', 'name', 'category', 'unitOfMeasure');
 
   const stockLevels = await Promise.all(items.map(async (item) => ({
-    itemId: item._id,
+    itemId: item.id,
     locationId,
-    quantity: await getStockLevel(item._id, locationId),
+    quantity: await getStockLevel(item.id, locationId),
     item: { sku: item.sku, name: item.name, category: item.category, unitOfMeasure: item.unitOfMeasure },
   })));
 
@@ -58,17 +57,12 @@ const listSellableItems = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = { isActive: { $ne: false } };
+  let query = knex('inventory_items').whereNot({ isActive: false });
   if (req.query.search) {
-    const q = req.query.search.trim();
-    filter.$or = [
-      { name: { $regex: q, $options: 'i' } },
-      { sku: { $regex: q, $options: 'i' } },
-      { barcode: { $regex: q, $options: 'i' } },
-      { brand: { $regex: q, $options: 'i' } },
-    ];
+    const q = `%${req.query.search.trim()}%`;
+    query = query.where((qb) => qb.whereILike('name', q).orWhereILike('sku', q).orWhereILike('barcode', q).orWhereILike('brand', q));
   }
-  const items = await findMany('inventory_items', filter, { limit: 50, sort: { name: 1 } });
+  const items = await query.orderBy('name').limit(50);
   return returnFunction(res, 200, true, req.locale.success, items);
 };
 

@@ -2,6 +2,9 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// pos_sales is Postgres now (Phase 6) — found while sweeping CRM; the rest of this
+// file's tables (crm_deals/crm_pipelines/crm_contacts) stay Mongo, CRM's own phase (7).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getCrmAccessLevel, getScopedAssigneeIds, canAccessAssignee } = require('../../lib/crm/crmAccess');
 const { logSystemActivity } = require('./crmActivitiesFunctions');
 
@@ -163,10 +166,10 @@ const winDeal = async (req, res) => {
 
   let confirmedSaleId = null;
   if (req.body.confirmedSaleId) {
-    const sale = await findOne('pos_sales', { _id: new ObjectId(req.body.confirmedSaleId) });
+    const sale = await knex('pos_sales').where({ id: req.body.confirmedSaleId }).first();
     if (!sale) return returnFunction(res, 404, false, 'Sale not found.');
     if (String(sale.contactId) !== String(deal.contactId)) return returnFunction(res, 400, false, 'That sale is not linked to this deal\'s contact.');
-    confirmedSaleId = sale._id;
+    confirmedSaleId = sale.id;
   }
 
   const pipeline = await findOne('crm_pipelines', { _id: deal.pipelineId });

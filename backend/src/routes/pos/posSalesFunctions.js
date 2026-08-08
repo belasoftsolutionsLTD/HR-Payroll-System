@@ -1,7 +1,14 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — pos_sales/pos_vouchers/inventory_locations/
+// inventory_items/inventory_stock_movements are all Postgres now. `company_settings`
+// (used by getReceipt for branding) and `gl_journal_entries`/gl_accounts (via glEngine)
+// are still Mongo (Phase 7/10) — left untouched; referenceId there is stored as an
+// opaque string (never ObjectId-cast), so a Postgres pos_sales id round-trips fine.
+// items/cartDiscount/payments are JSONB columns (whole-replaced), matching the
+// established "no $push/$pull found" convention used throughout this phase.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
+const { findOne } = require('../../functions/Database/commonDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { deductStockForSale, returnStockFromSale, getStockLevel } = require('../../lib/inventory/inventoryIntegration');
 const { getPosAccessLevel, getScopedPosLocationIds } = require('../../lib/pos/posAccess');
 const { getMyOpenSession } = require('./posRegisterFunctions');
@@ -24,8 +31,8 @@ const POS_PAYMENT_SYSTEM_KEYS = { cash: 'cash', card: 'pos_card_clearing', mpesa
 // itself — any failure here is queued to gl_posting_failures for admin retry.
 async function postSaleJournalEntry(saleDoc, saleId, postedBy) {
   const netSales = round2(saleDoc.subtotal - saleDoc.autoDiscountTotal - saleDoc.lineDiscountTotal - saleDoc.cartDiscountAmount);
-  const location = await findOne('inventory_locations', { _id: saleDoc.locationId }, { projection: { department: 1 } });
-  const movements = await findMany('inventory_stock_movements', { referenceId: saleId, referenceModel: 'pos_sale', movementType: 'sale' }, {});
+  const location = await knex('inventory_locations').where({ id: saleDoc.locationId }).select('department').first();
+  const movements = await knex('inventory_stock_movements').where({ referenceId: saleId, referenceModel: 'pos_sale', movementType: 'sale' });
   const cogsAmount = round2(movements.reduce((s, m) => s + Math.abs(m.quantityChange) * (m.unitCost || 0), 0));
 
   const lines = [];
@@ -61,14 +68,19 @@ async function postSaleJournalEntry(saleDoc, saleId, postedBy) {
   }
 }
 
+const nextCounterSeq = async (key) => {
+  const [row] = await knex('counters')
+    .insert({ id: key, seq: 1 })
+    .onConflict('id')
+    .merge({ seq: knex.raw('"counters"."seq" + 1') })
+    .returning('*');
+  return row.seq;
+};
+
 const generateSaleNumber = async () => {
   const year = new Date().getFullYear();
-  const result = await global.dbo.collection('counters').findOneAndUpdate(
-    { _id: `pos_sale_number_${year}` },
-    { $inc: { seq: 1 } },
-    { upsert: true, returnDocument: 'after' }
-  );
-  return `SALE-${year}-${String(result.seq).padStart(6, '0')}`;
+  const seq = await nextCounterSeq(`pos_sale_number_${year}`);
+  return `SALE-${year}-${String(seq).padStart(6, '0')}`;
 };
 
 // Pure pricing math — no I/O — so the same computation can be unit-tested and reused by
@@ -129,7 +141,7 @@ const createSale = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const session = await getMyOpenSession(req.user._id);
+  const session = await getMyOpenSession(req.user.id);
   if (!session) return returnFunction(res, 400, false, 'Open a register session before starting a sale.');
 
   const { items, cartDiscount, payments, promoCode, voucherCode, contactId } = req.body;
@@ -141,11 +153,11 @@ const createSale = async (req, res) => {
     }
   }
 
-  const itemIds = items.map((l) => new ObjectId(l.itemId));
-  const itemDocs = await findMany('inventory_items', { _id: { $in: itemIds } }, {});
-  const itemById = Object.fromEntries(itemDocs.map((i) => [String(i._id), i]));
+  const itemIds = items.map((l) => l.itemId);
+  const itemDocs = await knex('inventory_items').whereIn('id', itemIds);
+  const itemById = Object.fromEntries(itemDocs.map((i) => [i.id, i]));
   for (const line of items) {
-    if (!itemById[String(line.itemId)]) return returnFunction(res, 400, false, `Item ${line.itemId} not found.`);
+    if (!itemById[line.itemId]) return returnFunction(res, 400, false, `Item ${line.itemId} not found.`);
     if (!(Number(line.quantity) > 0)) return returnFunction(res, 400, false, 'Every line needs a positive quantity.');
   }
 
@@ -154,7 +166,7 @@ const createSale = async (req, res) => {
   // on negative balance) to cover the race window between this check and the deduction.
   const shortages = [];
   for (const line of items) {
-    const item = itemById[String(line.itemId)];
+    const item = itemById[line.itemId];
     if (!item.isTracked) continue;
     const available = await getStockLevel(line.itemId, session.locationId);
     if (available < Number(line.quantity)) shortages.push({ itemId: line.itemId, name: item.name, available, requested: line.quantity });
@@ -170,9 +182,9 @@ const createSale = async (req, res) => {
   }
 
   const pricedItems = items.map((line) => {
-    const item = itemById[String(line.itemId)];
+    const item = itemById[line.itemId];
     return {
-      itemId: new ObjectId(line.itemId),
+      itemId: line.itemId,
       sku: item.sku,
       name: item.name,
       quantity: Number(line.quantity),
@@ -202,55 +214,61 @@ const createSale = async (req, res) => {
   }
 
   const saleNumber = await generateSaleNumber();
-  const saleDoc = {
+  const saleId = newId();
+  const items_ = lines.map((l) => ({
+    itemId: l.itemId, sku: l.sku, name: l.name, quantity: l.quantity,
+    unitPrice: l.unitPrice, discountAmount: l.lineDiscount, autoDiscountAmount: l.autoDiscount,
+    lineTotal: l.lineTotal, taxRate: l.taxRate, taxAmount: l.lineTax,
+    refundedQuantity: 0,
+  }));
+  const paymentsOut = payments.map((p) => {
+    const leg = { method: p.method, amount: round2(Number(p.amount)) };
+    if (p.method === 'cash' && p.cashTendered !== undefined && p.cashTendered !== null && p.cashTendered !== '') {
+      const cashTendered = round2(Number(p.cashTendered));
+      leg.cashTendered = cashTendered;
+      leg.changeDue = round2(Math.max(0, cashTendered - leg.amount));
+    }
+    if (p.method === 'mpesa') {
+      if (p.phoneNumber) leg.phoneNumber = String(p.phoneNumber).trim();
+      if (p.reference) leg.reference = String(p.reference).trim();
+    }
+    return leg;
+  });
+  const cartDiscountOut = resolvedCartDiscount ? { ...resolvedCartDiscount, amount: cartDiscountAmount } : null;
+
+  const saleRow = {
+    id: saleId,
     saleNumber,
     locationId: session.locationId,
-    registerSessionId: session._id,
+    registerSessionId: session.id,
     // Optional — POS itself never requires a customer identity (walk-up retail sales
     // are anonymous by default). When the register screen links a sale to a CRM
     // contact, this is the only field that connects the two modules; CRM reads it
-    // read-only via findMany('pos_sales', { contactId }), nothing here writes to CRM.
-    contactId: contactId ? new ObjectId(contactId) : null,
-    items: lines.map((l) => ({
-      itemId: l.itemId, sku: l.sku, name: l.name, quantity: l.quantity,
-      unitPrice: l.unitPrice, discountAmount: l.lineDiscount, autoDiscountAmount: l.autoDiscount,
-      lineTotal: l.lineTotal, taxRate: l.taxRate, taxAmount: l.lineTax,
-      refundedQuantity: 0,
-    })),
-    cartDiscount: resolvedCartDiscount ? { ...resolvedCartDiscount, amount: cartDiscountAmount } : null,
+    // read-only via knex('pos_sales').where({ contactId }), nothing here writes to CRM.
+    // No FK — CRM contacts table doesn't exist yet (Phase 7).
+    contactId: contactId ? String(contactId) : null,
+    items: JSON.stringify(items_),
+    cartDiscount: cartDiscountOut ? JSON.stringify(cartDiscountOut) : null,
     promoCode: appliedPromo?.code || null,
     voucherCode: appliedVoucher?.code || null,
     voucherAmount,
     subtotal, autoDiscountTotal, lineDiscountTotal, cartDiscountAmount, taxTotal, total,
-    // cashTendered/changeDue are purely informational (what the customer physically
-    // handed over vs. what was actually applied to the sale) — they never affect the
-    // paymentsTotal === total balance check above, only the receipt record.
-    payments: payments.map((p) => {
-      const leg = { method: p.method, amount: round2(Number(p.amount)) };
-      if (p.method === 'cash' && p.cashTendered !== undefined && p.cashTendered !== null && p.cashTendered !== '') {
-        const cashTendered = round2(Number(p.cashTendered));
-        leg.cashTendered = cashTendered;
-        leg.changeDue = round2(Math.max(0, cashTendered - leg.amount));
-      }
-      if (p.method === 'mpesa') {
-        if (p.phoneNumber) leg.phoneNumber = String(p.phoneNumber).trim();
-        if (p.reference) leg.reference = String(p.reference).trim();
-      }
-      return leg;
-    }),
+    payments: JSON.stringify(paymentsOut),
     status: 'completed',
-    staffId: req.user._id,
+    staffId: req.user.id,
     staffName: req.user.name,
     createdAt: new Date(),
   };
-  const result = await insertOne('pos_sales', saleDoc);
-  const saleId = result.insertedId;
+  await knex('pos_sales').insert(saleRow);
+  // In-memory copy with real (unstringified) JSONB fields — used below for stock
+  // deduction/journal posting, since re-reading it back would just re-parse them anyway.
+  const saleDoc = { ...saleRow, items: items_, cartDiscount: cartDiscountOut, payments: paymentsOut };
 
   // Redeem the voucher now that the sale exists — a sale void does NOT un-redeem it
   // (deliberate, mirrors how promo codes aren't usage-tracked/reversed either), so this
   // is a one-way mark, not part of the rollback path below.
   if (appliedVoucher) {
-    await updateOne('pos_vouchers', { _id: appliedVoucher._id }, { $set: { redeemedAt: new Date(), redeemedSaleId: saleId, updatedAt: new Date() } });
+    await knex('pos_vouchers').where({ id: appliedVoucher.id }).update({ redeemedAt: new Date(), redeemedSaleId: saleId, updatedAt: new Date() });
   }
 
   // Deduct stock line by line; if one fails (a genuine race — e.g. two cashiers sold the
@@ -259,24 +277,24 @@ const createSale = async (req, res) => {
   const deducted = [];
   try {
     for (const line of saleDoc.items) {
-      const movement = await deductStockForSale(line.itemId, session.locationId, line.quantity, saleId, req.user._id);
+      const movement = await deductStockForSale(line.itemId, session.locationId, line.quantity, saleId, req.user.id);
       if (movement) deducted.push(line);
     }
   } catch (err) {
     for (const line of deducted) {
-      await returnStockFromSale(line.itemId, session.locationId, line.quantity, saleId, req.user._id).catch(() => {});
+      await returnStockFromSale(line.itemId, session.locationId, line.quantity, saleId, req.user.id).catch(() => {});
     }
-    await updateOne('pos_sales', { _id: saleId }, { $set: { status: 'failed', failureReason: err.message } });
+    await knex('pos_sales').where({ id: saleId }).update({ status: 'failed', failureReason: err.message });
     return returnFunction(res, 409, false, `Sale could not be completed: ${err.message}`);
   }
 
   await postSaleJournalEntry(saleDoc, saleId, req.user._id);
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: saleId, ...saleDoc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saleDoc);
 };
 
 const getSale = async (req, res) => {
-  const sale = await findOne('pos_sales', { _id: new ObjectId(req.params.id) });
+  const sale = await knex('pos_sales').where({ id: req.params.id }).first();
   if (!sale) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, sale);
 };
@@ -287,25 +305,20 @@ const listSales = async (req, res) => {
   const scopedLocationIds = await getScopedPosLocationIds(req.user, level);
 
   const { page, limit, skip } = getPagination(req.query);
-  const filter = {};
-  if (req.query.locationId) filter.locationId = new ObjectId(req.query.locationId);
-  else if (scopedLocationIds) filter.locationId = { $in: scopedLocationIds.map((id) => new ObjectId(id)) };
-  if (req.query.staffId) filter.staffId = new ObjectId(req.query.staffId);
-  if (req.query.contactId) filter.contactId = new ObjectId(req.query.contactId);
-  if (req.query.status) filter.status = req.query.status;
-  if (req.query.startDate || req.query.endDate) {
-    filter.createdAt = {};
-    if (req.query.startDate) filter.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate);
-  }
+  let query = knex('pos_sales');
+  if (req.query.locationId) query = query.where({ locationId: req.query.locationId });
+  else if (scopedLocationIds) query = query.whereIn('locationId', scopedLocationIds);
+  if (req.query.staffId) query = query.where({ staffId: req.query.staffId });
+  if (req.query.contactId) query = query.where({ contactId: req.query.contactId });
+  if (req.query.status) query = query.where({ status: req.query.status });
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
   // Plain staff only ever see their own sales, even within a scoped location.
-  if (level === 'staff') filter.staffId = req.user._id;
+  if (level === 'staff') query = query.where({ staffId: req.user.id });
 
-  const [total, sales] = await Promise.all([
-    countDocuments('pos_sales', filter),
-    findMany('pos_sales', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(sales, total, page, limit));
+  const [{ count }] = await query.clone().count('* as count');
+  const sales = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(sales, Number(count), page, limit));
 };
 
 // Same-calendar-day, manager-or-above only — a full reversal of the sale (every line's
@@ -317,7 +330,7 @@ const voidSale = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (level !== 'admin' && level !== 'manager') return returnFunction(res, 403, false, 'Voiding a sale requires manager approval.');
 
-  const sale = await findOne('pos_sales', { _id: new ObjectId(req.params.id) });
+  const sale = await knex('pos_sales').where({ id: req.params.id }).first();
   if (!sale) return returnFunction(res, 404, false, req.locale.notFound);
   if (sale.status !== 'completed') return returnFunction(res, 400, false, 'Only a completed sale can be voided.');
 
@@ -325,29 +338,29 @@ const voidSale = async (req, res) => {
   if (!sameDay) return returnFunction(res, 400, false, 'A sale can only be voided on the same day it was made — use a refund instead.');
 
   for (const line of sale.items) {
-    await returnStockFromSale(line.itemId, sale.locationId, line.quantity - line.refundedQuantity, sale._id, req.user._id).catch(() => {});
+    await returnStockFromSale(line.itemId, sale.locationId, line.quantity - line.refundedQuantity, sale.id, req.user.id).catch(() => {});
   }
-  await updateOne('pos_sales', { _id: sale._id }, {
-    $set: { status: 'voided', voidedBy: req.user._id, voidedAt: new Date(), voidReason: req.body.reason || null },
+  await knex('pos_sales').where({ id: sale.id }).update({
+    status: 'voided', voidedBy: req.user.id, voidedAt: new Date(), voidReason: req.body.reason || null,
   });
 
   // Direct reuse of the reversal primitive — no bespoke logic needed. Never blocks the
   // void itself; a missing/already-reversed entry just gets queued for admin attention.
   try {
-    const saleEntry = await findOne('gl_journal_entries', { referenceId: sale._id, referenceModel: 'pos_sales', source: 'pos_sale', status: 'posted' });
+    const saleEntry = await findOne('gl_journal_entries', { referenceId: sale.id, referenceModel: 'pos_sales', source: 'pos_sale', status: 'posted' });
     if (saleEntry) await reverseJournalEntry(saleEntry._id, { reason: 'Sale voided', postedBy: req.user._id });
   } catch (err) {
-    await logPostingFailure({ source: 'pos_sale_void', sourceModule: 'pos', referenceId: sale._id, referenceModel: 'pos_sales', attemptedPayload: {}, error: err });
+    await logPostingFailure({ source: 'pos_sale_void', sourceModule: 'pos', referenceId: sale.id, referenceModel: 'pos_sales', attemptedPayload: {}, error: err });
   }
 
   return returnFunction(res, 200, true, 'Sale voided and stock restored.');
 };
 
 const getReceipt = async (req, res) => {
-  const sale = await findOne('pos_sales', { _id: new ObjectId(req.params.id) });
+  const sale = await knex('pos_sales').where({ id: req.params.id }).first();
   if (!sale) return returnFunction(res, 404, false, req.locale.notFound);
   const [location, settings] = await Promise.all([
-    findOne('inventory_locations', { _id: sale.locationId }, { projection: { name: 1 } }),
+    knex('inventory_locations').where({ id: sale.locationId }).select('name').first(),
     findOne('company_settings', {}),
   ]);
   const pdfBuffer = await generateReceiptPDF(sale, { companyName: settings?.companyName, location, logoPath: settings?.logoPath });

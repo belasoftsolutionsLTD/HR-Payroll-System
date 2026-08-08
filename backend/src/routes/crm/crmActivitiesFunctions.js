@@ -2,6 +2,9 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
+// pos_sales is Postgres now (Phase 6) — found while sweeping CRM; the rest of this
+// file's tables (crm_activities/crm_contacts) stay Mongo, CRM's own phase (7).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getCrmAccessLevel, canAccessAssignee, getScopedAssigneeIds } = require('../../lib/crm/crmAccess');
 
 const LOGGABLE_TYPES = ['call', 'email', 'meeting', 'note'];
@@ -164,7 +167,7 @@ const getContactTimeline = async (req, res) => {
 
   const [activities, sales] = await Promise.all([
     findMany('crm_activities', { contactId: contact._id }, { sort: { createdAt: -1 } }),
-    findMany('pos_sales', { contactId: contact._id, status: { $ne: 'failed' } }, { sort: { createdAt: -1 } }),
+    knex('pos_sales').where({ contactId: String(contact._id) }).whereNot({ status: 'failed' }).orderBy('createdAt', 'desc'),
   ]);
 
   const timeline = [

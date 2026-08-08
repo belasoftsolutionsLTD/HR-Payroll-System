@@ -1,6 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_items/inventory_locations are Postgres now
+// (found while sweeping CRM for Phase 6 — CRM's own tables stay Mongo, unaffected).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany } = require('../../functions/Database/commonDBFunctions');
 const { getStockLevel } = require('../../lib/inventory/inventoryIntegration');
 const { getCrmAccessLevel } = require('../../lib/crm/crmAccess');
 
@@ -12,24 +13,20 @@ const searchStock = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = { isActive: { $ne: false } };
+  let query = knex('inventory_items').whereNot({ isActive: false });
   if (req.query.search) {
-    const q = req.query.search.trim();
-    filter.$or = [
-      { name: { $regex: q, $options: 'i' } },
-      { sku: { $regex: q, $options: 'i' } },
-      { barcode: { $regex: q, $options: 'i' } },
-    ];
+    const q = `%${req.query.search.trim()}%`;
+    query = query.where((qb) => qb.whereILike('name', q).orWhereILike('sku', q).orWhereILike('barcode', q));
   }
-  const items = await findMany('inventory_items', filter, { limit: 20, sort: { name: 1 } });
+  const items = await query.orderBy('name').limit(20);
 
   const locations = req.query.locationId
-    ? [new ObjectId(req.query.locationId)]
-    : (await findMany('inventory_locations', { isActive: { $ne: false } }, { projection: { _id: 1 } })).map((l) => l._id);
+    ? [req.query.locationId]
+    : (await knex('inventory_locations').whereNot({ isActive: false }).select('id')).map((l) => l.id);
 
   const withStock = await Promise.all(items.map(async (item) => {
     if (!item.isTracked) return { ...item, stock: null };
-    const perLocation = await Promise.all(locations.map((locId) => getStockLevel(item._id, locId)));
+    const perLocation = await Promise.all(locations.map((locId) => getStockLevel(item.id, locId)));
     return { ...item, stock: perLocation.reduce((sum, q) => sum + q, 0) };
   }));
 

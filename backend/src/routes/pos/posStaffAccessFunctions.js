@@ -1,6 +1,9 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — users has been Postgres since Phase 1; this file was
+// still reading/writing it via the Mongo commonDBFunctions helper. posLocationIds is a
+// Postgres text[] column (see phase6 migration's ALTER TABLE users) — plain JS string
+// array in and out, no ObjectId wrapping needed anymore.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { STAFF } = require('../../constants/roles');
 const { getPosAccessLevel } = require('../../lib/pos/posAccess');
 
@@ -11,7 +14,7 @@ const listStaffAccess = async (req, res) => {
   const level = await getPosAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
 
-  const users = await findMany('users', { role: STAFF }, { projection: { name: 1, email: 1, employeeId: 1, posLocationIds: 1 } });
+  const users = await knex('users').where({ role: STAFF }).select('id', 'name', 'email', 'employeeId', 'posLocationIds');
   return returnFunction(res, 200, true, req.locale.success, users.map((u) => ({ ...u, posLocationIds: u.posLocationIds || [] })));
 };
 
@@ -20,8 +23,9 @@ const setStaffLocations = async (req, res) => {
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
   if (!Array.isArray(req.body.locationIds)) return returnFunction(res, 400, false, 'locationIds must be an array.');
 
-  await updateOne('users', { _id: new ObjectId(req.params.userId) }, {
-    $set: { posLocationIds: req.body.locationIds.map((id) => new ObjectId(id)), updatedAt: new Date() },
+  await knex('users').where({ id: req.params.userId }).update({
+    posLocationIds: req.body.locationIds.map((id) => String(id)),
+    updatedAt: new Date(),
   });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };

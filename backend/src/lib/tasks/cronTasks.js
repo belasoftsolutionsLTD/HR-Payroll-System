@@ -9,8 +9,9 @@ const { getLowStockLevels } = require('../../routes/inventory/inventoryLocations
 const { updateOne, findOne, findMany } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
 // employees/users (Phase 1), leave_requests/leave_types (Phase 3a),
-// attendance_records/shifts/work_schedules (Phase 3b), and job_requisitions/
-// offboarding_records (Phase 4) now live in Postgres; everything else this file
+// attendance_records/shifts/work_schedules (Phase 3b), job_requisitions/
+// offboarding_records (Phase 4), employee_certifications (Phase 5), and
+// inventory_stock_levels (Phase 6) now live in Postgres; everything else this file
 // touches stays on the Mongo helpers above until its own phase.
 const pgDB = require('../../functions/Database/pgDBFunctions');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -46,7 +47,9 @@ async function checkLowStockAlerts() {
       link: `/inventory?tab=items`,
     }).catch(() => {});
     {
-      const hrUsers = await findMany('users', { role: { $in: ['super_admin', 'hr_manager'] }, isActive: { $ne: false } }, { projection: { email: 1 } });
+      // users has been Postgres since Phase 1 — was still reading it off the Mongo
+      // helper here, silently broken (found while sweeping cronTasks.js for Phase 6).
+      const hrUsers = await pgDB.knex('users').whereIn('role', ['super_admin', 'hr_manager']).whereNot({ isActive: false }).select('email');
       const tokens = {
         itemName: level.item?.name ?? 'An item', sku: level.item?.sku ?? '', locationName: level.location?.name ?? 'a location',
         quantity: level.quantity, unitOfMeasure: level.item?.unitOfMeasure ?? 'units', reorderPoint: level.reorderPoint,
@@ -57,7 +60,8 @@ async function checkLowStockAlerts() {
         fallbackHtml: `<p>${tokens.itemName} (${tokens.sku}) at ${tokens.locationName} is at ${tokens.quantity} ${tokens.unitOfMeasure}, at/below its reorder point of ${tokens.reorderPoint}.</p>`,
       }).catch(() => {}));
     }
-    await updateOne('inventory_stock_levels', { itemId: level.itemId, locationId: level.locationId }, { $set: { lastLowStockAlertAt: new Date() } });
+    // inventory_stock_levels is Postgres too (Phase 6) — same fix as the users lookup above.
+    await pgDB.knex('inventory_stock_levels').where({ itemId: level.itemId, locationId: level.locationId }).update({ lastLowStockAlertAt: new Date() });
   }
 }
 

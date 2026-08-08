@@ -1,6 +1,9 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — inventory_lots/inventory_items/inventory_locations/
+// inventory_stock_movements are all Postgres now. Mongo's $inc on quantityRemaining
+// becomes a real transaction-free knex increment (single-row UPDATE ... SET x = x + $1
+// is already atomic at the row level in Postgres, same guarantee $inc gave us in Mongo).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 
 // A lot record is scoped to one item + one location + one lot/serial number — receiving
 // the same lot number again at the same location tops up quantityRemaining; receiving it
@@ -9,29 +12,31 @@ const { findOne, findMany, insertOne, updateOne } = require('../../functions/Dat
 
 async function receiveLotStock({ itemId, locationId, lotNumber, quantity, expiryDate = null, poId = null }) {
   const now = new Date();
-  const existing = await findOne('inventory_lots', { itemId, locationId, lotNumber });
+  const existing = await knex('inventory_lots').where({ itemId, locationId, lotNumber }).first();
   if (existing) {
-    await updateOne('inventory_lots', { _id: existing._id }, {
-      $inc: { quantityRemaining: quantity },
-      $set: { updatedAt: now, ...(expiryDate ? { expiryDate: new Date(expiryDate) } : {}) },
-    });
-    return { ...existing, quantityRemaining: existing.quantityRemaining + quantity };
+    const set = { quantityRemaining: knex.raw('"quantityRemaining" + ?', [quantity]), updatedAt: now };
+    if (expiryDate) set.expiryDate = new Date(expiryDate);
+    const [updated] = await knex('inventory_lots').where({ id: existing.id }).update(set).returning('*');
+    return updated;
   }
   const doc = {
-    itemId, locationId, lotNumber,
+    id: newId(), itemId, locationId, lotNumber,
     quantityRemaining: quantity,
     expiryDate: expiryDate ? new Date(expiryDate) : null,
     poId, receivedAt: now, createdAt: now, updatedAt: now,
   };
-  const result = await insertOne('inventory_lots', doc);
-  return { _id: result.insertedId, ...doc };
+  const [saved] = await knex('inventory_lots').insert(doc).returning('*');
+  return saved;
 }
 
 async function consumeLotStock({ itemId, locationId, lotNumber, quantity }) {
-  const lot = await findOne('inventory_lots', { itemId, locationId, lotNumber });
+  const lot = await knex('inventory_lots').where({ itemId, locationId, lotNumber }).first();
   if (!lot) throw new Error(`Lot ${lotNumber} not found at this location.`);
   if (lot.quantityRemaining < quantity) throw new Error(`Lot ${lotNumber} only has ${lot.quantityRemaining} remaining.`);
-  await updateOne('inventory_lots', { _id: lot._id }, { $inc: { quantityRemaining: -quantity }, $set: { updatedAt: new Date() } });
+  await knex('inventory_lots').where({ id: lot.id }).update({
+    quantityRemaining: knex.raw('"quantityRemaining" - ?', [quantity]),
+    updatedAt: new Date(),
+  });
   return lot;
 }
 
@@ -46,15 +51,15 @@ async function transferLotStock({ itemId, lotNumber, fromLocationId, toLocationI
 }
 
 const listLotsForItem = async (req, res) => {
-  const itemId = new ObjectId(req.params.itemId);
-  const lots = await findMany('inventory_lots', { itemId }, { sort: { expiryDate: 1 } });
-  const locIds = [...new Set(lots.map((l) => String(l.locationId)))].map((id) => new ObjectId(id));
-  const locations = locIds.length ? await findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } }) : [];
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const itemId = req.params.itemId;
+  const lots = await knex('inventory_lots').where({ itemId }).orderBy('expiryDate');
+  const locIds = [...new Set(lots.map((l) => l.locationId))];
+  const locations = locIds.length ? await knex('inventory_locations').whereIn('id', locIds).select('id', 'name') : [];
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
   const now = new Date();
   const enriched = lots.map((l) => ({
     ...l,
-    location: locMap[String(l.locationId)] || null,
+    location: locMap[l.locationId] || null,
     isExpired: !!(l.expiryDate && l.expiryDate < now),
   }));
   return returnFunction(res, 200, true, req.locale.success, enriched);
@@ -66,20 +71,20 @@ const traceLot = async (req, res) => {
   const { itemId, lotNumber } = req.query;
   if (!itemId || !lotNumber) return returnFunction(res, 400, false, 'itemId and lotNumber are required.');
 
-  const lots = await findMany('inventory_lots', { itemId: new ObjectId(itemId), lotNumber }, { sort: { receivedAt: 1 } });
+  const lots = await knex('inventory_lots').where({ itemId, lotNumber }).orderBy('receivedAt');
   if (!lots.length) return returnFunction(res, 404, false, 'No lot found with that number for this item.');
 
-  const lotIds = lots.map((l) => l._id);
-  const movements = await findMany('inventory_stock_movements', { lotId: { $in: lotIds } }, { sort: { createdAt: 1 } });
+  const lotIds = lots.map((l) => l.id);
+  const movements = await knex('inventory_stock_movements').whereIn('lotId', lotIds).orderBy('createdAt');
 
-  const locIds = [...new Set(lots.map((l) => String(l.locationId)))].map((id) => new ObjectId(id));
-  const locations = await findMany('inventory_locations', { _id: { $in: locIds } }, { projection: { name: 1 } });
-  const locMap = Object.fromEntries(locations.map((l) => [String(l._id), l]));
+  const locIds = [...new Set(lots.map((l) => l.locationId))];
+  const locations = await knex('inventory_locations').whereIn('id', locIds).select('id', 'name');
+  const locMap = Object.fromEntries(locations.map((l) => [l.id, l]));
 
   return returnFunction(res, 200, true, req.locale.success, {
     lotNumber,
-    lots: lots.map((l) => ({ ...l, location: locMap[String(l.locationId)] || null })),
-    movements: movements.map((m) => ({ ...m, location: locMap[String(m.locationId)] || null })),
+    lots: lots.map((l) => ({ ...l, location: locMap[l.locationId] || null })),
+    movements: movements.map((m) => ({ ...m, location: locMap[m.locationId] || null })),
   });
 };
 

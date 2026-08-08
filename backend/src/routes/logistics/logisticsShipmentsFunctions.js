@@ -2,6 +2,9 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// inventory_transfers/pos_sales are Postgres now (Phase 6) — found while sweeping
+// Logistics; logistics_shipments/logistics_routes stay Mongo, Logistics' own phase (8).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getLogisticsAccessLevel, getLogisticsDepartmentFilter } = require('../../lib/logistics/logisticsAccess');
 const { completeInventoryTransfer } = require('../../lib/inventory/inventoryIntegration');
 
@@ -55,15 +58,15 @@ const createShipment = async (req, res) => {
   let sourceId = null;
   if (sourceType === 'inventory_transfer') {
     if (!req.body.sourceId) return returnFunction(res, 400, false, 'sourceId (transfer) is required for sourceType inventory_transfer.');
-    const transfer = await findOne('inventory_transfers', { _id: new ObjectId(req.body.sourceId) });
+    const transfer = await knex('inventory_transfers').where({ id: req.body.sourceId }).first();
     if (!transfer) return returnFunction(res, 400, false, 'Inventory transfer not found.');
     if (transfer.status !== 'approved') return returnFunction(res, 400, false, 'Only an approved transfer (ready to be received) can become a shipment.');
-    sourceId = transfer._id;
+    sourceId = transfer.id;
   } else if (sourceType === 'pos_sale') {
     if (!req.body.sourceId) return returnFunction(res, 400, false, 'sourceId (sale) is required for sourceType pos_sale.');
-    const sale = await findOne('pos_sales', { _id: new ObjectId(req.body.sourceId) });
+    const sale = await knex('pos_sales').where({ id: req.body.sourceId }).first();
     if (!sale) return returnFunction(res, 400, false, 'POS sale not found.');
-    sourceId = sale._id;
+    sourceId = sale.id;
   }
 
   // Optional route/stop assignment — schema has always had these fields, but nothing

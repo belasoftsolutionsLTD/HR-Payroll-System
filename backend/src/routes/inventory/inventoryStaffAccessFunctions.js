@@ -1,6 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 6) — users has been Postgres since Phase 1; this file was
+// still reading/writing it via the Mongo commonDBFunctions helper.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findMany, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { STAFF } = require('../../constants/roles');
 const { getInventoryAccessLevel } = require('../../lib/inventory/inventoryAccess');
 
@@ -11,7 +12,7 @@ const listStaffAccess = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
 
-  const users = await findMany('users', { role: STAFF }, { projection: { name: 1, email: 1, employeeId: 1, isInventoryClerk: 1 } });
+  const users = await knex('users').where({ role: STAFF }).select('id', 'name', 'email', 'employeeId', 'isInventoryClerk');
   return returnFunction(res, 200, true, req.locale.success, users.map((u) => ({ ...u, isInventoryClerk: u.isInventoryClerk === true })));
 };
 
@@ -19,7 +20,7 @@ const setInventoryClerkFlag = async (req, res) => {
   const level = await getInventoryAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
 
-  await updateOne('users', { _id: new ObjectId(req.params.userId) }, { $set: { isInventoryClerk: Boolean(req.body.isInventoryClerk), updatedAt: new Date() } });
+  await knex('users').where({ id: req.params.userId }).update({ isInventoryClerk: Boolean(req.body.isInventoryClerk), updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
