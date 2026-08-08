@@ -1,4 +1,9 @@
-const { findMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 7) — employees/users have been Postgres since Phase 1; this
+// file was still reading them off the Mongo helper (found while sweeping for Phase 7,
+// same gap as lib/inventory/inventoryAccess.js and lib/pos/posAccess.js in Phase 6).
+// crm_contacts/crm_deals are Postgres now too (this phase), so every id this file hands
+// back is a plain string, matching those tables' assignedTo columns directly.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { DEPT_HEAD, STAFF, HR_ROLES, ALL_ROLES } = require('../../constants/roles');
 
 // Same "no dedicated role, computed per-request" convention as Inventory/POS — but
@@ -19,8 +24,8 @@ const getCrmAccessLevel = async (user) => {
   if (user.role === DEPT_HEAD) return 'manager';
   if (user.role === STAFF) {
     if (user.employeeId) {
-      const directReport = await findMany('employees', { managerId: user.employeeId }, { projection: { _id: 1 } });
-      if (directReport.length) return 'manager';
+      const directReport = await knex('employees').where({ managerId: String(user.employeeId) }).select('id').first();
+      if (directReport) return 'manager';
     }
     return 'staff';
   }
@@ -30,17 +35,17 @@ const getCrmAccessLevel = async (user) => {
 // User ids (against assignedTo/ownerId fields) a given level may see. null = unrestricted.
 const getScopedAssigneeIds = async (user, level) => {
   if (level === 'admin') return null;
-  if (level === 'staff') return [user._id];
+  if (level === 'staff') return [user.id];
 
   // 'manager' — self + direct reports' linked user accounts. Two hops: employees
   // reporting to this manager -> the users documents linked to those employees.
-  if (!user.employeeId) return [user._id];
-  const reports = await findMany('employees', { managerId: user.employeeId }, { projection: { _id: 1 } });
-  const reportEmployeeIds = reports.map((e) => e._id);
+  if (!user.employeeId) return [user.id];
+  const reports = await knex('employees').where({ managerId: String(user.employeeId) }).select('id');
+  const reportEmployeeIds = reports.map((e) => e.id);
   const reportUsers = reportEmployeeIds.length
-    ? await findMany('users', { employeeId: { $in: reportEmployeeIds } }, { projection: { _id: 1 } })
+    ? await knex('users').whereIn('employeeId', reportEmployeeIds).select('id')
     : [];
-  return [user._id, ...reportUsers.map((u) => u._id)];
+  return [user.id, ...reportUsers.map((u) => u.id)];
 };
 
 const canAccessAssignee = async (user, level, assigneeId) => {
@@ -53,10 +58,10 @@ const canAccessAssignee = async (user, level, assigneeId) => {
 // admin/manager is allowed to hand a record to, scoped the same way everything else is.
 const listTeamMembers = async (user, level) => {
   if (level === 'admin') {
-    return findMany('users', { role: { $in: ALL_ROLES } }, { projection: { name: 1, email: 1, role: 1 } });
+    return knex('users').whereIn('role', ALL_ROLES).select('id', 'name', 'email', 'role');
   }
   const scoped = await getScopedAssigneeIds(user, level);
-  return findMany('users', { _id: { $in: scoped } }, { projection: { name: 1, email: 1, role: 1 } });
+  return knex('users').whereIn('id', scoped).select('id', 'name', 'email', 'role');
 };
 
 module.exports = { getCrmAccessLevel, getScopedAssigneeIds, canAccessAssignee, listTeamMembers };

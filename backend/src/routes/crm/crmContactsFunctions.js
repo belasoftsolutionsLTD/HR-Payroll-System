@@ -1,7 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 7) — crm_contacts/crm_companies/crm_deals are Postgres now.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { getCrmAccessLevel, getScopedAssigneeIds, canAccessAssignee } = require('../../lib/crm/crmAccess');
 
 const listContacts = async (req, res) => {
@@ -10,43 +10,36 @@ const listContacts = async (req, res) => {
   const scoped = await getScopedAssigneeIds(req.user, level);
 
   const { page, limit, skip } = getPagination(req.query);
-  const filter = { isActive: { $ne: false } };
-  if (scoped) filter.assignedTo = { $in: scoped };
-  if (req.query.companyId) filter.companyId = new ObjectId(req.query.companyId);
-  if (req.query.tag) filter.tags = req.query.tag;
+  let query = knex('crm_contacts').whereNot({ isActive: false });
+  if (scoped) query = query.whereIn('assignedTo', scoped);
+  if (req.query.companyId) query = query.where({ companyId: req.query.companyId });
+  if (req.query.tag) query = query.whereRaw('? = ANY("tags")', [req.query.tag]);
   if (req.query.search) {
-    const q = req.query.search.trim();
-    filter.$or = [
-      { firstName: { $regex: q, $options: 'i' } },
-      { lastName: { $regex: q, $options: 'i' } },
-      { email: { $regex: q, $options: 'i' } },
-      { phone: { $regex: q, $options: 'i' } },
-    ];
+    const q = `%${req.query.search.trim()}%`;
+    query = query.where((qb) => qb.whereILike('firstName', q).orWhereILike('lastName', q).orWhereILike('email', q).orWhereILike('phone', q));
   }
 
-  const [total, contacts] = await Promise.all([
-    countDocuments('crm_contacts', filter),
-    findMany('crm_contacts', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const contacts = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  const companyIds = [...new Set(contacts.filter((c) => c.companyId).map((c) => String(c.companyId)))].map((id) => new ObjectId(id));
-  const companies = companyIds.length ? await findMany('crm_companies', { _id: { $in: companyIds } }, { projection: { name: 1 } }) : [];
-  const companyMap = Object.fromEntries(companies.map((c) => [String(c._id), c]));
-  const enriched = contacts.map((c) => ({ ...c, company: c.companyId ? companyMap[String(c.companyId)] || null : null }));
+  const companyIds = [...new Set(contacts.filter((c) => c.companyId).map((c) => c.companyId))];
+  const companies = companyIds.length ? await knex('crm_companies').whereIn('id', companyIds).select('id', 'name') : [];
+  const companyMap = Object.fromEntries(companies.map((c) => [c.id, c]));
+  const enriched = contacts.map((c) => ({ ...c, company: c.companyId ? companyMap[c.companyId] || null : null }));
 
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 const getContact = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const contact = await findOne('crm_contacts', { _id: new ObjectId(req.params.id) });
+  const contact = await knex('crm_contacts').where({ id: req.params.id }).first();
   if (!contact) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, contact.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
 
   const [company, deals] = await Promise.all([
-    contact.companyId ? findOne('crm_companies', { _id: contact.companyId }, { projection: { name: 1 } }) : null,
-    findMany('crm_deals', { contactId: contact._id }, { sort: { createdAt: -1 } }),
+    contact.companyId ? knex('crm_companies').where({ id: contact.companyId }).select('name').first() : null,
+    knex('crm_deals').where({ contactId: contact.id }).orderBy('createdAt', 'desc'),
   ]);
   return returnFunction(res, 200, true, req.locale.success, { ...contact, company: company || null, deals });
 };
@@ -66,11 +59,12 @@ const createContact = async (req, res) => {
   }
 
   const doc = {
+    id: newId(),
     firstName: req.body.firstName.trim(),
     lastName: req.body.lastName?.trim() || '',
     email: req.body.email?.trim() || '',
     phone: req.body.phone?.trim() || '',
-    companyId: req.body.companyId ? new ObjectId(req.body.companyId) : null,
+    companyId: req.body.companyId || null,
     tags: Array.isArray(req.body.tags) ? req.body.tags.map(String) : [],
     // 'manual' only as a fallback for callers that omit source entirely (e.g. programmatic
     // creation) — the Add Contact form always sends a real value from the dropdown now:
@@ -81,26 +75,26 @@ const createContact = async (req, res) => {
     sourceEventName: req.body.source === 'event' ? req.body.sourceEventName.trim() : null,
     sourceEventVenue: req.body.source === 'event' ? (req.body.sourceEventVenue?.trim() || null) : null,
     sourceEventDate: req.body.source === 'event' && req.body.sourceEventDate ? new Date(req.body.sourceEventDate) : null,
-    assignedTo: req.body.assignedTo ? new ObjectId(req.body.assignedTo) : req.user._id,
-    customFieldValues: req.body.customFieldValues && typeof req.body.customFieldValues === 'object' ? req.body.customFieldValues : {},
+    assignedTo: req.body.assignedTo || req.user.id,
+    customFieldValues: JSON.stringify(req.body.customFieldValues && typeof req.body.customFieldValues === 'object' ? req.body.customFieldValues : {}),
     isActive: true,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
   // Only admin/manager may hand a new contact to someone other than themselves.
-  if (String(doc.assignedTo) !== String(req.user._id) && level === 'staff') {
+  if (doc.assignedTo !== req.user.id && level === 'staff') {
     return returnFunction(res, 403, false, 'You can only create contacts assigned to yourself.');
   }
 
-  const result = await insertOne('crm_contacts', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('crm_contacts').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateContact = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const contact = await findOne('crm_contacts', { _id: new ObjectId(req.params.id) });
+  const contact = await knex('crm_contacts').where({ id: req.params.id }).first();
   if (!contact) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, contact.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
 
@@ -109,7 +103,7 @@ const updateContact = async (req, res) => {
   if (req.body.lastName !== undefined) update.lastName = req.body.lastName.trim();
   if (req.body.email !== undefined) update.email = req.body.email.trim();
   if (req.body.phone !== undefined) update.phone = req.body.phone.trim();
-  if (req.body.companyId !== undefined) update.companyId = req.body.companyId ? new ObjectId(req.body.companyId) : null;
+  if (req.body.companyId !== undefined) update.companyId = req.body.companyId || null;
   if (Array.isArray(req.body.tags)) update.tags = req.body.tags.map(String);
   if (req.body.source !== undefined) {
     if (req.body.source === 'website' && !req.body.sourceWebsite?.trim()) {
@@ -124,20 +118,20 @@ const updateContact = async (req, res) => {
     update.sourceEventVenue = req.body.source === 'event' ? (req.body.sourceEventVenue?.trim() || null) : null;
     update.sourceEventDate = req.body.source === 'event' && req.body.sourceEventDate ? new Date(req.body.sourceEventDate) : null;
   }
-  if (req.body.customFieldValues && typeof req.body.customFieldValues === 'object') update.customFieldValues = req.body.customFieldValues;
+  if (req.body.customFieldValues && typeof req.body.customFieldValues === 'object') update.customFieldValues = JSON.stringify(req.body.customFieldValues);
   if (req.body.assignedTo !== undefined) {
     if (level === 'staff') return returnFunction(res, 403, false, 'You cannot reassign contacts.');
-    update.assignedTo = new ObjectId(req.body.assignedTo);
+    update.assignedTo = req.body.assignedTo;
   }
 
-  await updateOne('crm_contacts', { _id: contact._id }, { $set: update });
+  await knex('crm_contacts').where({ id: contact.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteContact = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (level !== 'admin' && level !== 'manager') return returnFunction(res, 403, false, 'Not authorized.');
-  await updateOne('crm_contacts', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('crm_contacts').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 

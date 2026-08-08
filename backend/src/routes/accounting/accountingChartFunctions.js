@@ -1,7 +1,7 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 7) — gl_accounts is Postgres now.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { getAccountingAccessLevel } = require('../../lib/accounting/accountingAccess');
 
 const ACCOUNT_TYPES = ['asset', 'liability', 'equity', 'revenue', 'expense'];
@@ -13,16 +13,16 @@ const DEFAULT_NORMAL_BALANCE = { asset: 'debit', liability: 'credit', equity: 'c
 const listAccounts = async (req, res) => {
   const level = await getAccountingAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const filter = { isActive: { $ne: false } };
-  if (req.query.type) filter.type = req.query.type;
-  const accounts = await findMany('gl_accounts', filter, { sort: { code: 1 } });
+  let query = knex('gl_accounts').whereNot({ isActive: false });
+  if (req.query.type) query = query.where({ type: req.query.type });
+  const accounts = await query.orderBy('code');
   return returnFunction(res, 200, true, req.locale.success, accounts);
 };
 
 const getAccount = async (req, res) => {
   const level = await getAccountingAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const account = await findOne('gl_accounts', { _id: new ObjectId(req.params.id) });
+  const account = await knex('gl_accounts').where({ id: req.params.id }).first();
   if (!account) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, account);
 };
@@ -32,54 +32,55 @@ const createAccount = async (req, res) => {
   if (level !== 'admin') return returnFunction(res, 403, false, 'Only an accounting admin can change the Chart of Accounts.');
   if (!validateRequiredFields(req, res, ['code', 'name', 'type'])) return;
   if (!ACCOUNT_TYPES.includes(req.body.type)) return returnFunction(res, 400, false, `type must be one of: ${ACCOUNT_TYPES.join(', ')}.`);
-  const existing = await findOne('gl_accounts', { code: req.body.code.trim() });
+  const existing = await knex('gl_accounts').where({ code: req.body.code.trim() }).first();
   if (existing) return returnFunction(res, 409, false, 'An account with this code already exists.');
 
   const doc = {
+    id: newId(),
     code: req.body.code.trim(),
     name: req.body.name.trim(),
     type: req.body.type,
     subType: req.body.subType?.trim() || null,
-    parentId: req.body.parentId ? new ObjectId(req.body.parentId) : null,
+    parentId: req.body.parentId || null,
     normalBalance: ['debit', 'credit'].includes(req.body.normalBalance) ? req.body.normalBalance : DEFAULT_NORMAL_BALANCE[req.body.type],
     isSystemAccount: false,
     systemKey: null, // only ever set by the seed script — never user-assignable, so automation targets stay stable
     linkedExpenseCategories: Array.isArray(req.body.linkedExpenseCategories) ? req.body.linkedExpenseCategories.map(String) : [],
     isActive: true,
     balanceCache: 0,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('gl_accounts', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('gl_accounts').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateAccount = async (req, res) => {
   const level = await getAccountingAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Only an accounting admin can change the Chart of Accounts.');
-  const existing = await findOne('gl_accounts', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('gl_accounts').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
 
   const update = { updatedAt: new Date() };
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (req.body.subType !== undefined) update.subType = req.body.subType?.trim() || null;
-  if (req.body.parentId !== undefined) update.parentId = req.body.parentId ? new ObjectId(req.body.parentId) : null;
+  if (req.body.parentId !== undefined) update.parentId = req.body.parentId || null;
   if (Array.isArray(req.body.linkedExpenseCategories)) update.linkedExpenseCategories = req.body.linkedExpenseCategories.map(String);
   // code/type/normalBalance/systemKey are deliberately not editable after creation —
   // changing them would silently break every automatic-posting call site and any
   // already-posted journal entry's stored accountCode/accountName snapshot.
-  await updateOne('gl_accounts', { _id: existing._id }, { $set: update });
+  await knex('gl_accounts').where({ id: existing.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const archiveAccount = async (req, res) => {
   const level = await getAccountingAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Only an accounting admin can change the Chart of Accounts.');
-  const account = await findOne('gl_accounts', { _id: new ObjectId(req.params.id) });
+  const account = await knex('gl_accounts').where({ id: req.params.id }).first();
   if (!account) return returnFunction(res, 404, false, req.locale.notFound);
   if (account.isSystemAccount) return returnFunction(res, 400, false, 'A system account (used by automatic posting) cannot be archived.');
-  await updateOne('gl_accounts', { _id: account._id }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('gl_accounts').where({ id: account.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Archived.');
 };
 
@@ -125,11 +126,12 @@ const seedDefaultChartOfAccounts = async (req, res) => {
   const level = await getAccountingAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Only an accounting admin can seed the Chart of Accounts.');
 
-  const existingCodes = new Set((await findMany('gl_accounts', {}, { projection: { code: 1 } })).map((a) => a.code));
+  const existingCodes = new Set((await knex('gl_accounts').select('code')).map((a) => a.code));
   let inserted = 0;
   for (const acct of STARTER_TEMPLATE) {
     if (existingCodes.has(acct.code)) continue;
-    await insertOne('gl_accounts', {
+    await knex('gl_accounts').insert({
+      id: newId(),
       code: acct.code,
       name: acct.name,
       type: acct.type,
@@ -141,7 +143,7 @@ const seedDefaultChartOfAccounts = async (req, res) => {
       linkedExpenseCategories: [],
       isActive: true,
       balanceCache: 0,
-      createdBy: req.user._id,
+      createdBy: req.user.id,
       createdAt: new Date(),
       updatedAt: new Date(),
     });

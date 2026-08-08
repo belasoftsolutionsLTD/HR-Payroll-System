@@ -4,6 +4,9 @@ const AsyncHandler = require('../../middleware/AsyncHandler');
 const { allowRoles } = require('../../middleware/RolesMiddleware');
 const { ALL_ROLES, HR_ROLES } = require('../../constants/roles');
 const returnFunction = require('../../functions/returnFunction');
+// crm_contacts/crm_deals are Postgres now (Phase 7) — this route's own inline handler
+// was still bypassing straight to global.dbo.collection(), found while sweeping crm.js.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getCrmAccessLevel, listTeamMembers } = require('../../lib/crm/crmAccess');
 
 const { listContacts, getContact, createContact, updateContact, deleteContact } = require('./crmContactsFunctions');
@@ -33,8 +36,8 @@ router.get('/my-access', allowRoles(ANY), AsyncHandler(async (req, res) => {
   let relevant = level === 'admin' || level === 'manager';
   if (level === 'staff') {
     const [hasContact, hasDeal] = await Promise.all([
-      global.dbo.collection('crm_contacts').findOne({ assignedTo: req.user._id }, { projection: { _id: 1 } }),
-      global.dbo.collection('crm_deals').findOne({ assignedTo: req.user._id }, { projection: { _id: 1 } }),
+      knex('crm_contacts').where({ assignedTo: req.user.id }).select('id').first(),
+      knex('crm_deals').where({ assignedTo: req.user.id }).select('id').first(),
     ]);
     relevant = !!(hasContact || hasDeal);
   }

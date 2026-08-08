@@ -1203,6 +1203,164 @@ async function main() {
       redeemedAt: toDate(v.redeemedAt), redeemedSaleId: idStr(v.redeemedSaleId), createdAt: toDate(v.createdAt), updatedAt: toDate(v.updatedAt),
     })));
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  PHASE 7 — CRM, Accounting
+    // ══════════════════════════════════════════════════════════════════════
+
+    // gl_journal_entry_number_*/ar_invoice_number_*/ap_bill_number_* counters — same
+    // "seed the real live seq, don't start fresh at 0" lesson as Phase 5's
+    // certificate_number_* fix (see above). These three sequences only start mattering
+    // now that glEngine/accountingArFunctions/accountingApFunctions read the real
+    // Postgres counters table instead of a dead Mongo one.
+    const glCounters = await dbo.collection('counters')
+      .find({ _id: { $regex: /^(gl_journal_entry_number|ar_invoice_number|ap_bill_number)_/ } }).toArray();
+    counts.counters = (counts.counters || 0) + await upsertBatched('counters', glCounters.map((c) => ({
+      id: idStr(c._id), seq: c.seq ?? 0,
+    })));
+
+    // ── CRM ──────────────────────────────────────────────────────────────────
+    const crmCompanies = await dbo.collection('crm_companies').find({}).toArray();
+    counts.crm_companies = await upsertBatched('crm_companies', crmCompanies.map((c) => ({
+      id: idStr(c._id), name: c.name ?? null, industry: c.industry ?? null,
+      customFieldValues: c.customFieldValues ? JSON.stringify(c.customFieldValues) : null,
+      isActive: c.isActive ?? true, createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    // crm_companies must exist before crm_contacts (FK) — written above.
+    const crmContacts = await dbo.collection('crm_contacts').find({}).toArray();
+    counts.crm_contacts = await upsertBatched('crm_contacts', crmContacts.map((c) => ({
+      id: idStr(c._id), firstName: c.firstName ?? null, lastName: c.lastName ?? null, email: c.email ?? null, phone: c.phone ?? null,
+      companyId: idStr(c.companyId), tags: Array.isArray(c.tags) ? c.tags.map(String) : null,
+      source: c.source ?? null, sourceWebsite: c.sourceWebsite ?? null, sourceEventName: c.sourceEventName ?? null,
+      sourceEventVenue: c.sourceEventVenue ?? null, sourceEventDate: toDate(c.sourceEventDate), assignedTo: idStr(c.assignedTo),
+      customFieldValues: c.customFieldValues ? JSON.stringify(c.customFieldValues) : null,
+      isActive: c.isActive ?? true, createdBy: idStr(c.createdBy), createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    const crmPipelines = await dbo.collection('crm_pipelines').find({}).toArray();
+    counts.crm_pipelines = await upsertBatched('crm_pipelines', crmPipelines.map((p) => ({
+      id: idStr(p._id), name: p.name ?? null, stages: p.stages ? JSON.stringify(p.stages) : null,
+      isDefault: p.isDefault ?? false, isActive: p.isActive ?? true, createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+    })));
+
+    // crm_contacts/crm_companies/crm_pipelines must exist before crm_deals (FK) — written above.
+    const crmDeals = await dbo.collection('crm_deals').find({}).toArray();
+    counts.crm_deals = await upsertBatched('crm_deals', crmDeals.map((d) => ({
+      id: idStr(d._id), title: d.title ?? null, contactId: idStr(d.contactId), companyId: idStr(d.companyId),
+      pipelineId: idStr(d.pipelineId), stageId: d.stageId ?? null, value: d.value ?? null, currency: d.currency ?? null,
+      expectedCloseDate: toDate(d.expectedCloseDate), nextAction: d.nextAction ? JSON.stringify(d.nextAction) : null,
+      assignedTo: idStr(d.assignedTo), status: d.status ?? null, wonAt: toDate(d.wonAt), lostAt: toDate(d.lostAt),
+      lostReason: d.lostReason ?? null, confirmedSaleId: idStr(d.confirmedSaleId),
+      customFieldValues: d.customFieldValues ? JSON.stringify(d.customFieldValues) : null,
+      createdBy: idStr(d.createdBy), createdAt: toDate(d.createdAt), updatedAt: toDate(d.updatedAt),
+    })));
+
+    // crm_deals must exist before crm_activities (FK) — written above.
+    const crmActivities = await dbo.collection('crm_activities').find({}).toArray();
+    counts.crm_activities = await upsertBatched('crm_activities', crmActivities.map((a) => ({
+      id: idStr(a._id), type: a.type ?? null, contactId: idStr(a.contactId), dealId: idStr(a.dealId),
+      subject: a.subject ?? null, notes: a.notes ?? null, dueDate: toDate(a.dueDate), completed: a.completed ?? null,
+      completedAt: toDate(a.completedAt), assignedTo: idStr(a.assignedTo), priority: a.priority ?? null,
+      performedBy: idStr(a.performedBy), performedByName: a.performedByName ?? null, createdAt: toDate(a.createdAt),
+    })));
+
+    // crm_activities must exist before crm_activity_subtasks (FK) — written above.
+    const subtaskRows = crmActivities.flatMap((a) => (Array.isArray(a.subtasks) ? a.subtasks : []).map((s) => ({
+      id: idStr(s._id), activityId: idStr(a._id), title: s.title ?? null,
+      isCompleted: s.isCompleted ?? false, completedAt: toDate(s.completedAt),
+    })));
+    counts.crm_activity_subtasks = await upsertBatched('crm_activity_subtasks', subtaskRows);
+
+    const crmFeedback = await dbo.collection('crm_feedback').find({}).toArray();
+    counts.crm_feedback = await upsertBatched('crm_feedback', crmFeedback.map((f) => ({
+      id: idStr(f._id), contactId: idStr(f.contactId), dealId: idStr(f.dealId), rating: f.rating ?? null,
+      comment: f.comment ?? null, loggedBy: idStr(f.loggedBy), loggedByName: f.loggedByName ?? null, createdAt: toDate(f.createdAt),
+    })));
+
+    const crmCustomFieldDefs = await dbo.collection('crm_custom_field_defs').find({}).toArray();
+    counts.crm_custom_field_defs = await upsertBatched('crm_custom_field_defs', crmCustomFieldDefs.map((d) => ({
+      id: idStr(d._id), name: d.name ?? null, fieldType: d.fieldType ?? null, appliesTo: d.appliesTo ?? null,
+      options: Array.isArray(d.options) ? d.options.map(String) : null,
+      isActive: d.isActive ?? true, createdAt: toDate(d.createdAt), updatedAt: toDate(d.updatedAt),
+    })));
+
+    // ── Accounting ───────────────────────────────────────────────────────────
+    // gl_accounts self-references (parentId) — no real data uses it (all real accounts
+    // are top-level), but written as a single pass since none actually chain.
+    const glAccounts = await dbo.collection('gl_accounts').find({}).toArray();
+    counts.gl_accounts = await upsertBatched('gl_accounts', glAccounts.map((a) => ({
+      id: idStr(a._id), code: a.code ?? null, name: a.name ?? null, type: a.type ?? null, subType: a.subType ?? null,
+      parentId: idStr(a.parentId), normalBalance: a.normalBalance ?? null, isSystemAccount: a.isSystemAccount ?? false,
+      systemKey: a.systemKey ?? null, linkedExpenseCategories: Array.isArray(a.linkedExpenseCategories) ? a.linkedExpenseCategories.map(String) : null,
+      isActive: a.isActive ?? true, balanceCache: a.balanceCache ?? 0, createdBy: idStr(a.createdBy),
+      createdAt: toDate(a.createdAt), updatedAt: toDate(a.updatedAt),
+    })));
+
+    // gl_accounts must exist before gl_journal_entries (lines[].accountId has no FK, but
+    // ap_bills/bank_statement_imports below do reference gl_accounts directly).
+    // gl_journal_entries self-references (reversedByEntryId/reversesEntryId) — inserted
+    // in createdAt order so a reversal (created after the entry it reverses) never lands
+    // before its target.
+    const glEntries = (await dbo.collection('gl_journal_entries').find({}).toArray())
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    counts.gl_journal_entries = await upsertBatched('gl_journal_entries', glEntries.map((e) => ({
+      id: idStr(e._id), entryNumber: e.entryNumber ?? null, date: toDate(e.date), description: e.description ?? null,
+      source: e.source ?? null, sourceModule: e.sourceModule ?? null, referenceId: idStr(e.referenceId), referenceModel: e.referenceModel ?? null,
+      lines: e.lines ? JSON.stringify(e.lines) : null, totalDebit: e.totalDebit ?? null, totalCredit: e.totalCredit ?? null,
+      status: e.status ?? null, reversedByEntryId: idStr(e.reversedByEntryId), reversesEntryId: idStr(e.reversesEntryId),
+      department: e.department ?? null, postedBy: idStr(e.postedBy), postedAt: toDate(e.postedAt), createdAt: toDate(e.createdAt),
+      updatedAt: toDate(e.updatedAt), // only reversed entries have this — see migration file's column comment
+    })));
+
+    const glPeriods = await dbo.collection('gl_accounting_periods').find({}).toArray();
+    counts.gl_accounting_periods = await upsertBatched('gl_accounting_periods', glPeriods.map((p) => ({
+      id: idStr(p._id), year: p.year ?? null, month: p.month ?? null, status: p.status ?? null,
+      closedAt: toDate(p.closedAt), closedBy: idStr(p.closedBy), createdAt: toDate(p.createdAt),
+    })));
+
+    const glPostingFailures = await dbo.collection('gl_posting_failures').find({}).toArray();
+    counts.gl_posting_failures = await upsertBatched('gl_posting_failures', glPostingFailures.map((f) => ({
+      id: idStr(f._id), source: f.source ?? null, sourceModule: f.sourceModule ?? null, referenceId: idStr(f.referenceId),
+      referenceModel: f.referenceModel ?? null, attemptedPayload: f.attemptedPayload ? JSON.stringify(f.attemptedPayload) : null,
+      error: f.error ?? null, resolved: f.resolved ?? false, resolvedAt: toDate(f.resolvedAt), resolvedBy: idStr(f.resolvedBy),
+      createdAt: toDate(f.createdAt),
+    })));
+
+    const arInvoices = await dbo.collection('ar_invoices').find({}).toArray();
+    counts.ar_invoices = await upsertBatched('ar_invoices', arInvoices.map((i) => ({
+      id: idStr(i._id), invoiceNumber: i.invoiceNumber ?? null, customerId: idStr(i.customerId), customerModel: i.customerModel ?? null,
+      customerSnapshot: i.customerSnapshot ? JSON.stringify(i.customerSnapshot) : null, items: i.items ? JSON.stringify(i.items) : null,
+      subtotal: i.subtotal ?? null, taxTotal: i.taxTotal ?? null, total: i.total ?? null, amountPaid: i.amountPaid ?? 0,
+      balanceDue: i.balanceDue ?? null, dueDate: toDate(i.dueDate), status: i.status ?? null, createdBy: idStr(i.createdBy),
+      createdAt: toDate(i.createdAt), updatedAt: toDate(i.updatedAt), sentAt: toDate(i.sentAt), paidAt: toDate(i.paidAt),
+    })));
+
+    // ar_invoices must exist before ar_payments (FK) — written above.
+    const arPayments = await dbo.collection('ar_payments').find({}).toArray();
+    counts.ar_payments = await upsertBatched('ar_payments', arPayments.map((p) => ({
+      id: idStr(p._id), invoiceId: idStr(p.invoiceId), amount: p.amount ?? null, method: p.method ?? null,
+      reference: p.reference ?? null, paidAt: toDate(p.paidAt), recordedBy: idStr(p.recordedBy), createdAt: toDate(p.createdAt),
+    })));
+
+    // gl_accounts must exist before ap_bills (FK expenseAccountId) — written above.
+    const apBills = await dbo.collection('ap_bills').find({}).toArray();
+    counts.ap_bills = await upsertBatched('ap_bills', apBills.map((b) => ({
+      id: idStr(b._id), billNumber: b.billNumber ?? null, vendorName: b.vendorName ?? null, expenseAccountId: idStr(b.expenseAccountId),
+      items: b.items ? JSON.stringify(b.items) : null, totalAmount: b.totalAmount ?? null, dueDate: toDate(b.dueDate),
+      scheduledPaymentDate: toDate(b.scheduledPaymentDate), status: b.status ?? null, approvedBy: idStr(b.approvedBy),
+      approvedAt: toDate(b.approvedAt), paidAt: toDate(b.paidAt), paymentMethod: b.paymentMethod ?? null,
+      paymentReference: b.paymentReference ?? null, createdBy: idStr(b.createdBy), createdAt: toDate(b.createdAt), updatedAt: toDate(b.updatedAt),
+    })));
+
+    // gl_accounts must exist before bank_statement_imports (FK) — written above.
+    const bankImports = await dbo.collection('bank_statement_imports').find({}).toArray();
+    counts.bank_statement_imports = await upsertBatched('bank_statement_imports', bankImports.map((i) => ({
+      id: idStr(i._id), accountId: idStr(i.accountId), filename: i.filename ?? null, importedBy: idStr(i.importedBy),
+      importedAt: toDate(i.importedAt), periodStart: toDate(i.periodStart), periodEnd: toDate(i.periodEnd),
+      openingBalance: i.openingBalance ?? null, closingBalance: i.closingBalance ?? null, lines: i.lines ? JSON.stringify(i.lines) : null,
+      status: i.status ?? null, reconciledAt: toDate(i.reconciledAt), reconciledBy: idStr(i.reconciledBy), createdAt: toDate(i.createdAt),
+    })));
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

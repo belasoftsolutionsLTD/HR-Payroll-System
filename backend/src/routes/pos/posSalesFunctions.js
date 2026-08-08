@@ -1,8 +1,10 @@
 // Postgres migration (Phase 6) — pos_sales/pos_vouchers/inventory_locations/
 // inventory_items/inventory_stock_movements are all Postgres now. `company_settings`
-// (used by getReceipt for branding) and `gl_journal_entries`/gl_accounts (via glEngine)
-// are still Mongo (Phase 7/10) — left untouched; referenceId there is stored as an
-// opaque string (never ObjectId-cast), so a Postgres pos_sales id round-trips fine.
+// (used by getReceipt for branding) is still Mongo (Phase 10) — left untouched.
+// gl_accounts/gl_journal_entries (via glEngine) became Postgres in Phase 7 — voidSale's
+// own direct gl_journal_entries lookup below was fixed then too (found while sweeping
+// Phase 7 for cross-cutting touches); referenceId there is stored as an opaque string
+// (never ObjectId-cast either way), so a Postgres pos_sales id round-trips fine regardless.
 // items/cartDiscount/payments are JSONB columns (whole-replaced), matching the
 // established "no $push/$pull found" convention used throughout this phase.
 const { knex, newId } = require('../../functions/Database/pgDBFunctions');
@@ -347,8 +349,8 @@ const voidSale = async (req, res) => {
   // Direct reuse of the reversal primitive — no bespoke logic needed. Never blocks the
   // void itself; a missing/already-reversed entry just gets queued for admin attention.
   try {
-    const saleEntry = await findOne('gl_journal_entries', { referenceId: sale.id, referenceModel: 'pos_sales', source: 'pos_sale', status: 'posted' });
-    if (saleEntry) await reverseJournalEntry(saleEntry._id, { reason: 'Sale voided', postedBy: req.user._id });
+    const saleEntry = await knex('gl_journal_entries').where({ referenceId: sale.id, referenceModel: 'pos_sales', source: 'pos_sale', status: 'posted' }).first();
+    if (saleEntry) await reverseJournalEntry(saleEntry.id, { reason: 'Sale voided', postedBy: req.user._id });
   } catch (err) {
     await logPostingFailure({ source: 'pos_sale_void', sourceModule: 'pos', referenceId: sale.id, referenceModel: 'pos_sales', attemptedPayload: {}, error: err });
   }

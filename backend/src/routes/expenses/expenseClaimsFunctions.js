@@ -2,6 +2,9 @@ const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
 const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
+// gl_accounts is Postgres now (Phase 7) — found while sweeping for cross-cutting
+// touches; expense_claims itself stays Mongo, its own future phase.
+const { knex: pgKnex } = require('../../functions/Database/pgDBFunctions');
 const path = require('path');
 const fs   = require('fs');
 const { createInboxItem, notifyHR, notifyManager } = require('../inbox/inboxFunctions');
@@ -603,10 +606,13 @@ const markReimbursed = async (req, res) => {
       department: claim.department || null, lines: [],
     };
     try {
-      const categoryAcct = await findOne('gl_accounts', { linkedExpenseCategories: claim.category, isActive: { $ne: false } });
+      const categoryAcct = await pgKnex('gl_accounts').whereRaw('? = ANY("linkedExpenseCategories")', [claim.category]).whereNot({ isActive: false }).first();
       const expenseAcct = categoryAcct || await resolveSystemAccount('other_expense');
       const paymentAcct = await resolveSystemAccount(resolvePaymentSystemKey(req.body.paymentMethod));
-      payload.lines = [{ accountId: expenseAcct._id, debit: claim.amount || 0 }, { accountId: paymentAcct._id, credit: claim.amount || 0 }];
+      // categoryAcct (fetched directly via knex, not through glEngine) only ever carries
+      // the plain Postgres `id`, not the Mongo-alias `_id` resolveSystemAccount's results
+      // have — fall back to `.id` so this works either way.
+      payload.lines = [{ accountId: expenseAcct._id || expenseAcct.id, debit: claim.amount || 0 }, { accountId: paymentAcct._id, credit: claim.amount || 0 }];
       if (claim.amount > 0) await postJournalEntry({ ...payload, postedBy: req.user?._id ?? null });
     } catch (err) {
       await logPostingFailure({ source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim._id, referenceModel: 'expense_claims', attemptedPayload: payload, error: err });

@@ -1,4 +1,7 @@
-const { findOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 7) — employees has been Postgres since Phase 1; this file
+// was still reading it off the Mongo helper (found while sweeping for Phase 7, same gap
+// as every other module's own accessLevel file before its phase).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD, STAFF } = require('../../constants/roles');
 
 // Accounting has its own access model layered on the app's 4 real roles, same convention
@@ -22,18 +25,22 @@ const getAccountingAccessLevel = async (user) => {
   if (user.role === HR_MANAGER) return 'bookkeeper';
   if (user.role === DEPT_HEAD) return 'viewer';
   if (user.role === STAFF && user.employeeId) {
-    const directReport = await findOne('employees', { managerId: user.employeeId }, { projection: { _id: 1 } });
+    const directReport = await knex('employees').where({ managerId: String(user.employeeId) }).select('id').first();
     if (directReport) return 'viewer';
   }
   return null;
 };
 
 // 'viewer'-level report scoping — matched by department. Admin/bookkeeper see everything
-// (null = no filter), same "null means unrestricted" convention used elsewhere.
+// (null = no filter), same "null means unrestricted" convention used elsewhere. gl_
+// journal_entries.lines is JSONB now (Phase 7) — callers that used to spread this
+// straight into a Mongo `$match` stage now use it as a plain department string to
+// compare against `elem->>'department'` in a raw jsonb_array_elements query instead
+// (see accountingReportsFunctions.js).
 const getAccountingDepartmentFilter = (user, level) => {
   if (level === 'admin' || level === 'bookkeeper') return null;
-  if (!user.department) return { 'lines.department': '__none__' }; // no department on file — see nothing
-  return { 'lines.department': user.department };
+  if (!user.department) return '__none__'; // no department on file — see nothing
+  return user.department;
 };
 
 module.exports = { getAccountingAccessLevel, getAccountingDepartmentFilter };

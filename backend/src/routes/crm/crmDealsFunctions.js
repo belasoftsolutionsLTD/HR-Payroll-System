@@ -1,19 +1,17 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 7) — crm_deals/crm_contacts/crm_pipelines are Postgres now.
+// pos_sales was already fixed in Phase 6 (kept as-is below).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-// pos_sales is Postgres now (Phase 6) — found while sweeping CRM; the rest of this
-// file's tables (crm_deals/crm_pipelines/crm_contacts) stay Mongo, CRM's own phase (7).
-const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getCrmAccessLevel, getScopedAssigneeIds, canAccessAssignee } = require('../../lib/crm/crmAccess');
 const { logSystemActivity } = require('./crmActivitiesFunctions');
 
 const enrichDeals = async (deals) => {
   if (!deals.length) return [];
-  const contactIds = [...new Set(deals.map((d) => String(d.contactId)))].map((id) => new ObjectId(id));
-  const contacts = await findMany('crm_contacts', { _id: { $in: contactIds } }, { projection: { firstName: 1, lastName: 1 } });
-  const contactMap = Object.fromEntries(contacts.map((c) => [String(c._id), c]));
-  return deals.map((d) => ({ ...d, contact: contactMap[String(d.contactId)] || null }));
+  const contactIds = [...new Set(deals.map((d) => d.contactId))];
+  const contacts = await knex('crm_contacts').whereIn('id', contactIds).select('id', 'firstName', 'lastName');
+  const contactMap = Object.fromEntries(contacts.map((c) => [c.id, c]));
+  return deals.map((d) => ({ ...d, contact: contactMap[d.contactId] || null }));
 };
 
 const listDeals = async (req, res) => {
@@ -26,30 +24,27 @@ const listDeals = async (req, res) => {
   // not a small page — a business realistically has dozens to low-hundreds of open
   // deals, not thousands, so one generous cap stands in for real pagination here.
   const limit = Math.min(parseInt(req.query.limit, 10) || 500, 500);
-  const filter = {};
-  if (scoped) filter.assignedTo = { $in: scoped };
-  if (req.query.pipelineId) filter.pipelineId = new ObjectId(req.query.pipelineId);
-  filter.status = req.query.status || 'open';
-  if (req.query.contactId) filter.contactId = new ObjectId(req.query.contactId);
+  let query = knex('crm_deals').where({ status: req.query.status || 'open' });
+  if (scoped) query = query.whereIn('assignedTo', scoped);
+  if (req.query.pipelineId) query = query.where({ pipelineId: req.query.pipelineId });
+  if (req.query.contactId) query = query.where({ contactId: req.query.contactId });
 
-  const [total, deals] = await Promise.all([
-    countDocuments('crm_deals', filter),
-    findMany('crm_deals', filter, { skip, limit, sort: { updatedAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const deals = await query.clone().orderBy('updatedAt', 'desc').limit(limit).offset(skip);
   const enriched = await enrichDeals(deals);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, total, page, limit));
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(enriched, Number(count), page, limit));
 };
 
 const getDeal = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const deal = await findOne('crm_deals', { _id: new ObjectId(req.params.id) });
+  const deal = await knex('crm_deals').where({ id: req.params.id }).first();
   if (!deal) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, deal.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
 
   const [contact, pipeline] = await Promise.all([
-    findOne('crm_contacts', { _id: deal.contactId }, { projection: { firstName: 1, lastName: 1, companyId: 1 } }),
-    findOne('crm_pipelines', { _id: deal.pipelineId }),
+    knex('crm_contacts').where({ id: deal.contactId }).select('firstName', 'lastName', 'companyId').first(),
+    knex('crm_pipelines').where({ id: deal.pipelineId }).first(),
   ]);
   return returnFunction(res, 200, true, req.locale.success, { ...deal, contact: contact || null, pipeline: pipeline || null });
 };
@@ -60,8 +55,8 @@ const createDeal = async (req, res) => {
   if (!validateRequiredFields(req, res, ['title', 'contactId', 'pipelineId'])) return;
 
   const [contact, pipeline] = await Promise.all([
-    findOne('crm_contacts', { _id: new ObjectId(req.body.contactId) }),
-    findOne('crm_pipelines', { _id: new ObjectId(req.body.pipelineId) }),
+    knex('crm_contacts').where({ id: req.body.contactId }).first(),
+    knex('crm_pipelines').where({ id: req.body.pipelineId }).first(),
   ]);
   if (!contact) return returnFunction(res, 404, false, 'Contact not found.');
   if (!pipeline) return returnFunction(res, 404, false, 'Pipeline not found.');
@@ -70,43 +65,46 @@ const createDeal = async (req, res) => {
   const stageId = req.body.stageId || pipeline.stages[0]?.id;
   if (!pipeline.stages.some((s) => s.id === stageId)) return returnFunction(res, 400, false, 'stageId does not belong to this pipeline.');
 
-  const assignedTo = req.body.assignedTo ? new ObjectId(req.body.assignedTo) : req.user._id;
-  if (level === 'staff' && String(assignedTo) !== String(req.user._id)) {
+  const assignedTo = req.body.assignedTo || req.user.id;
+  if (level === 'staff' && assignedTo !== req.user.id) {
     return returnFunction(res, 403, false, 'You can only create deals assigned to yourself.');
   }
 
   const doc = {
+    id: newId(),
     title: req.body.title.trim(),
-    contactId: contact._id,
+    contactId: contact.id,
     companyId: contact.companyId || null,
-    pipelineId: pipeline._id,
+    pipelineId: pipeline.id,
     stageId,
     value: Number(req.body.value) || 0,
     currency: req.body.currency || 'KES',
     expectedCloseDate: req.body.expectedCloseDate ? new Date(req.body.expectedCloseDate) : null,
-    nextAction: req.body.nextAction?.description ? { description: req.body.nextAction.description.trim(), dueDate: req.body.nextAction.dueDate ? new Date(req.body.nextAction.dueDate) : null } : null,
+    nextAction: req.body.nextAction?.description
+      ? JSON.stringify({ description: req.body.nextAction.description.trim(), dueDate: req.body.nextAction.dueDate ? new Date(req.body.nextAction.dueDate) : null })
+      : null,
     assignedTo,
     status: 'open',
     wonAt: null, lostAt: null, confirmedSaleId: null,
-    customFieldValues: req.body.customFieldValues && typeof req.body.customFieldValues === 'object' ? req.body.customFieldValues : {},
-    createdBy: req.user._id,
+    customFieldValues: JSON.stringify(req.body.customFieldValues && typeof req.body.customFieldValues === 'object' ? req.body.customFieldValues : {}),
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('crm_deals', doc);
+  const [saved] = await knex('crm_deals').insert(doc).returning('*');
 
   await logSystemActivity({
-    contactId: contact._id, dealId: result.insertedId, type: 'deal_created',
-    subject: `Deal "${doc.title}" created`, performedBy: req.user._id, performedByName: req.user.name,
+    contactId: contact.id, dealId: saved.id, type: 'deal_created',
+    subject: `Deal "${saved.title}" created`, performedBy: req.user.id, performedByName: req.user.name,
   });
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateDeal = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const deal = await findOne('crm_deals', { _id: new ObjectId(req.params.id) });
+  const deal = await knex('crm_deals').where({ id: req.params.id }).first();
   if (!deal) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, deal.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
 
@@ -117,12 +115,12 @@ const updateDeal = async (req, res) => {
   if (req.body.expectedCloseDate !== undefined) update.expectedCloseDate = req.body.expectedCloseDate ? new Date(req.body.expectedCloseDate) : null;
   if (req.body.nextAction !== undefined) {
     update.nextAction = req.body.nextAction?.description
-      ? { description: req.body.nextAction.description.trim(), dueDate: req.body.nextAction.dueDate ? new Date(req.body.nextAction.dueDate) : null }
+      ? JSON.stringify({ description: req.body.nextAction.description.trim(), dueDate: req.body.nextAction.dueDate ? new Date(req.body.nextAction.dueDate) : null })
       : null;
   }
-  if (req.body.customFieldValues && typeof req.body.customFieldValues === 'object') update.customFieldValues = req.body.customFieldValues;
+  if (req.body.customFieldValues && typeof req.body.customFieldValues === 'object') update.customFieldValues = JSON.stringify(req.body.customFieldValues);
 
-  await updateOne('crm_deals', { _id: deal._id }, { $set: update });
+  await knex('crm_deals').where({ id: deal.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -133,21 +131,21 @@ const moveDealStage = async (req, res) => {
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   if (!validateRequiredFields(req, res, ['stageId'])) return;
 
-  const deal = await findOne('crm_deals', { _id: new ObjectId(req.params.id) });
+  const deal = await knex('crm_deals').where({ id: req.params.id }).first();
   if (!deal) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, deal.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
   if (deal.status !== 'open') return returnFunction(res, 400, false, 'This deal is already closed.');
 
-  const pipeline = await findOne('crm_pipelines', { _id: deal.pipelineId });
+  const pipeline = await knex('crm_pipelines').where({ id: deal.pipelineId }).first();
   const fromStage = pipeline?.stages.find((s) => s.id === deal.stageId);
   const toStage = pipeline?.stages.find((s) => s.id === req.body.stageId);
   if (!toStage) return returnFunction(res, 400, false, 'stageId does not belong to this deal\'s pipeline.');
 
-  await updateOne('crm_deals', { _id: deal._id }, { $set: { stageId: toStage.id, updatedAt: new Date() } });
+  await knex('crm_deals').where({ id: deal.id }).update({ stageId: toStage.id, updatedAt: new Date() });
   await logSystemActivity({
-    contactId: deal.contactId, dealId: deal._id, type: 'stage_change',
+    contactId: deal.contactId, dealId: deal.id, type: 'stage_change',
     subject: `Deal "${deal.title}" moved from ${fromStage?.name ?? '—'} to ${toStage.name}`,
-    performedBy: req.user._id, performedByName: req.user.name,
+    performedBy: req.user.id, performedByName: req.user.name,
   });
 
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
@@ -159,7 +157,7 @@ const moveDealStage = async (req, res) => {
 const winDeal = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const deal = await findOne('crm_deals', { _id: new ObjectId(req.params.id) });
+  const deal = await knex('crm_deals').where({ id: req.params.id }).first();
   if (!deal) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, deal.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
   if (deal.status !== 'open') return returnFunction(res, 400, false, 'This deal is already closed.');
@@ -172,16 +170,16 @@ const winDeal = async (req, res) => {
     confirmedSaleId = sale.id;
   }
 
-  const pipeline = await findOne('crm_pipelines', { _id: deal.pipelineId });
+  const pipeline = await knex('crm_pipelines').where({ id: deal.pipelineId }).first();
   const wonStage = pipeline?.stages.find((s) => s.isWon);
 
-  await updateOne('crm_deals', { _id: deal._id }, {
-    $set: { status: 'won', wonAt: new Date(), confirmedSaleId, stageId: wonStage?.id || deal.stageId, updatedAt: new Date() },
+  await knex('crm_deals').where({ id: deal.id }).update({
+    status: 'won', wonAt: new Date(), confirmedSaleId, stageId: wonStage?.id || deal.stageId, updatedAt: new Date(),
   });
   await logSystemActivity({
-    contactId: deal.contactId, dealId: deal._id, type: 'deal_won',
+    contactId: deal.contactId, dealId: deal.id, type: 'deal_won',
     subject: `Deal "${deal.title}" won${confirmedSaleId ? ' — confirmed against a POS sale' : ''}`,
-    performedBy: req.user._id, performedByName: req.user.name,
+    performedBy: req.user.id, performedByName: req.user.name,
   });
 
   return returnFunction(res, 200, true, 'Deal marked as won.');
@@ -190,21 +188,21 @@ const winDeal = async (req, res) => {
 const loseDeal = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const deal = await findOne('crm_deals', { _id: new ObjectId(req.params.id) });
+  const deal = await knex('crm_deals').where({ id: req.params.id }).first();
   if (!deal) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, deal.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
   if (deal.status !== 'open') return returnFunction(res, 400, false, 'This deal is already closed.');
 
-  const pipeline = await findOne('crm_pipelines', { _id: deal.pipelineId });
+  const pipeline = await knex('crm_pipelines').where({ id: deal.pipelineId }).first();
   const lostStage = pipeline?.stages.find((s) => s.isLost);
 
-  await updateOne('crm_deals', { _id: deal._id }, {
-    $set: { status: 'lost', lostAt: new Date(), lostReason: req.body.reason || null, stageId: lostStage?.id || deal.stageId, updatedAt: new Date() },
+  await knex('crm_deals').where({ id: deal.id }).update({
+    status: 'lost', lostAt: new Date(), lostReason: req.body.reason || null, stageId: lostStage?.id || deal.stageId, updatedAt: new Date(),
   });
   await logSystemActivity({
-    contactId: deal.contactId, dealId: deal._id, type: 'deal_lost',
+    contactId: deal.contactId, dealId: deal.id, type: 'deal_lost',
     subject: `Deal "${deal.title}" lost${req.body.reason ? `: ${req.body.reason}` : ''}`,
-    performedBy: req.user._id, performedByName: req.user.name,
+    performedBy: req.user.id, performedByName: req.user.name,
   });
 
   return returnFunction(res, 200, true, 'Deal marked as lost.');
@@ -215,11 +213,11 @@ const reassignDeal = async (req, res) => {
   if (level !== 'admin' && level !== 'manager') return returnFunction(res, 403, false, 'Not authorized to reassign deals.');
   if (!validateRequiredFields(req, res, ['assignedTo'])) return;
 
-  const deal = await findOne('crm_deals', { _id: new ObjectId(req.params.id) });
+  const deal = await knex('crm_deals').where({ id: req.params.id }).first();
   if (!deal) return returnFunction(res, 404, false, req.locale.notFound);
   if (!(await canAccessAssignee(req.user, level, deal.assignedTo))) return returnFunction(res, 403, false, 'Not authorized.');
 
-  await updateOne('crm_deals', { _id: deal._id }, { $set: { assignedTo: new ObjectId(req.body.assignedTo), updatedAt: new Date() } });
+  await knex('crm_deals').where({ id: deal.id }).update({ assignedTo: req.body.assignedTo, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 

@@ -1,20 +1,20 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 7) — crm_custom_field_defs is Postgres now.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne } = require('../../functions/Database/commonDBFunctions');
 const { getCrmAccessLevel } = require('../../lib/crm/crmAccess');
 
-// Same field-def-collection pattern as Inventory's item custom fields (name + fieldType
-// + options, values stored on the record keyed by this doc's _id) — reused here for
+// Same field-def-table pattern as Inventory's item custom fields (name + fieldType
+// + options, values stored on the record keyed by this doc's id) — reused here for
 // contacts, companies, AND deals via the `appliesTo` discriminator, configurable by
 // super_admin/hr_manager without a code change, per the module spec.
 
 const listCustomFieldDefs = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const filter = { isActive: { $ne: false } };
-  if (req.query.appliesTo) filter.appliesTo = req.query.appliesTo;
-  const defs = await findMany('crm_custom_field_defs', filter, { sort: { name: 1 } });
+  let query = knex('crm_custom_field_defs').whereNot({ isActive: false });
+  if (req.query.appliesTo) query = query.where({ appliesTo: req.query.appliesTo });
+  const defs = await query.orderBy('name');
   return returnFunction(res, 200, true, req.locale.success, defs);
 };
 
@@ -29,6 +29,7 @@ const createCustomFieldDef = async (req, res) => {
     return returnFunction(res, 400, false, "appliesTo must be 'contact', 'company', or 'deal'.");
   }
   const doc = {
+    id: newId(),
     name: req.body.name.trim(),
     fieldType: req.body.fieldType,
     appliesTo: req.body.appliesTo,
@@ -37,8 +38,8 @@ const createCustomFieldDef = async (req, res) => {
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('crm_custom_field_defs', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('crm_custom_field_defs').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateCustomFieldDef = async (req, res) => {
@@ -48,14 +49,14 @@ const updateCustomFieldDef = async (req, res) => {
   if (req.body.name !== undefined) update.name = req.body.name.trim();
   if (Array.isArray(req.body.options)) update.options = req.body.options.map(String);
   if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
-  await updateOne('crm_custom_field_defs', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('crm_custom_field_defs').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deleteCustomFieldDef = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (level !== 'admin') return returnFunction(res, 403, false, 'Not authorized.');
-  await updateOne('crm_custom_field_defs', { _id: new ObjectId(req.params.id) }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('crm_custom_field_defs').where({ id: req.params.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully || 'Deleted successfully.');
 };
 

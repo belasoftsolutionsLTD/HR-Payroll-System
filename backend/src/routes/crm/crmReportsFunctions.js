@@ -1,17 +1,12 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 7) — crm_pipelines/crm_deals/crm_contacts/crm_activities/
+// crm_feedback are all Postgres now.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
-const { findOne, findMany } = require('../../functions/Database/commonDBFunctions');
 const { getCrmAccessLevel, getScopedAssigneeIds } = require('../../lib/crm/crmAccess');
 
-const buildAssigneeFilter = async (req, level) => {
-  const filter = {};
-  if (req.query.assignedTo) {
-    filter.assignedTo = new ObjectId(req.query.assignedTo);
-  } else {
-    const scoped = await getScopedAssigneeIds(req.user, level);
-    if (scoped) filter.assignedTo = { $in: scoped };
-  }
-  return filter;
+const resolveAssigneeIds = async (req, level) => {
+  if (req.query.assignedTo) return [req.query.assignedTo];
+  return getScopedAssigneeIds(req.user, level); // array, or null = unrestricted
 };
 
 // Pipeline value by stage, win rate, average deal size, average time-to-close — the
@@ -21,11 +16,13 @@ const getPipelineReport = async (req, res) => {
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   if (!req.query.pipelineId) return returnFunction(res, 400, false, 'pipelineId is required.');
 
-  const pipeline = await findOne('crm_pipelines', { _id: new ObjectId(req.query.pipelineId) });
+  const pipeline = await knex('crm_pipelines').where({ id: req.query.pipelineId }).first();
   if (!pipeline) return returnFunction(res, 404, false, 'Pipeline not found.');
 
-  const filter = { ...(await buildAssigneeFilter(req, level)), pipelineId: pipeline._id };
-  const deals = await findMany('crm_deals', filter, {});
+  let query = knex('crm_deals').where({ pipelineId: pipeline.id });
+  const assigneeIds = await resolveAssigneeIds(req, level);
+  if (assigneeIds) query = query.whereIn('assignedTo', assigneeIds);
+  const deals = await query;
 
   const openDeals = deals.filter((d) => d.status === 'open');
   const wonDeals = deals.filter((d) => d.status === 'won');
@@ -60,19 +57,16 @@ const getActivityReport = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = {};
+  let query = knex('crm_activities');
   const scoped = await getScopedAssigneeIds(req.user, level);
-  if (scoped) filter.performedBy = { $in: scoped };
-  if (req.query.startDate || req.query.endDate) {
-    filter.createdAt = {};
-    if (req.query.startDate) filter.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) filter.createdAt.$lte = new Date(req.query.endDate);
-  }
+  if (scoped) query = query.whereIn('performedBy', scoped);
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
 
-  const activities = await findMany('crm_activities', filter, {});
+  const activities = await query;
   const byStaff = {};
   for (const a of activities) {
-    const key = String(a.performedBy);
+    const key = a.performedBy;
     byStaff[key] ??= { staffId: a.performedBy, staffName: a.performedByName, calls: 0, emails: 0, meetings: 0, notes: 0, tasksCompleted: 0 };
     if (a.type === 'call') byStaff[key].calls++;
     else if (a.type === 'email') byStaff[key].emails++;
@@ -92,15 +86,16 @@ const getSourceEffectivenessReport = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const contactFilter = await buildAssigneeFilter(req, level);
-  const contacts = await findMany('crm_contacts', { ...contactFilter, isActive: { $ne: false } }, { projection: { source: 1 } });
-  const contactIds = contacts.map((c) => c._id);
-  const deals = contactIds.length ? await findMany('crm_deals', { contactId: { $in: contactIds } }, { projection: { contactId: 1, status: 1, value: 1 } }) : [];
+  let contactQuery = knex('crm_contacts').whereNot({ isActive: false });
+  const assigneeIds = await resolveAssigneeIds(req, level);
+  if (assigneeIds) contactQuery = contactQuery.whereIn('assignedTo', assigneeIds);
+  const contacts = await contactQuery.select('id', 'source');
+  const contactIds = contacts.map((c) => c.id);
+  const deals = contactIds.length ? await knex('crm_deals').whereIn('contactId', contactIds).select('contactId', 'status', 'value') : [];
 
   const dealsByContact = {};
   for (const d of deals) {
-    const key = String(d.contactId);
-    (dealsByContact[key] ??= []).push(d);
+    (dealsByContact[d.contactId] ??= []).push(d);
   }
 
   const bySource = {};
@@ -108,7 +103,7 @@ const getSourceEffectivenessReport = async (req, res) => {
     const key = c.source || 'other';
     bySource[key] ??= { source: key, contactCount: 0, wonContactCount: 0, wonValue: 0 };
     bySource[key].contactCount += 1;
-    const cDeals = dealsByContact[String(c._id)] || [];
+    const cDeals = dealsByContact[c.id] || [];
     const wonDeals = cDeals.filter((d) => d.status === 'won');
     if (wonDeals.length) {
       bySource[key].wonContactCount += 1;
@@ -130,11 +125,11 @@ const getFeedbackSummary = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = {};
+  let query = knex('crm_feedback');
   const scoped = await getScopedAssigneeIds(req.user, level);
-  if (scoped) filter.loggedBy = { $in: scoped };
+  if (scoped) query = query.whereIn('loggedBy', scoped);
 
-  const feedback = await findMany('crm_feedback', filter, {});
+  const feedback = await query;
   const avgRating = feedback.length ? Math.round((feedback.reduce((s, f) => s + f.rating, 0) / feedback.length) * 10) / 10 : 0;
   const distribution = [1, 2, 3, 4, 5].map((rating) => ({ rating, count: feedback.filter((f) => f.rating === rating).length }));
 
@@ -150,18 +145,20 @@ const exportDealsCSV = async (req, res) => {
   const level = await getCrmAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
 
-  const filter = await buildAssigneeFilter(req, level);
-  if (req.query.pipelineId) filter.pipelineId = new ObjectId(req.query.pipelineId);
-  if (req.query.status) filter.status = req.query.status;
+  let query = knex('crm_deals');
+  const assigneeIds = await resolveAssigneeIds(req, level);
+  if (assigneeIds) query = query.whereIn('assignedTo', assigneeIds);
+  if (req.query.pipelineId) query = query.where({ pipelineId: req.query.pipelineId });
+  if (req.query.status) query = query.where({ status: req.query.status });
 
-  const deals = await findMany('crm_deals', filter, { sort: { createdAt: -1 } });
-  const contactIds = [...new Set(deals.map((d) => String(d.contactId)))].map((id) => new ObjectId(id));
-  const contacts = await findMany('crm_contacts', { _id: { $in: contactIds } }, { projection: { firstName: 1, lastName: 1 } });
-  const contactMap = Object.fromEntries(contacts.map((c) => [String(c._id), c]));
+  const deals = await query.orderBy('createdAt', 'desc');
+  const contactIds = [...new Set(deals.map((d) => d.contactId))];
+  const contacts = await knex('crm_contacts').whereIn('id', contactIds).select('id', 'firstName', 'lastName');
+  const contactMap = Object.fromEntries(contacts.map((c) => [c.id, c]));
 
   const header = 'Title,Contact,Value,Currency,Status,ExpectedCloseDate,CreatedAt,WonAt,LostAt';
   const rows = deals.map((d) => {
-    const contact = contactMap[String(d.contactId)];
+    const contact = contactMap[d.contactId];
     return [
       d.title, contact ? `${contact.firstName} ${contact.lastName}`.trim() : '', d.value, d.currency, d.status,
       d.expectedCloseDate ? new Date(d.expectedCloseDate).toISOString().split('T')[0] : '',

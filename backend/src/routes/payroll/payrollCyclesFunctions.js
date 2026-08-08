@@ -823,7 +823,10 @@ async function doCloseCycleInternal(req, res, cycle) {
   // employer contributions are not separately booked as GL liabilities in v1 — everything
   // nets through at the net-pay figure). Never blocks the close itself. Lines are split
   // per department so a department_head's 'viewer' reports scope correctly later.
-  // GL accounting (gl_accounts/gl_journal_entries) is unmigrated — stays Mongo.
+  // GL accounting (gl_accounts/gl_journal_entries) is Postgres now (Phase 7) — this
+  // block only ever went through glEngine's postJournalEntry/resolveSystemAccount
+  // exports, whose call signature and return shape were kept identical across that
+  // rewrite, so nothing here needed to change (verified live, not just assumed).
   {
     const employeeIds = [...new Set(results.map((r) => r.employeeId))];
     const employees = employeeIds.length ? await knex('employees').whereIn('id', employeeIds).select('id', 'department') : [];
