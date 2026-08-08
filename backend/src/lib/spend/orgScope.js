@@ -1,4 +1,12 @@
-const { findOne, findMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 8) — employees has been Postgres since Phase 1;
+// purchase_requests/expense_claims are Postgres now too. buildSpendScopeFilter's return
+// shape changed from a raw Mongo filter fragment (spread straight into a `filter`
+// object) to a normalized `{department}` | `{employeeIds}` | null shape — a knex query
+// builder has no `{...filter}` shorthand equivalent to Mongo's, so every call site now
+// applies this explicitly via `.where()`/`.whereIn()` instead of a spread. This also
+// sidesteps the "async helper returns a query builder" trap found in Phase 6
+// (posReportsFunctions.js) — this helper only ever returns plain data, never a builder.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD } = require('../../constants/roles');
 
 // Spend Management (Expenses + Procurement) has no "manager" role in this app — only
@@ -16,11 +24,16 @@ const getRequesterContext = async (req) => {
   const isHR = [SUPER_ADMIN, HR_MANAGER].includes(role);
   const isDeptHead = role === DEPT_HEAD;
   const employee = req.user?.employeeId
-    ? await findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1, managerId: 1 } })
+    ? await knex('employees').where({ id: String(req.user.employeeId) }).select('department', 'managerId').first()
     : null;
   return {
     role, isHR, isDeptHead,
-    employeeId: req.user?.employeeId ?? null,
+    // req.user.employeeId is a Mongo ObjectId instance (AuthMiddleware.js's backward-
+    // compat alias for not-yet-migrated modules) — String() it here so every caller
+    // downstream (buildSpendScopeFilter's employeeIds array, whereIn/insert values)
+    // gets a plain string, not an object that knex would JSON.stringify into "<hex>"
+    // (quotes included) and silently fail to match anything.
+    employeeId: req.user?.employeeId ? String(req.user.employeeId) : null,
     department: employee?.department ?? null,
   };
 };
@@ -28,22 +41,22 @@ const getRequesterContext = async (req) => {
 // Employee ids who report directly to this employeeId, via employees.managerId.
 const getDirectReportIds = async (employeeId) => {
   if (!employeeId) return [];
-  const reports = await findMany('employees', { managerId: employeeId }, { projection: { _id: 1 } });
-  return reports.map((r) => r._id);
+  const reports = await knex('employees').where({ managerId: String(employeeId) }).select('id');
+  return reports.map((r) => r.id);
 };
 
-// Scopes a list query on a spend-management collection keyed by `employeeId` (and,
-// for department-level access, a `department` string field on the same document).
-// HR/super_admin: unrestricted. department_head: their department only. Anyone who
+// Scopes a list query on a spend-management table keyed by `employeeId` (and, for
+// department-level access, a `department` string column on the same table). HR/
+// super_admin: unrestricted (null). department_head: their department only. Anyone who
 // has direct reports (checked via the employees chain, not a role): those reports'
 // records plus their own. Everyone else: their own records only.
 const buildSpendScopeFilter = async (req) => {
   const ctx = await getRequesterContext(req);
-  if (ctx.isHR) return {};
+  if (ctx.isHR) return null;
   if (ctx.isDeptHead) return { department: ctx.department };
   const reportIds = await getDirectReportIds(ctx.employeeId);
-  if (reportIds.length) return { employeeId: { $in: [...reportIds, ctx.employeeId] } };
-  return { employeeId: ctx.employeeId };
+  if (reportIds.length) return { employeeIds: [...reportIds, ctx.employeeId] };
+  return { employeeIds: [ctx.employeeId] };
 };
 
 // Whether this requester may view/act on a single record belonging to `recordEmployeeId`
@@ -60,7 +73,7 @@ const canAccessRecord = async (req, recordEmployeeId, recordDepartment) => {
 // Whether this requester is the direct manager of recordEmployeeId (level-1 approval).
 const isDirectManagerOf = async (req, recordEmployeeId) => {
   if (!req.user?.employeeId || !recordEmployeeId) return false;
-  const employee = await findOne('employees', { _id: recordEmployeeId }, { projection: { managerId: 1 } });
+  const employee = await knex('employees').where({ id: String(recordEmployeeId) }).select('managerId').first();
   return !!employee?.managerId && String(employee.managerId) === String(req.user.employeeId);
 };
 

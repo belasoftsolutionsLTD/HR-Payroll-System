@@ -1,4 +1,3 @@
-const { ObjectId } = require('mongodb');
 const returnFunction = require('../../functions/returnFunction');
 const { findOne, findMany, countDocuments } = require('../../functions/Database/commonDBFunctions');
 // Postgres migration (see /home/carole/.claude/plans/abundant-dreaming-flurry.md) —
@@ -23,7 +22,7 @@ const getDashboardSummary = async (req, res) => {
 
     const [balances, pendingExpenses, goals] = await Promise.all([
       empId ? pgDB.findMany('leave_balances', { employeeId: empId, year }) : [],
-      empId ? countDocuments('expense_claims', { employeeId: new ObjectId(empId), status: 'submitted' }) : 0,
+      empId ? pgDB.knex('expense_claims').where({ employeeId: empId, status: 'submitted' }).count('* as count').first().then((r) => Number(r.count)) : 0,
       empId ? pgDB.knex('goals').where({ employeeId: empId }).whereIn('status', ['at_risk', 'behind']).count('* as count').then(([r]) => Number(r.count)) : 0,
     ]);
 
@@ -49,7 +48,10 @@ const getDashboardSummary = async (req, res) => {
       pgDB.knex('employees').where({ status: 'active' }).modify((qb) => { if (dept) qb.where({ department: dept }); }).count('* as count').first().then(r => Number(r.count)),
       teamIds.length ? pgDB.knex('leave_requests').whereIn('employeeId', teamIds).where({ status: 'approved' }).where('startDate', '<=', now).where('endDate', '>=', now).count('* as count').first().then(r => Number(r.count)) : 0,
       teamIds.length ? pgDB.knex('leave_requests').whereIn('employeeId', teamIds).where({ status: 'pending' }).count('* as count').first().then(r => Number(r.count)) : 0,
-      countDocuments('expense_claims', { status: 'pending' }),
+      // 'pending' is not a real expense_claims status (submitted/approved/rejected/
+      // disputed/reimbursed) — this always resolved to 0 pre-migration too; preserved
+      // as-is rather than silently changed, same posture as the payrollStatus note below.
+      pgDB.knex('expense_claims').where({ status: 'pending' }).count('* as count').first().then((r) => Number(r.count)),
     ]);
 
     // Missing clock-in (active team members with no attendance record today)

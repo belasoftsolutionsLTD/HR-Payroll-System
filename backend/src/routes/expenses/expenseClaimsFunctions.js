@@ -1,12 +1,8 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 8) — expense_claims/expense_policies are Postgres now.
+// employees/users have been Postgres since Phase 1; gl_accounts since Phase 7.
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findMany, findOne, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-// gl_accounts is Postgres now (Phase 7) — found while sweeping for cross-cutting
-// touches; expense_claims itself stays Mongo, its own future phase.
-const { knex: pgKnex } = require('../../functions/Database/pgDBFunctions');
-const path = require('path');
-const fs   = require('fs');
 const { createInboxItem, notifyHR, notifyManager } = require('../inbox/inboxFunctions');
 const { notifyEmployee, notifyByRoles, notifyUser } = require('../../functions/HR/notifyUser');
 const { buildApprovalChain, findCurrentLevelEntry, canActOnLevel } = require('../../lib/spend/approvalChain');
@@ -24,43 +20,42 @@ const COMPANY_NAME = process.env.COMPANY_NAME || 'School ERP';
 
 const listClaims = async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const isHR       = ['super_admin','hr_manager'].includes(req.user?.role);
+  const isHR       = ['super_admin', 'hr_manager'].includes(req.user?.role);
   const isDeptHead = req.user?.role === 'department_head';
   const showAll    = req.query.all === 'true';
-  const filter = {};
+  let query = knex('expense_claims');
 
   if (isHR) {
     // HR sees all — no employeeId filter
   } else if (showAll && isDeptHead) {
     // Dept head on Team Expenses tab: show their whole department
     const deptRecord = req.user?.employeeId
-      ? await findOne('employees', { _id: new ObjectId(req.user.employeeId) }, { projection: { department: 1 } })
+      ? await knex('employees').where({ id: String(req.user.employeeId) }).select('department').first()
       : null;
     if (deptRecord?.department) {
-      filter.department = deptRecord.department;
+      query = query.where({ department: deptRecord.department });
     } else {
       return returnFunction(res, 200, true, req.locale.success, { data: [], total: 0, page: 1, totalPages: 0, stats: null });
     }
   } else if (showAll && req.user?.employeeId) {
     // "Team" tab for anyone with direct reports (employees.managerId) — not a role,
     // a relationship. Falls back to own-only if this requester manages no one.
-    const reportIds = await getDirectReportIds(new ObjectId(req.user.employeeId));
-    filter.employeeId = { $in: [...reportIds, new ObjectId(req.user.employeeId)] };
+    const myId = String(req.user.employeeId);
+    const reportIds = await getDirectReportIds(myId);
+    query = query.whereIn('employeeId', [...reportIds, myId]);
   } else {
-    filter.employeeId = req.user?.employeeId ? new ObjectId(req.user.employeeId) : null;
+    query = query.where({ employeeId: req.user?.employeeId ? String(req.user.employeeId) : '__none__' });
   }
-  if (req.query.status)     filter.status     = req.query.status;
-  if (req.query.type)       filter.type       = req.query.type;
-  if (req.query.category)   filter.category   = req.query.category;
-  if (req.query.employeeId && isHR) filter.employeeId = new ObjectId(req.query.employeeId);
+  if (req.query.status)   query = query.where({ status: req.query.status });
+  if (req.query.type)     query = query.where({ type: req.query.type });
+  if (req.query.category) query = query.where({ category: req.query.category });
+  if (req.query.employeeId && isHR) query = query.where({ employeeId: req.query.employeeId });
 
-  const [total, data] = await Promise.all([
-    countDocuments('expense_claims', filter),
-    findMany('expense_claims', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
+  const [{ count }] = await query.clone().count('* as count');
+  const data = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
 
-  const enriched = await Promise.all(data.map(async c => {
-    const emp = await findOne('employees', { _id: c.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const enriched = await Promise.all(data.map(async (c) => {
+    const emp = await knex('employees').where({ id: c.employeeId }).select('fullName', 'staffNumber', 'department').first();
     return { ...c, employee: emp ?? null };
   }));
 
@@ -68,36 +63,36 @@ const listClaims = async (req, res) => {
   let stats = null;
   if (isHR) {
     const now = new Date(); const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const [pendingCount, pendingTotal, thisMonthApproved, violations] = await Promise.all([
-      countDocuments('expense_claims', { status: 'submitted' }),
-      global.dbo.collection('expense_claims').aggregate([{ $match: { status: 'submitted' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]).toArray(),
-      global.dbo.collection('expense_claims').aggregate([{ $match: { status: 'approved', approvedAt: { $gte: startOfMonth } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]).toArray(),
-      countDocuments('expense_claims', { isPolicyViolation: true }),
+    const [[{ count: pendingCount }], [{ total: pendingTotal }], [{ total: approvedTotal, count: approvedCount }], [{ count: violations }]] = await Promise.all([
+      knex('expense_claims').where({ status: 'submitted' }).count('* as count'),
+      knex('expense_claims').where({ status: 'submitted' }).sum('amount as total'),
+      knex('expense_claims').where({ status: 'approved' }).where('approvedAt', '>=', startOfMonth).sum('amount as total').count('* as count'),
+      knex('expense_claims').where({ isPolicyViolation: true }).count('* as count'),
     ]);
     stats = {
-      pendingCount,
-      pendingTotal:   pendingTotal[0]?.total ?? 0,
-      approvedCount:  thisMonthApproved[0]?.count ?? 0,
-      approvedTotal:  thisMonthApproved[0]?.total ?? 0,
-      violations,
+      pendingCount: Number(pendingCount),
+      pendingTotal: Number(pendingTotal) || 0,
+      approvedCount: Number(approvedCount),
+      approvedTotal: Number(approvedTotal) || 0,
+      violations: Number(violations),
     };
   }
 
-  return returnFunction(res, 200, true, req.locale.success, { ...paginatedResponse(enriched, total, page, limit), stats });
+  return returnFunction(res, 200, true, req.locale.success, { ...paginatedResponse(enriched, Number(count), page, limit), stats });
 };
 
 // ── Get Single ────────────────────────────────────────────────────────────────
 
 const getClaim = async (req, res) => {
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
-  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
   if (!isHR && String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
-  const emp = await findOne('employees', { _id: claim.employeeId }, { projection: { fullName: 1, staffNumber: 1, department: 1 } });
+  const emp = await knex('employees').where({ id: claim.employeeId }).select('fullName', 'staffNumber', 'department').first();
   return returnFunction(res, 200, true, req.locale.success, { ...claim, employee: emp ?? null });
 };
 
-// ── Submit Claim (all 3 types) ────────────────────────────────────────────────
+// ── Submit Claim (all 4 types) ────────────────────────────────────────────────
 
 const submitClaim = async (req, res) => {
   if (!validateRequiredFields(req, res, ['type'])) return;
@@ -105,16 +100,18 @@ const submitClaim = async (req, res) => {
           destination, startDate, endDate, fromLocation, toLocation, distanceKm, isRoundTrip,
           projectId, isBillable, items } = req.body;
 
-  if (!['regular','per_diem','mileage','itemized'].includes(type)) return returnFunction(res, 400, false, 'Invalid expense type.');
+  if (!['regular', 'per_diem', 'mileage', 'itemized'].includes(type)) return returnFunction(res, 400, false, 'Invalid expense type.');
 
-  const employeeId = req.user?.employeeId;
+  // req.user.employeeId is a Mongo ObjectId instance (AuthMiddleware.js's backward-
+  // compat alias) — String() it before it's inserted as a plain-text FK value below.
+  const employeeId = req.user?.employeeId ? String(req.user.employeeId) : null;
   if (!employeeId) {
     return returnFunction(res, 400, false, 'Your account is not linked to an employee profile. Ask your HR admin to create an employee record for you and link it to your account.');
   }
 
   // Resolve the applicable policy for this employee — most specific targeting wins
   // (employeeId > role > department), falling back to the org's default policy.
-  const employeeDoc = await findOne('employees', { _id: new ObjectId(employeeId) }, { projection: { department: 1 } });
+  const employeeDoc = await knex('employees').where({ id: employeeId }).select('department').first();
   const policy = await resolvePolicy('expense_policies', {
     employeeId, role: req.user?.role, department: employeeDoc?.department,
   }) ?? {};
@@ -126,7 +123,7 @@ const submitClaim = async (req, res) => {
   if (type === 'per_diem') {
     if (!destination || !startDate || !endDate) return returnFunction(res, 400, false, 'Per diem requires destination, startDate, endDate.');
     days = Math.ceil((new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24)) + 1;
-    const rate = policy.perDiemRates?.find(r => r.location?.toLowerCase() === destination?.toLowerCase())?.rate ?? policy.defaultPerDiemRate ?? 3000;
+    const rate = policy.perDiemRates?.find((r) => r.location?.toLowerCase() === destination?.toLowerCase())?.rate ?? policy.defaultPerDiemRate ?? 3000;
     finalAmount = days * rate;
   }
 
@@ -140,7 +137,7 @@ const submitClaim = async (req, res) => {
   if (type === 'itemized') {
     if (!Array.isArray(items) || !items.length) return returnFunction(res, 400, false, 'Add at least one line item.');
     lineItems = items.map((it) => ({
-      id: it.id || new ObjectId().toString(),
+      id: it.id || newId(),
       categoryId: it.categoryId || '',
       categoryName: it.categoryName || it.categoryId || 'Other',
       description: it.description || '',
@@ -165,12 +162,12 @@ const submitClaim = async (req, res) => {
 
   // Policy violation check (single-item types)
   let isPolicyViolation = false;
-  let violationReason   = null;
+  let violationReason = null;
   if (type === 'regular' && category) {
-    const catLimit = policy.categoryLimits?.find(l => l.category === category);
+    const catLimit = policy.categoryLimits?.find((l) => l.category === category);
     if (catLimit?.maxPerClaim && finalAmount > catLimit.maxPerClaim) {
       isPolicyViolation = true;
-      violationReason   = `Exceeds per-claim limit of ${catLimit.maxPerClaim} for ${category}.`;
+      violationReason = `Exceeds per-claim limit of ${catLimit.maxPerClaim} for ${category}.`;
     }
   }
   if (type === 'itemized' && lineItems.some((it) => it.policyViolation)) {
@@ -184,55 +181,56 @@ const submitClaim = async (req, res) => {
   // chain entirely (an already-declared policy field that had no effect until now).
   const autoApprove = policy.autoApproveUnder != null && finalAmount <= policy.autoApproveUnder;
   const now = new Date();
-  const approvalChain = autoApprove ? [] : await buildApprovalChain(new ObjectId(employeeId), finalAmount, policy);
+  const approvalChain = autoApprove ? [] : await buildApprovalChain(employeeId, finalAmount, policy);
 
   const doc = {
-    employeeId:       new ObjectId(employeeId),
-    department:       employeeDoc?.department || null,
+    id: newId(),
+    employeeId,
+    department: employeeDoc?.department || null,
     type,
-    category:         category || null,
-    amount:           finalAmount,
-    currency:         currency || 'KES',
-    date:             date      ? new Date(date) : new Date(),
-    description:      description || null,
-    notes:            notes || null,
+    category: category || null,
+    amount: finalAmount,
+    currency: currency || 'KES',
+    date: date ? new Date(date) : new Date(),
+    description: description || null,
+    notes: notes || null,
     receiptFile,
-    destination:      destination   || null,
-    startDate:        startDate     ? new Date(startDate)  : null,
-    endDate:          endDate       ? new Date(endDate)    : null,
-    perDiemDays:      days || null,
-    fromLocation:     fromLocation  || null,
-    toLocation:       toLocation    || null,
-    distanceKm:       distanceKm    ? Number(distanceKm)   : null,
-    isRoundTrip:      Boolean(isRoundTrip),
-    projectId:        projectId     ? new ObjectId(projectId) : null,
-    isBillable:       Boolean(isBillable),
-    items:            lineItems,
+    destination: destination || null,
+    startDate: startDate ? new Date(startDate) : null,
+    endDate: endDate ? new Date(endDate) : null,
+    perDiemDays: days || null,
+    fromLocation: fromLocation || null,
+    toLocation: toLocation || null,
+    distanceKm: distanceKm ? Number(distanceKm) : null,
+    isRoundTrip: Boolean(isRoundTrip),
+    projectId: projectId || null,
+    isBillable: Boolean(isBillable),
+    items: JSON.stringify(lineItems),
     isPolicyViolation,
     violationReason,
-    policyId:         policy._id || null,
-    approvalChain,
+    policyId: policy.id || null,
+    approvalChain: JSON.stringify(approvalChain),
     currentApprovalLevel: approvalChain[0]?.level ?? 0,
-    status:           autoApprove ? 'approved' : 'submitted',
-    approvedBy:       null, approvedAt: autoApprove ? now : null,
-    rejectedBy:       null, rejectedAt: null, rejectionReason: null,
-    reimbursedAt:     null,
-    payrollCycleId:   null,
-    createdAt:        now, updatedAt: now,
+    status: autoApprove ? 'approved' : 'submitted',
+    approvedBy: null, approvedAt: autoApprove ? now : null,
+    rejectedBy: null, rejectedAt: null, rejectionReason: null,
+    reimbursedAt: null,
+    payrollCycleId: null,
+    createdAt: now, updatedAt: now,
   };
 
-  const result = await insertOne('expense_claims', doc);
+  const [saved] = await knex('expense_claims').insert(doc).returning('*');
 
   // Inbox: notify manager that an expense claim was submitted (skip if auto-approved)
-  const empForInbox = await findOne('employees', { _id: doc.employeeId }, { projection: { fullName: 1 } });
+  const empForInbox = await knex('employees').where({ id: doc.employeeId }).select('fullName').first();
   const empNameInbox = empForInbox?.fullName || 'An employee';
   if (!autoApprove) {
     const expensePayload = {
       type: 'expense', subType: 'expense_claim',
       title: `Expense claim from ${empNameInbox}`,
       subtitle: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type} · ${description || ''}`.trim().replace(/·\s*$/, ''),
-      referenceId: result.insertedId, referenceModel: 'expense_claims',
-      requiresAction: true, triggeredBy: req.user._id,
+      referenceId: saved.id, referenceModel: 'expense_claims',
+      requiresAction: true, triggeredBy: req.user?.id ?? null,
     };
     await notifyManager(doc.employeeId, expensePayload);
     notifyHR(expensePayload).catch(() => {});
@@ -254,31 +252,31 @@ const submitClaim = async (req, res) => {
       type: 'expense', subType: 'expense_claim_auto_approved',
       title: `Expense claim auto-approved for ${empNameInbox}`,
       subtitle: `${currency || 'KES'} ${finalAmount.toLocaleString()} · ${category || type} (under policy threshold, no approval needed)`,
-      referenceId: result.insertedId, referenceModel: 'expense_claims',
-      requiresAction: false, triggeredBy: req.user._id,
+      referenceId: saved.id, referenceModel: 'expense_claims',
+      requiresAction: false, triggeredBy: req.user?.id ?? null,
     }).catch(() => {});
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, isPolicyViolation, autoApproved: autoApprove });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id, isPolicyViolation, autoApproved: autoApprove });
 };
 
 // ── Update Claim ──────────────────────────────────────────────────────────────
 
 const updateClaim = async (req, res) => {
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
   if (claim.status !== 'submitted' && claim.status !== 'draft') return returnFunction(res, 400, false, 'Cannot edit after approval.');
-  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
   if (!isHR && String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
   const { amount, description, category, date, notes, items } = req.body;
   const update = { updatedAt: new Date() };
   if (description) update.description = description;
-  if (category)    update.category    = category;
-  if (date)        update.date        = new Date(date);
-  if (notes)       update.notes       = notes;
+  if (category)    update.category = category;
+  if (date)        update.date = new Date(date);
+  if (notes)       update.notes = notes;
   if (claim.type === 'itemized' && Array.isArray(items)) {
-    update.items = items.map((it) => ({
-      id: it.id || new ObjectId().toString(),
+    const newItems = items.map((it) => ({
+      id: it.id || newId(),
       categoryId: it.categoryId || '', categoryName: it.categoryName || it.categoryId || 'Other',
       description: it.description || '', amount: Number(it.amount) || 0,
       currency: it.currency || claim.currency || 'KES',
@@ -286,45 +284,46 @@ const updateClaim = async (req, res) => {
       receiptFile: it.receiptFile || null, merchantName: it.merchantName || null,
       notes: it.notes || null, policyViolation: null,
     }));
-    update.amount = update.items.reduce((s, it) => s + it.amount, 0);
+    update.items = JSON.stringify(newItems);
+    update.amount = newItems.reduce((s, it) => s + it.amount, 0);
   } else if (amount) {
     update.amount = Number(amount);
   }
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('expense_claims').where({ id: req.params.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 // ── Delete ────────────────────────────────────────────────────────────────────
 
 const deleteClaim = async (req, res) => {
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
-  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
   if (isHR) return returnFunction(res, 403, false, 'HR cannot delete employee expense claims.');
   if (String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
-  if (!['draft','rejected'].includes(claim.status)) return returnFunction(res, 400, false, 'Only draft or rejected claims can be deleted.');
-  await global.dbo.collection('expense_claims').deleteOne({ _id: new ObjectId(req.params.id) });
+  if (!['draft', 'rejected'].includes(claim.status)) return returnFunction(res, 400, false, 'Only draft or rejected claims can be deleted.');
+  await knex('expense_claims').where({ id: req.params.id }).delete();
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
 const disputeClaim = async (req, res) => {
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
-  const isHR = ['super_admin','hr_manager'].includes(req.user?.role);
+  const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
   if (isHR) return returnFunction(res, 403, false, 'HR cannot dispute claims.');
   if (String(claim.employeeId) !== String(req.user?.employeeId)) return returnFunction(res, 403, false, 'Access denied.');
   if (claim.status !== 'rejected') return returnFunction(res, 400, false, 'Only rejected claims can be disputed.');
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'disputed', disputeReason: req.body.reason || null, disputedAt: new Date(), updatedAt: new Date() },
+  await knex('expense_claims').where({ id: req.params.id }).update({
+    status: 'disputed', disputeReason: req.body.reason || null, disputedAt: new Date(), updatedAt: new Date(),
   });
-  const dispEmployee = await findOne('employees', { _id: claim.employeeId }, { projection: { fullName: 1 } });
+  const dispEmployee = await knex('employees').where({ id: claim.employeeId }).select('fullName').first();
   const dispName = dispEmployee?.fullName || 'An employee';
   notifyHR({
     type: 'expense', subType: 'expense_dispute',
     title: `Expense dispute from ${dispName}`,
     subtitle: req.body.reason ? `"${req.body.reason}"` : 'No reason provided',
-    referenceId: claim._id, referenceModel: 'expense_claims',
-    requiresAction: true, triggeredBy: req.user._id,
+    referenceId: claim.id, referenceModel: 'expense_claims',
+    requiresAction: true, triggeredBy: req.user?.id ?? null,
   }).catch(() => {});
   notifyByRoles(['super_admin', 'hr_manager'], {
     title: 'Expense Claim Disputed',
@@ -344,7 +343,7 @@ const disputeClaim = async (req, res) => {
 // they fall through to the HR/dept-head-only override path, same as before.
 
 const approveClaim = async (req, res) => {
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
   if (!['submitted', 'disputed'].includes(claim.status)) return returnFunction(res, 400, false, 'Claim is not pending approval.');
   if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
@@ -365,18 +364,18 @@ const approveClaim = async (req, res) => {
       ? { ...a, status: 'approved', actedAt: now, comment: req.body?.comment || null }
       : a);
     nextPending = chain.find((a) => a.status === 'pending' && a.level > levelEntry.level) || null;
-    update.approvalChain = chain;
+    update.approvalChain = JSON.stringify(chain);
   }
 
   if (nextPending) {
     update.currentApprovalLevel = nextPending.level;
   } else {
     update.status = 'approved';
-    update.approvedBy = req.user?._id ?? null;
+    update.approvedBy = req.user?.id ?? null;
     update.approvedAt = now;
   }
 
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('expense_claims').where({ id: req.params.id }).update(update);
 
   if (nextPending) {
     notifyUser(nextPending.approverId, {
@@ -400,7 +399,7 @@ const approveClaim = async (req, res) => {
 
 const rejectClaim = async (req, res) => {
   if (!validateRequiredFields(req, res, ['reason'])) return;
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
   if (!['submitted', 'disputed'].includes(claim.status)) return returnFunction(res, 400, false, 'Claim is not pending approval.');
   if (claim.employeeId && String(claim.employeeId) === String(req.user?.employeeId)) {
@@ -414,15 +413,15 @@ const rejectClaim = async (req, res) => {
 
   const now = new Date();
   const update = {
-    status: 'rejected', rejectedBy: req.user?._id ?? null, rejectedAt: now,
+    status: 'rejected', rejectedBy: req.user?.id ?? null, rejectedAt: now,
     rejectionReason: req.body.reason, updatedAt: now,
   };
   if (levelEntry) {
-    update.approvalChain = claim.approvalChain.map((a) => a.level === levelEntry.level
+    update.approvalChain = JSON.stringify(claim.approvalChain.map((a) => a.level === levelEntry.level
       ? { ...a, status: 'rejected', actedAt: now, comment: req.body.reason }
-      : a);
+      : a));
   }
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, { $set: update });
+  await knex('expense_claims').where({ id: req.params.id }).update(update);
   if (claim.employeeId) {
     notifyEmployee(claim.employeeId, {
       title: 'Expense Claim Rejected',
@@ -436,9 +435,9 @@ const rejectClaim = async (req, res) => {
 // ── Export CSV ────────────────────────────────────────────────────────────────
 
 const exportClaims = async (req, res) => {
-  const data = await findMany('expense_claims', {}, { sort: { createdAt: -1 }, limit: 5000 });
-  const enriched = await Promise.all(data.map(async c => {
-    const emp = await findOne('employees', { _id: c.employeeId }, { projection: { fullName: 1, staffNumber: 1 } });
+  const data = await knex('expense_claims').orderBy('createdAt', 'desc').limit(5000);
+  const enriched = await Promise.all(data.map(async (c) => {
+    const emp = await knex('employees').where({ id: c.employeeId }).select('fullName', 'staffNumber').first();
     return [
       emp?.staffNumber ?? '', emp?.fullName ?? '', c.type, c.category ?? '', c.amount,
       c.currency, c.date?.toISOString().split('T')[0] ?? '', c.status,
@@ -458,42 +457,32 @@ const getAnalytics = async (req, res) => {
   // super_admin/hr: org-wide. department_head: their department only. Anyone with
   // direct reports (employees.managerId): their team only. Everyone else: own data.
   const scope = await buildSpendScopeFilter(req);
-  const filter = { ...scope, createdAt: { $gte: start, $lt: end }, status: { $in: ['approved','reimbursed'] } };
+  const applyScope = (q) => {
+    if (scope?.department !== undefined) return q.where({ department: scope.department });
+    if (scope?.employeeIds) return q.whereIn('employeeId', scope.employeeIds);
+    return q;
+  };
+  const baseFilter = (q) => applyScope(q.where('createdAt', '>=', start).where('createdAt', '<', end).whereIn('status', ['approved', 'reimbursed']));
 
-  const [byCategory, byMonth, byDept, topSpenders] = await Promise.all([
-    global.dbo.collection('expense_claims').aggregate([
-      { $match: filter },
-      { $group: { _id: '$category', total: { $sum: '$amount' }, count: { $sum: 1 } } },
-      { $sort: { total: -1 } },
-    ]).toArray(),
-    global.dbo.collection('expense_claims').aggregate([
-      { $match: filter },
-      { $group: { _id: { $month: '$date' }, total: { $sum: '$amount' } } },
-      { $sort: { '_id': 1 } },
-    ]).toArray(),
-    global.dbo.collection('expense_claims').aggregate([
-      { $match: filter },
-      { $lookup: { from: 'employees', localField: 'employeeId', foreignField: '_id', as: 'emp' } },
-      { $unwind: { path: '$emp', preserveNullAndEmptyArrays: true } },
-      { $group: { _id: '$emp.department', total: { $sum: '$amount' } } },
-      { $sort: { total: -1 } }, { $limit: 10 },
-    ]).toArray(),
-    global.dbo.collection('expense_claims').aggregate([
-      { $match: filter },
-      { $group: { _id: '$employeeId', total: { $sum: '$amount' }, count: { $sum: 1 } } },
-      { $sort: { total: -1 } }, { $limit: 10 },
-    ]).toArray(),
+  const [byCategory, byMonthRows, byDeptRows, topSpendersRows] = await Promise.all([
+    baseFilter(knex('expense_claims')).select('category').sum('amount as total').count('* as count').groupBy('category').orderBy('total', 'desc'),
+    baseFilter(knex('expense_claims')).select(knex.raw('EXTRACT(MONTH FROM "date") as month')).sum('amount as total').groupBy(knex.raw('EXTRACT(MONTH FROM "date")')).orderBy('month'),
+    baseFilter(knex('expense_claims')).select('department').sum('amount as total').groupBy('department').orderBy('total', 'desc').limit(10),
+    baseFilter(knex('expense_claims')).select('employeeId').sum('amount as total').count('* as count').groupBy('employeeId').orderBy('total', 'desc').limit(10),
   ]);
 
   const months = Array(12).fill(0);
-  byMonth.forEach(m => { if (m._id >= 1 && m._id <= 12) months[m._id - 1] = m.total; });
+  byMonthRows.forEach((m) => { const idx = Number(m.month); if (idx >= 1 && idx <= 12) months[idx - 1] = Number(m.total) || 0; });
 
-  const topEnriched = await Promise.all(topSpenders.map(async t => {
-    const emp = await findOne('employees', { _id: t._id }, { projection: { fullName: 1, department: 1 } });
-    return { ...t, employee: emp ?? null };
+  const byDept = byDeptRows.map((d) => ({ _id: d.department, total: Number(d.total) || 0 }));
+  const byCategoryOut = byCategory.map((c) => ({ _id: c.category, total: Number(c.total) || 0, count: Number(c.count) }));
+
+  const topEnriched = await Promise.all(topSpendersRows.map(async (t) => {
+    const emp = await knex('employees').where({ id: t.employeeId }).select('fullName', 'department').first();
+    return { _id: t.employeeId, total: Number(t.total) || 0, count: Number(t.count), employee: emp ?? null };
   }));
 
-  return returnFunction(res, 200, true, req.locale.success, { byCategory, byMonth: months, byDept, topSpenders: topEnriched });
+  return returnFunction(res, 200, true, req.locale.success, { byCategory: byCategoryOut, byMonth: months, byDept, topSpenders: topEnriched });
 };
 
 // ── Policy ────────────────────────────────────────────────────────────────────
@@ -503,19 +492,19 @@ const getAnalytics = async (req, res) => {
 // /expense-claims/policies routes below and never touch the default.
 
 const getPolicy = async (req, res) => {
-  const policy = await findOne('expense_policies', { isDefault: true }) || await findOne('expense_policies', {});
+  const policy = await knex('expense_policies').where({ isDefault: true }).first() || await knex('expense_policies').first();
   return returnFunction(res, 200, true, req.locale.success, policy ?? {});
 };
 
 // ── Multi-policy CRUD (targeted policies) ────────────────────────────────────
 
 const listPolicies = async (req, res) => {
-  const policies = await findMany('expense_policies', {}, { sort: { isDefault: -1, createdAt: -1 } });
+  const policies = await knex('expense_policies').orderBy('isDefault', 'desc').orderBy('createdAt', 'desc');
   return returnFunction(res, 200, true, req.locale.success, policies);
 };
 
 const getPolicyById = async (req, res) => {
-  const policy = await findOne('expense_policies', { _id: new ObjectId(req.params.id) });
+  const policy = await knex('expense_policies').where({ id: req.params.id }).first();
   if (!policy) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, policy);
 };
@@ -527,47 +516,52 @@ const createPolicy = async (req, res) => {
           hrApprovalThreshold, reimbursementCycle } = req.body;
 
   if (isDefault) {
-    await global.dbo.collection('expense_policies').updateMany({}, { $set: { isDefault: false } });
+    await knex('expense_policies').update({ isDefault: false });
   }
 
   const doc = {
+    id: newId(),
     name, description: description || null,
     isDefault: Boolean(isDefault),
-    appliesTo: appliesTo || {},
-    categories: categories || [],
-    approvalChain: approvalChain || [],
-    perDiemRates: perDiemRates || [],
+    appliesTo: JSON.stringify(appliesTo || {}),
+    categories: JSON.stringify(categories || []),
+    approvalChain: JSON.stringify(approvalChain || []),
+    perDiemRates: JSON.stringify(perDiemRates || []),
     defaultPerDiemRate: defaultPerDiemRate ?? null,
     mileageRate: mileageRate ?? null,
-    categoryLimits: categoryLimits || [],
+    categoryLimits: JSON.stringify(categoryLimits || []),
     autoApproveUnder: autoApproveUnder ?? null,
     hrApprovalThreshold: hrApprovalThreshold ?? null,
     reimbursementCycle: reimbursementCycle || 'withNextPayroll',
     isActive: true,
-    createdBy: req.user?._id ?? null,
+    createdBy: req.user?.id ?? null,
     createdAt: new Date(), updatedAt: new Date(),
   };
-  const result = await insertOne('expense_policies', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId });
+  const [saved] = await knex('expense_policies').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { id: saved.id });
 };
 
 const updatePolicyById = async (req, res) => {
-  const existing = await findOne('expense_policies', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('expense_policies').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   if (req.body.isDefault) {
-    await global.dbo.collection('expense_policies').updateMany({ _id: { $ne: existing._id } }, { $set: { isDefault: false } });
+    await knex('expense_policies').whereNot({ id: existing.id }).update({ isDefault: false });
   }
-  const update = { ...req.body, updatedAt: new Date() };
-  delete update._id;
-  await updateOne('expense_policies', { _id: existing._id }, { $set: update });
+  const JSONB_FIELDS = ['appliesTo', 'categories', 'approvalChain', 'perDiemRates', 'categoryLimits'];
+  const update = { updatedAt: new Date() };
+  for (const [key, val] of Object.entries(req.body)) {
+    if (key === 'id') continue;
+    update[key] = JSONB_FIELDS.includes(key) ? JSON.stringify(val) : val;
+  }
+  await knex('expense_policies').where({ id: existing.id }).update(update);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
 const deletePolicyById = async (req, res) => {
-  const existing = await findOne('expense_policies', { _id: new ObjectId(req.params.id) });
+  const existing = await knex('expense_policies').where({ id: req.params.id }).first();
   if (!existing) return returnFunction(res, 404, false, req.locale.notFound);
   if (existing.isDefault) return returnFunction(res, 400, false, 'Cannot deactivate the default policy — mark another policy as default first.');
-  await updateOne('expense_policies', { _id: existing._id }, { $set: { isActive: false, updatedAt: new Date() } });
+  await knex('expense_policies').where({ id: existing.id }).update({ isActive: false, updatedAt: new Date() });
   return returnFunction(res, 200, true, req.locale.deletedSuccessfully);
 };
 
@@ -578,22 +572,20 @@ const markReimbursed = async (req, res) => {
   if (!REIMBURSEMENT_METHODS.includes(req.body.paymentMethod)) {
     return returnFunction(res, 400, false, `paymentMethod must be one of: ${REIMBURSEMENT_METHODS.join(', ')}`);
   }
-  const claim = await findOne('expense_claims', { _id: new ObjectId(req.params.id) });
+  const claim = await knex('expense_claims').where({ id: req.params.id }).first();
   if (!claim) return returnFunction(res, 404, false, req.locale.notFound);
   if (claim.status !== 'approved') return returnFunction(res, 400, false, 'Only approved claims can be marked as reimbursed.');
 
   const now = new Date();
-  await updateOne('expense_claims', { _id: new ObjectId(req.params.id) }, {
-    $set: {
-      status: 'reimbursed',
-      reimbursedAt: now,
-      reimbursedBy: req.user?._id ?? null,
-      reimbursementMethod: req.body.paymentMethod,
-      reimbursementReference: req.body.reference || null,
-      reimbursementEvidenceFilename: req.file?.filename ?? null,
-      reimbursementEvidenceOriginalName: req.file?.originalname ?? null,
-      updatedAt: now,
-    },
+  await knex('expense_claims').where({ id: req.params.id }).update({
+    status: 'reimbursed',
+    reimbursedAt: now,
+    reimbursedBy: req.user?.id ?? null,
+    reimbursementMethod: req.body.paymentMethod,
+    reimbursementReference: req.body.reference || null,
+    reimbursementEvidenceFilename: req.file?.filename ?? null,
+    reimbursementEvidenceOriginalName: req.file?.originalname ?? null,
+    updatedAt: now,
   });
 
   // A claim pulled into a payroll cycle already has its amount inside that cycle's
@@ -602,20 +594,20 @@ const markReimbursed = async (req, res) => {
   if (!claim.payrollCycleId) {
     const payload = {
       date: new Date(), description: `Expense reimbursement — ${claim.category || 'expense'} (${req.body.paymentMethod})`,
-      source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim._id, referenceModel: 'expense_claims',
+      source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim.id, referenceModel: 'expense_claims',
       department: claim.department || null, lines: [],
     };
     try {
-      const categoryAcct = await pgKnex('gl_accounts').whereRaw('? = ANY("linkedExpenseCategories")', [claim.category]).whereNot({ isActive: false }).first();
+      const categoryAcct = await knex('gl_accounts').whereRaw('? = ANY("linkedExpenseCategories")', [claim.category]).whereNot({ isActive: false }).first();
       const expenseAcct = categoryAcct || await resolveSystemAccount('other_expense');
       const paymentAcct = await resolveSystemAccount(resolvePaymentSystemKey(req.body.paymentMethod));
       // categoryAcct (fetched directly via knex, not through glEngine) only ever carries
       // the plain Postgres `id`, not the Mongo-alias `_id` resolveSystemAccount's results
       // have — fall back to `.id` so this works either way.
       payload.lines = [{ accountId: expenseAcct._id || expenseAcct.id, debit: claim.amount || 0 }, { accountId: paymentAcct._id, credit: claim.amount || 0 }];
-      if (claim.amount > 0) await postJournalEntry({ ...payload, postedBy: req.user?._id ?? null });
+      if (claim.amount > 0) await postJournalEntry({ ...payload, postedBy: req.user?.id ?? null });
     } catch (err) {
-      await logPostingFailure({ source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim._id, referenceModel: 'expense_claims', attemptedPayload: payload, error: err });
+      await logPostingFailure({ source: 'expense_reimbursement', sourceModule: 'expenses', referenceId: claim.id, referenceModel: 'expense_claims', attemptedPayload: payload, error: err });
     }
   }
 
@@ -629,7 +621,7 @@ const markReimbursed = async (req, res) => {
 
     // In-app notification alone is easy to miss — reimbursement is money actually
     // moving, so it gets an email too, same as payroll's payslip-generated flow.
-    const claimant = await findOne('users', { employeeId: new ObjectId(claim.employeeId) }, { projection: { email: 1, name: 1 } });
+    const claimant = await knex('users').where({ employeeId: claim.employeeId }).select('email', 'name').first();
     if (claimant?.email) {
       const methodLabel = req.body.paymentMethod.replace('_', ' ');
       sendEmail({
@@ -651,13 +643,22 @@ const markReimbursed = async (req, res) => {
 };
 
 const updatePolicy = async (req, res) => {
-  const existing = await findOne('expense_policies', { isDefault: true }) || await findOne('expense_policies', {});
-  const update = { ...req.body, isDefault: true, updatedAt: new Date() };
-  delete update._id;
+  const existing = await knex('expense_policies').where({ isDefault: true }).first() || await knex('expense_policies').first();
+  const JSONB_FIELDS = ['appliesTo', 'categories', 'approvalChain', 'perDiemRates', 'categoryLimits'];
+  const rawUpdate = { ...req.body, isDefault: true, updatedAt: new Date() };
+  delete rawUpdate.id;
+  const update = {};
+  for (const [key, val] of Object.entries(rawUpdate)) {
+    update[key] = JSONB_FIELDS.includes(key) ? JSON.stringify(val) : val;
+  }
   if (existing) {
-    await updateOne('expense_policies', { _id: existing._id }, { $set: update });
+    await knex('expense_policies').where({ id: existing.id }).update(update);
   } else {
-    await insertOne('expense_policies', { ...update, name: update.name || 'Default Policy', appliesTo: {}, isActive: true, createdBy: req.user?._id ?? null, createdAt: new Date() });
+    await knex('expense_policies').insert({
+      id: newId(), ...update, name: update.name || 'Default Policy',
+      appliesTo: update.appliesTo ?? JSON.stringify({}), isActive: true,
+      createdBy: req.user?.id ?? null, createdAt: new Date(),
+    });
   }
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };

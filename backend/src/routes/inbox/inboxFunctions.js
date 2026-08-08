@@ -192,28 +192,18 @@ const takeAction = async (req, res) => {
       }
 
       if (item.type === 'expense' && item.referenceModel === 'expense_claims') {
-        const update = action === 'approved'
-          ? { status: 'approved', approvedBy: req.user._id, approvedAt: now }
-          : { status: 'rejected', rejectedBy: req.user._id, rejectedAt: now, rejectionReason: reason || '' };
-        await global.dbo.collection('expense_claims').updateOne({ _id: item.referenceId }, { $set: { ...update, updatedAt: now } });
-
-        const claim = await findOne('expense_claims', { _id: item.referenceId });
-        if (claim) {
-          const empUser = await pgDB.findOne('users', { employeeId: String(claim.employeeId) });
-          if (empUser) {
-            await createInboxItem({
-              recipientId: empUser._id,
-              type: 'general',
-              subType: `expense_${action}`,
-              title: `Expense claim ${action}`,
-              subtitle: `Your expense claim has been ${action}.`,
-              referenceId: item.referenceId,
-              referenceModel: 'expense_claims',
-              requiresAction: false,
-              triggeredBy: req.user._id,
-            });
-          }
-        }
+        // Delegates to the real expense-claims module (approval-chain walking,
+        // canActOnLevel authorization, GL posting on reimbursement) instead of writing
+        // to expense_claims directly — same fix as the leave-requests/timesheets
+        // branches above, for the same reason: the direct write bypassed all of that,
+        // including the "cannot approve your own claim" guard.
+        const { approveClaim, rejectClaim } = require('../expenses/expenseClaimsFunctions');
+        const shimReq = { params: { id: String(item.referenceId) }, body: { comment: reason, reason: reason || '' }, user: req.user, locale: req.locale };
+        let shimResult = null;
+        const shimRes = { status: () => shimRes, json: (payload) => { shimResult = payload; } };
+        if (action === 'approved') await approveClaim(shimReq, shimRes);
+        else await rejectClaim(shimReq, shimRes);
+        if (shimResult && !shimResult.success) return returnFunction(res, 400, false, shimResult.message);
       }
 
       if (item.type === 'timesheet' && item.referenceModel === 'timesheets') {

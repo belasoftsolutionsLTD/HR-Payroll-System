@@ -1,10 +1,9 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 8) — logistics_shipments/logistics_routes/
+// logistics_route_stops are Postgres now. inventory_transfers/pos_sales were already
+// fixed in Phase 6 (kept as-is below).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, countDocuments } = require('../../functions/Database/commonDBFunctions');
-// inventory_transfers/pos_sales are Postgres now (Phase 6) — found while sweeping
-// Logistics; logistics_shipments/logistics_routes stay Mongo, Logistics' own phase (8).
-const { knex } = require('../../functions/Database/pgDBFunctions');
 const { getLogisticsAccessLevel, getLogisticsDepartmentFilter } = require('../../lib/logistics/logisticsAccess');
 const { completeInventoryTransfer } = require('../../lib/inventory/inventoryIntegration');
 
@@ -21,27 +20,25 @@ const listShipments = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   const { page, limit, skip } = getPagination(req.query);
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
+  let query = knex('logistics_shipments');
+  if (req.query.status) query = query.where({ status: req.query.status });
   if (level === 'driver') {
-    const routes = await findMany('logistics_routes', { driverId: req.user.employeeId }, { projection: { _id: 1 } });
-    filter.routeId = { $in: routes.map((r) => r._id) };
+    const routes = await knex('logistics_routes').where({ driverId: String(req.user.employeeId) }).select('id');
+    query = query.whereIn('routeId', routes.map((r) => r.id));
   } else {
     const deptFilter = getLogisticsDepartmentFilter(req.user, level);
-    if (deptFilter) Object.assign(filter, deptFilter);
+    if (deptFilter) query = query.where(deptFilter);
   }
 
-  const [total, shipments] = await Promise.all([
-    countDocuments('logistics_shipments', filter),
-    findMany('logistics_shipments', filter, { skip, limit, sort: { createdAt: -1 } }),
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(shipments, total, page, limit));
+  const [{ count }] = await query.clone().count('* as count');
+  const shipments = await query.clone().orderBy('createdAt', 'desc').limit(limit).offset(skip);
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(shipments, Number(count), page, limit));
 };
 
 const getShipment = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const shipment = await findOne('logistics_shipments', { _id: new ObjectId(req.params.id) });
+  const shipment = await knex('logistics_shipments').where({ id: req.params.id }).first();
   if (!shipment) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.success, shipment);
 };
@@ -76,11 +73,11 @@ const createShipment = async (req, res) => {
   let routeId = null;
   let stopId = null;
   if (req.body.routeId) {
-    const route = await findOne('logistics_routes', { _id: new ObjectId(req.body.routeId) });
+    const route = await knex('logistics_routes').where({ id: req.body.routeId }).first();
     if (!route) return returnFunction(res, 400, false, 'Route not found.');
-    routeId = route._id;
+    routeId = route.id;
     if (req.body.stopId) {
-      const stop = (route.stops || []).find((s) => s.id === req.body.stopId);
+      const stop = await knex('logistics_route_stops').where({ id: req.body.stopId, routeId: route.id }).first();
       if (!stop) return returnFunction(res, 400, false, 'That stop does not belong to the selected route.');
       stopId = stop.id;
     }
@@ -97,6 +94,7 @@ const createShipment = async (req, res) => {
   }
 
   const doc = {
+    id: newId(),
     sourceType, sourceId,
     status: 'pending',
     routeId, stopId,
@@ -104,12 +102,12 @@ const createShipment = async (req, res) => {
     actualDeliveryDate: null,
     exceptionReason: null, exceptionResolution: null, exceptionResolvedAt: null,
     department: req.body.department || null,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('logistics_shipments', doc);
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  const [saved] = await knex('logistics_shipments').insert(doc).returning('*');
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, saved);
 };
 
 const updateShipmentStatus = async (req, res) => {
@@ -118,8 +116,8 @@ const updateShipmentStatus = async (req, res) => {
   if (!TRANSITIONABLE.includes(req.body.status)) {
     return returnFunction(res, 400, false, `status must be one of: ${TRANSITIONABLE.join(', ')} (use the dedicated deliver/exception actions for those).`);
   }
-  const result = await updateOne('logistics_shipments', { _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, updatedAt: new Date() } });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const updated = await knex('logistics_shipments').where({ id: req.params.id }).update({ status: req.body.status, updatedAt: new Date() });
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -128,7 +126,7 @@ const updateShipmentStatus = async (req, res) => {
 // directly when a driver marks a stop Delivered, the same "call the function, don't
 // duplicate the logic" pattern as completeInventoryTransfer itself.
 async function markShipmentDelivered(shipmentId, performedBy) {
-  const shipment = await findOne('logistics_shipments', { _id: new ObjectId(shipmentId) });
+  const shipment = await knex('logistics_shipments').where({ id: shipmentId }).first();
   if (!shipment) throw new Error('Shipment not found.');
   if (shipment.status === 'delivered') return shipment;
 
@@ -136,17 +134,17 @@ async function markShipmentDelivered(shipmentId, performedBy) {
     await completeInventoryTransfer(shipment.sourceId, performedBy);
   }
 
-  await updateOne('logistics_shipments', { _id: shipment._id }, {
-    $set: { status: 'delivered', actualDeliveryDate: new Date(), updatedAt: new Date() },
-  });
-  return shipment;
+  const [updated] = await knex('logistics_shipments').where({ id: shipment.id }).update({
+    status: 'delivered', actualDeliveryDate: new Date(), updatedAt: new Date(),
+  }).returning('*');
+  return updated;
 }
 
 const markDelivered = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level || level === 'driver') return returnFunction(res, 403, false, 'Not authorized.');
   try {
-    await markShipmentDelivered(req.params.id, req.user._id);
+    await markShipmentDelivered(req.params.id, req.user.id);
   } catch (err) {
     return returnFunction(res, 400, false, err.message);
   }
@@ -157,22 +155,22 @@ const flagException = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   if (!validateRequiredFields(req, res, ['reason'])) return;
-  const result = await updateOne('logistics_shipments', { _id: new ObjectId(req.params.id) }, {
-    $set: { status: 'exception', exceptionReason: req.body.reason, updatedAt: new Date() },
+  const updated = await knex('logistics_shipments').where({ id: req.params.id }).update({
+    status: 'exception', exceptionReason: req.body.reason, updatedAt: new Date(),
   });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, 'Exception flagged.');
 };
 
 const resolveException = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (level !== 'admin' && level !== 'opsAdmin') return returnFunction(res, 403, false, 'Not authorized.');
-  const shipment = await findOne('logistics_shipments', { _id: new ObjectId(req.params.id) });
+  const shipment = await knex('logistics_shipments').where({ id: req.params.id }).first();
   if (!shipment) return returnFunction(res, 404, false, req.locale.notFound);
   if (shipment.status !== 'exception') return returnFunction(res, 400, false, 'This shipment has no open exception.');
   const backTo = req.body.resumeStatus && TRANSITIONABLE.includes(req.body.resumeStatus) ? req.body.resumeStatus : 'in_transit';
-  await updateOne('logistics_shipments', { _id: shipment._id }, {
-    $set: { status: backTo, exceptionResolution: req.body.resolution || null, exceptionResolvedAt: new Date(), updatedAt: new Date() },
+  await knex('logistics_shipments').where({ id: shipment.id }).update({
+    status: backTo, exceptionResolution: req.body.resolution || null, exceptionResolvedAt: new Date(), updatedAt: new Date(),
   });
   return returnFunction(res, 200, true, 'Exception resolved.');
 };
@@ -182,33 +180,28 @@ const resolveException = async (req, res) => {
 const getPredictedETA = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const shipment = await findOne('logistics_shipments', { _id: new ObjectId(req.params.id) });
+  const shipment = await knex('logistics_shipments').where({ id: req.params.id }).first();
   if (!shipment) return returnFunction(res, 404, false, req.locale.notFound);
 
   if (!shipment.routeId) return returnFunction(res, 200, true, req.locale.success, { predictedETA: shipment.expectedDeliveryDate });
 
-  const route = await findOne('logistics_routes', { _id: shipment.routeId });
-  const pastDelivered = await findMany('logistics_shipments', {
-    routeId: shipment.routeId, status: 'delivered', actualDeliveryDate: { $ne: null }, expectedDeliveryDate: { $ne: null },
-  }, {});
+  const pastDelivered = await knex('logistics_shipments').where({ routeId: shipment.routeId, status: 'delivered' })
+    .whereNotNull('actualDeliveryDate').whereNotNull('expectedDeliveryDate');
   if (!pastDelivered.length || !shipment.expectedDeliveryDate) {
     return returnFunction(res, 200, true, req.locale.success, { predictedETA: shipment.expectedDeliveryDate });
   }
   const avgDelayMs = pastDelivered.reduce((s, p) => s + (new Date(p.actualDeliveryDate) - new Date(p.expectedDeliveryDate)), 0) / pastDelivered.length;
   const predictedETA = new Date(new Date(shipment.expectedDeliveryDate).getTime() + avgDelayMs);
-  return returnFunction(res, 200, true, req.locale.success, { predictedETA, basedOnDeliveries: pastDelivered.length, route: route?._id || null });
+  return returnFunction(res, 200, true, req.locale.success, { predictedETA, basedOnDeliveries: pastDelivered.length, route: shipment.routeId });
 };
 
 const getDeliveryPerformanceReport = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (level !== 'admin' && level !== 'opsAdmin') return returnFunction(res, 403, false, 'Not authorized.');
-  const match = {};
-  if (req.query.startDate || req.query.endDate) {
-    match.createdAt = {};
-    if (req.query.startDate) match.createdAt.$gte = new Date(req.query.startDate);
-    if (req.query.endDate) match.createdAt.$lte = new Date(req.query.endDate);
-  }
-  const shipments = await findMany('logistics_shipments', match, {});
+  let query = knex('logistics_shipments');
+  if (req.query.startDate) query = query.where('createdAt', '>=', new Date(req.query.startDate));
+  if (req.query.endDate) query = query.where('createdAt', '<=', new Date(req.query.endDate));
+  const shipments = await query;
   const delivered = shipments.filter((s) => s.status === 'delivered');
   const exceptions = shipments.filter((s) => s.status === 'exception' || s.exceptionReason);
   const onTime = delivered.filter((s) => s.expectedDeliveryDate && s.actualDeliveryDate && new Date(s.actualDeliveryDate) <= new Date(s.expectedDeliveryDate));
@@ -231,10 +224,10 @@ const getDeliveryPerformanceReport = async (req, res) => {
 const exportDeliveryPerformanceCSV = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (level !== 'admin' && level !== 'opsAdmin') return returnFunction(res, 403, false, 'Not authorized.');
-  const shipments = await findMany('logistics_shipments', {}, { sort: { createdAt: -1 } });
+  const shipments = await knex('logistics_shipments').orderBy('createdAt', 'desc');
   const header = 'Shipment,Source Type,Status,Expected Delivery,Actual Delivery,Exception Reason';
   const rows = shipments.map((s) => [
-    String(s._id), s.sourceType, s.status,
+    s.id, s.sourceType, s.status,
     s.expectedDeliveryDate ? new Date(s.expectedDeliveryDate).toISOString().split('T')[0] : '',
     s.actualDeliveryDate ? new Date(s.actualDeliveryDate).toISOString().split('T')[0] : '',
     s.exceptionReason || '',

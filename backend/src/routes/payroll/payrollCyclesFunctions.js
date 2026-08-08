@@ -470,9 +470,7 @@ async function doLockCycleInternal(req, res, cycle) {
     // period — not raw attendance_records. A timesheet must go through the manager
     // approval gate before its overtime hours affect pay, and each one is stamped
     // with this cycle's id below so it's never counted into a payroll run twice.
-    // timesheets now lives in Postgres (Phase 3b). empObjectId (below) is still needed
-    // for expense_claims, which stays Mongo.
-    const empObjectId = new ObjectId(emp.id);
+    // timesheets now lives in Postgres (Phase 3b).
     const cycleTimesheets = await knex('timesheets')
       .where({ employeeId: emp.id, status: 'approved' }).whereNull('payrollRunId')
       .where('weekStart', '>=', cycle.periodStartDate).where('weekStart', '<=', cycle.periodEndDate);
@@ -538,20 +536,15 @@ async function doLockCycleInternal(req, res, cycle) {
     }
 
     // Pull approved expense reimbursements for this cycle period. expense_claims is
-    // unmigrated — stays Mongo.
-    const expenseDocs = await global.dbo.collection('expense_claims').find({
-      employeeId: empObjectId,
-      status: 'approved',
-      approvedAt: { $gte: cycle.periodStartDate, $lte: cycle.periodEndDate },
-      payrollCycleId: null,
-    }).toArray();
-    const expenseReimbursements = expenseDocs.reduce((s, e) => s + (e.amount || 0), 0);
-    const expenseIds = expenseDocs.map(e => e._id);
+    // Postgres now (Phase 8).
+    const expenseDocs = await knex('expense_claims')
+      .where({ employeeId: emp.id, status: 'approved' })
+      .where('approvedAt', '>=', cycle.periodStartDate).where('approvedAt', '<=', cycle.periodEndDate)
+      .whereNull('payrollCycleId');
+    const expenseReimbursements = expenseDocs.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+    const expenseIds = expenseDocs.map((e) => e.id);
     if (expenseIds.length) {
-      await global.dbo.collection('expense_claims').updateMany(
-        { _id: { $in: expenseIds } },
-        { $set: { payrollCycleId: new ObjectId(cycle.id), updatedAt: new Date() } }
-      );
+      await knex('expense_claims').whereIn('id', expenseIds).update({ payrollCycleId: cycle.id, updatedAt: new Date() });
     }
 
     // Pull approved leave overlapping this cycle period. Every approved leave type shows as

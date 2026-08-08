@@ -1,7 +1,11 @@
-const { ObjectId } = require('mongodb');
+// Postgres migration (Phase 8) — logistics_routes/logistics_vehicles/logistics_shipments
+// are Postgres now, and route stops are a REAL child table (logistics_route_stops), not
+// JSONB — updateStopStatus/uploadProofOfDelivery both did a genuine Mongo arrayFilters
+// positional update, the clearest "real per-row addressability" signal this migration
+// uses to mean "child table" (see the migration file's own header comment).
+const { knex, newId } = require('../../functions/Database/pgDBFunctions');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
-const { findOne, findMany, insertOne, updateOne, updateMany, countDocuments } = require('../../functions/Database/commonDBFunctions');
 const { getLogisticsAccessLevel, getLogisticsDepartmentFilter } = require('../../lib/logistics/logisticsAccess');
 const { markShipmentDelivered } = require('./logisticsShipmentsFunctions');
 
@@ -36,31 +40,30 @@ const listRoutes = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   const { page, limit, skip } = getPagination(req.query);
-  const filter = {};
-  if (req.query.status) filter.status = req.query.status;
+  let query = knex('logistics_routes');
+  if (req.query.status) query = query.where({ status: req.query.status });
   if (level === 'driver') {
-    filter.driverId = req.user.employeeId;
+    query = query.where({ driverId: String(req.user.employeeId) });
   } else {
     const deptFilter = getLogisticsDepartmentFilter(req.user, level);
-    if (deptFilter) Object.assign(filter, deptFilter);
+    if (deptFilter) query = query.where(deptFilter);
   }
 
-  const [total, routes] = await Promise.all([
-    countDocuments('logistics_routes', filter),
-    findMany('logistics_routes', filter, { skip, limit, sort: { date: -1 } }),
-  ]);
-  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(routes, total, page, limit));
+  const [{ count }] = await query.clone().count('* as count');
+  const routes = await query.clone().orderBy('date', 'desc').limit(limit).offset(skip);
+  return returnFunction(res, 200, true, req.locale.success, paginatedResponse(routes, Number(count), page, limit));
 };
 
 const getRoute = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
-  const route = await findOne('logistics_routes', { _id: new ObjectId(req.params.id) });
+  const route = await knex('logistics_routes').where({ id: req.params.id }).first();
   if (!route) return returnFunction(res, 404, false, req.locale.notFound);
-  if (level === 'driver' && String(route.driverId) !== String(req.user.employeeId)) {
+  if (level === 'driver' && route.driverId !== String(req.user.employeeId)) {
     return returnFunction(res, 403, false, 'You can only view your own routes.');
   }
-  return returnFunction(res, 200, true, req.locale.success, route);
+  const stops = await knex('logistics_route_stops').where({ routeId: route.id }).orderBy('sequence');
+  return returnFunction(res, 200, true, req.locale.success, { ...route, stops });
 };
 
 const createRoute = async (req, res) => {
@@ -69,19 +72,19 @@ const createRoute = async (req, res) => {
   if (!validateRequiredFields(req, res, ['vehicleId', 'driverId', 'date', 'stops'])) return;
   if (!Array.isArray(req.body.stops) || !req.body.stops.length) return returnFunction(res, 400, false, 'At least one stop is required.');
 
-  const vehicle = await findOne('logistics_vehicles', { _id: new ObjectId(req.body.vehicleId) });
+  const vehicle = await knex('logistics_vehicles').where({ id: req.body.vehicleId }).first();
   if (!vehicle) return returnFunction(res, 400, false, 'Vehicle not found.');
-  const driver = await findOne('employees', { _id: new ObjectId(req.body.driverId) });
+  const driver = await knex('employees').where({ id: req.body.driverId }).first();
   if (!driver) return returnFunction(res, 400, false, 'Driver (employee) not found.');
 
   const rawStops = req.body.stops.map((s) => ({
-    id: new ObjectId().toString(),
+    id: newId(),
     address: s.address,
     lat: typeof s.lat === 'number' ? s.lat : null,
     lng: typeof s.lng === 'number' ? s.lng : null,
     timeWindowStart: s.timeWindowStart || null,
     timeWindowEnd: s.timeWindowEnd || null,
-    shipmentId: s.shipmentId ? new ObjectId(s.shipmentId) : null,
+    shipmentId: s.shipmentId || null,
     status: 'pending',
     proofOfDeliveryUrl: null,
     signatureUrl: null,
@@ -90,40 +93,40 @@ const createRoute = async (req, res) => {
   }));
   const stops = sequenceStops(rawStops);
 
+  const routeId = newId();
   const doc = {
-    vehicleId: vehicle._id,
-    driverId: driver._id,
+    id: routeId,
+    vehicleId: vehicle.id,
+    driverId: driver.id,
     date: new Date(req.body.date),
-    stops,
     status: 'planned',
     department: req.body.department || null,
-    createdBy: req.user._id,
+    createdBy: req.user.id,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
-  const result = await insertOne('logistics_routes', doc);
+  const [saved] = await knex('logistics_routes').insert(doc).returning('*');
+  await knex('logistics_route_stops').insert(stops.map((s) => ({ ...s, routeId })));
 
   // A shipment placed on a route is now "picked up" — it moves off 'pending' the moment
   // it's actually assigned a driver/vehicle, not just when a stop is delivered.
   const shipmentIds = stops.map((s) => s.shipmentId).filter(Boolean);
   if (shipmentIds.length) {
-    await updateMany('logistics_shipments', { _id: { $in: shipmentIds } }, {
-      $set: { routeId: result.insertedId, status: 'picked_up', updatedAt: new Date() },
-    });
+    await knex('logistics_shipments').whereIn('id', shipmentIds).update({ routeId, status: 'picked_up', updatedAt: new Date() });
     for (const stop of stops) {
-      if (stop.shipmentId) await updateOne('logistics_shipments', { _id: stop.shipmentId }, { $set: { stopId: stop.id } });
+      if (stop.shipmentId) await knex('logistics_shipments').where({ id: stop.shipmentId }).update({ stopId: stop.id });
     }
   }
 
-  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { _id: result.insertedId, ...doc });
+  return returnFunction(res, 201, true, req.locale.createdSuccessfully, { ...saved, stops });
 };
 
 const updateRouteStatus = async (req, res) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (level !== 'admin' && level !== 'opsAdmin') return returnFunction(res, 403, false, 'Not authorized.');
   if (!ROUTE_STATUSES.includes(req.body.status)) return returnFunction(res, 400, false, `status must be one of: ${ROUTE_STATUSES.join(', ')}`);
-  const result = await updateOne('logistics_routes', { _id: new ObjectId(req.params.id) }, { $set: { status: req.body.status, updatedAt: new Date() } });
-  if (!result.matchedCount) return returnFunction(res, 404, false, req.locale.notFound);
+  const updated = await knex('logistics_routes').where({ id: req.params.id }).update({ status: req.body.status, updatedAt: new Date() });
+  if (!updated) return returnFunction(res, 404, false, req.locale.notFound);
   return returnFunction(res, 200, true, req.locale.updatedSuccessfully);
 };
 
@@ -136,12 +139,12 @@ const updateStopStatus = async (req, res) => {
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   if (!STOP_STATUSES.includes(req.body.status)) return returnFunction(res, 400, false, `status must be one of: ${STOP_STATUSES.join(', ')}`);
 
-  const route = await findOne('logistics_routes', { _id: new ObjectId(req.params.id) });
+  const route = await knex('logistics_routes').where({ id: req.params.id }).first();
   if (!route) return returnFunction(res, 404, false, req.locale.notFound);
-  if (level === 'driver' && String(route.driverId) !== String(req.user.employeeId)) {
+  if (level === 'driver' && route.driverId !== String(req.user.employeeId)) {
     return returnFunction(res, 403, false, 'You can only update your own route.');
   }
-  const stop = route.stops.find((s) => s.id === req.params.stopId);
+  const stop = await knex('logistics_route_stops').where({ id: req.params.stopId, routeId: route.id }).first();
   if (!stop) return returnFunction(res, 404, false, 'Stop not found on this route.');
 
   if (stop.status === 'delivered' && stop.shipmentId) {
@@ -151,32 +154,25 @@ const updateStopStatus = async (req, res) => {
 
   if (req.body.status === 'delivered' && stop.shipmentId) {
     try {
-      await markShipmentDelivered(stop.shipmentId, req.user._id);
+      await markShipmentDelivered(stop.shipmentId, req.user.id);
     } catch (err) {
       return returnFunction(res, 400, false, err.message);
     }
   }
 
-  await updateOne(
-    'logistics_routes',
-    { _id: route._id },
-    {
-      $set: {
-        'stops.$[stop].status': req.body.status,
-        'stops.$[stop].notes': req.body.notes || null,
-        'stops.$[stop].completedAt': ['delivered', 'failed'].includes(req.body.status) ? new Date() : null,
-        updatedAt: new Date(),
-      },
-    },
-    { arrayFilters: [{ 'stop.id': req.params.stopId }] }
-  );
+  await knex('logistics_route_stops').where({ id: stop.id }).update({
+    status: req.body.status,
+    notes: req.body.notes || null,
+    completedAt: ['delivered', 'failed'].includes(req.body.status) ? new Date() : null,
+  });
+  await knex('logistics_routes').where({ id: route.id }).update({ updatedAt: new Date() });
 
-  const refreshed = await findOne('logistics_routes', { _id: route._id });
-  const allTerminal = refreshed.stops.every((s) => ['delivered', 'failed'].includes(s.status));
-  if (allTerminal && refreshed.status !== 'completed') {
-    await updateOne('logistics_routes', { _id: route._id }, { $set: { status: 'completed', updatedAt: new Date() } });
-  } else if (refreshed.status === 'planned') {
-    await updateOne('logistics_routes', { _id: route._id }, { $set: { status: 'in_progress', updatedAt: new Date() } });
+  const allStops = await knex('logistics_route_stops').where({ routeId: route.id });
+  const allTerminal = allStops.every((s) => ['delivered', 'failed'].includes(s.status));
+  if (allTerminal && route.status !== 'completed') {
+    await knex('logistics_routes').where({ id: route.id }).update({ status: 'completed', updatedAt: new Date() });
+  } else if (route.status === 'planned') {
+    await knex('logistics_routes').where({ id: route.id }).update({ status: 'in_progress', updatedAt: new Date() });
   }
 
   return returnFunction(res, 200, true, 'Stop updated.');
@@ -189,21 +185,17 @@ const uploadProofOfDelivery = async (req, res, field) => {
   const level = await getLogisticsAccessLevel(req.user);
   if (!level) return returnFunction(res, 403, false, 'Not authorized.');
   if (!req.file) return returnFunction(res, 400, false, 'No file uploaded.');
-  const route = await findOne('logistics_routes', { _id: new ObjectId(req.params.id) });
+  const route = await knex('logistics_routes').where({ id: req.params.id }).first();
   if (!route) return returnFunction(res, 404, false, req.locale.notFound);
-  if (level === 'driver' && String(route.driverId) !== String(req.user.employeeId)) {
+  if (level === 'driver' && route.driverId !== String(req.user.employeeId)) {
     return returnFunction(res, 403, false, 'You can only upload proof of delivery for your own route.');
   }
-  const stop = route.stops.find((s) => s.id === req.params.stopId);
+  const stop = await knex('logistics_route_stops').where({ id: req.params.stopId, routeId: route.id }).first();
   if (!stop) return returnFunction(res, 404, false, 'Stop not found on this route.');
 
-  const urlField = field === 'signature' ? 'stops.$[stop].signatureUrl' : 'stops.$[stop].proofOfDeliveryUrl';
-  await updateOne(
-    'logistics_routes',
-    { _id: route._id },
-    { $set: { [urlField]: req.file.path, updatedAt: new Date() } },
-    { arrayFilters: [{ 'stop.id': req.params.stopId }] }
-  );
+  const column = field === 'signature' ? 'signatureUrl' : 'proofOfDeliveryUrl';
+  await knex('logistics_route_stops').where({ id: stop.id }).update({ [column]: req.file.path });
+  await knex('logistics_routes').where({ id: route.id }).update({ updatedAt: new Date() });
   return returnFunction(res, 200, true, 'Proof of delivery uploaded.', { path: req.file.path });
 };
 

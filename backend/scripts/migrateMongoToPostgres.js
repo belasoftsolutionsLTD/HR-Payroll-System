@@ -1361,6 +1361,206 @@ async function main() {
       status: i.status ?? null, reconciledAt: toDate(i.reconciledAt), reconciledBy: idStr(i.reconciledBy), createdAt: toDate(i.createdAt),
     })));
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  PHASE 8 — Logistics, Spending/Procurement/Expenses
+    // ══════════════════════════════════════════════════════════════════════
+
+    // po_number_*/po_invoice_number_* counters — same "seed the real live seq, don't
+    // start fresh at 0" lesson as every earlier phase's counter migration.
+    const spendCounters = await dbo.collection('counters')
+      .find({ _id: { $regex: /^(po_number|po_invoice_number)_/ } }).toArray();
+    counts.counters = (counts.counters || 0) + await upsertBatched('counters', spendCounters.map((c) => ({
+      id: idStr(c._id), seq: c.seq ?? 0,
+    })));
+
+    // ── Logistics ────────────────────────────────────────────────────────────
+    const vehicleTypes = await dbo.collection('logistics_vehicle_types').find({}).toArray();
+    counts.logistics_vehicle_types = await upsertBatched('logistics_vehicle_types', vehicleTypes.map((v) => ({
+      id: idStr(v._id), name: v.name ?? null, isActive: v.isActive ?? true, createdAt: toDate(v.createdAt), updatedAt: toDate(v.updatedAt),
+    })));
+
+    const serviceBays = await dbo.collection('logistics_service_bays').find({}).toArray();
+    counts.logistics_service_bays = await upsertBatched('logistics_service_bays', serviceBays.map((b) => ({
+      id: idStr(b._id), name: b.name ?? null, isActive: b.isActive ?? true, createdAt: toDate(b.createdAt), updatedAt: toDate(b.updatedAt),
+    })));
+
+    const vehicles = await dbo.collection('logistics_vehicles').find({}).toArray();
+    counts.logistics_vehicles = await upsertBatched('logistics_vehicles', vehicles.map((v) => ({
+      id: idStr(v._id), make: v.make ?? null, model: v.model ?? null, licensePlate: v.licensePlate ?? null, vin: v.vin ?? null,
+      vehicleType: v.vehicleType ?? null, driverId: idStr(v.driverId), status: v.status ?? null, currentLocation: v.currentLocation ?? null,
+      odometer: v.odometer ?? 0, fuelType: v.fuelType ?? null, department: v.department ?? null, createdBy: idStr(v.createdBy),
+      createdAt: toDate(v.createdAt), updatedAt: toDate(v.updatedAt), locationUpdatedAt: toDate(v.locationUpdatedAt),
+    })));
+
+    // logistics_vehicles must exist before logistics_routes (FK) — written above.
+    const routes = await dbo.collection('logistics_routes').find({}).toArray();
+    counts.logistics_routes = await upsertBatched('logistics_routes', routes.map((r) => ({
+      id: idStr(r._id), vehicleId: idStr(r.vehicleId), driverId: idStr(r.driverId), date: toDate(r.date), status: r.status ?? null,
+      department: r.department ?? null, createdBy: idStr(r.createdBy), createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // logistics_routes must exist before logistics_shipments (FK routeId) — written above.
+    const shipments = await dbo.collection('logistics_shipments').find({}).toArray();
+    counts.logistics_shipments = await upsertBatched('logistics_shipments', shipments.map((s) => ({
+      id: idStr(s._id), sourceType: s.sourceType ?? null, sourceId: idStr(s.sourceId), status: s.status ?? null,
+      routeId: idStr(s.routeId), stopId: s.stopId ?? null, expectedDeliveryDate: toDate(s.expectedDeliveryDate),
+      actualDeliveryDate: toDate(s.actualDeliveryDate), exceptionReason: s.exceptionReason ?? null,
+      exceptionResolution: s.exceptionResolution ?? null, exceptionResolvedAt: toDate(s.exceptionResolvedAt),
+      department: s.department ?? null, createdBy: idStr(s.createdBy), createdAt: toDate(s.createdAt), updatedAt: toDate(s.updatedAt),
+    })));
+
+    // logistics_routes/logistics_shipments must both exist before logistics_route_stops
+    // (FK routeId/shipmentId) — written above.
+    const stopRows = routes.flatMap((r) => (Array.isArray(r.stops) ? r.stops : []).map((s) => ({
+      id: idStr(s.id), routeId: idStr(r._id), sequence: s.sequence ?? null, address: s.address ?? null,
+      lat: s.lat ?? null, lng: s.lng ?? null, timeWindowStart: s.timeWindowStart ?? null, timeWindowEnd: s.timeWindowEnd ?? null,
+      shipmentId: idStr(s.shipmentId), status: s.status ?? null, proofOfDeliveryUrl: s.proofOfDeliveryUrl ?? null,
+      signatureUrl: s.signatureUrl ?? null, notes: s.notes ?? null, completedAt: toDate(s.completedAt),
+    })));
+    counts.logistics_route_stops = await upsertBatched('logistics_route_stops', stopRows);
+
+    const workOrders = await dbo.collection('logistics_work_orders').find({}).toArray();
+    counts.logistics_work_orders = await upsertBatched('logistics_work_orders', workOrders.map((w) => ({
+      id: idStr(w._id), vehicleId: idStr(w.vehicleId), type: w.type ?? null, description: w.description ?? null, status: w.status ?? null,
+      scheduledDate: toDate(w.scheduledDate), completedDate: toDate(w.completedDate), serviceBay: w.serviceBay ?? null,
+      laborCost: w.laborCost ?? 0, otherCost: w.otherCost ?? 0, totalCost: w.totalCost ?? 0, postedToAccounting: w.postedToAccounting ?? false,
+      createdBy: idStr(w.createdBy), createdAt: toDate(w.createdAt), updatedAt: toDate(w.updatedAt),
+    })));
+
+    // logistics_work_orders must exist before logistics_work_order_parts (FK) — written
+    // above. No natural id on a part — auto-increment PK, plain insert (no upsert key).
+    const partRows = workOrders.flatMap((w) => (Array.isArray(w.partsUsed) ? w.partsUsed : []).map((p) => ({
+      workOrderId: idStr(w._id), itemId: idStr(p.itemId), itemName: p.itemName ?? null, sku: p.sku ?? null,
+      locationId: idStr(p.locationId), quantity: p.quantity ?? null, unitCost: p.unitCost ?? null,
+    })));
+    counts.logistics_work_order_parts = await upsertBatched('logistics_work_order_parts', partRows, null);
+
+    // ── Spending / Procurement / Expenses ─────────────────────────────────────
+    const vendors = await dbo.collection('vendors').find({}).toArray();
+    counts.vendors = await upsertBatched('vendors', vendors.map((v) => ({
+      id: idStr(v._id), name: v.name ?? null, contactName: v.contactName ?? null, email: v.email ?? null, phone: v.phone ?? null,
+      address: v.address ?? null, category: v.category ?? null, type: v.type ?? null, taxId: v.taxId ?? null, paymentTerms: v.paymentTerms ?? null,
+      bankDetails: v.bankDetails ? JSON.stringify(v.bankDetails) : null, documents: v.documents ? JSON.stringify(v.documents) : null,
+      status: v.status ?? null, notes: v.notes ?? null, approvedBy: idStr(v.approvedBy), approvedAt: toDate(v.approvedAt),
+      rejectedBy: idStr(v.rejectedBy), rejectedAt: toDate(v.rejectedAt), rejectionReason: v.rejectionReason ?? null,
+      createdBy: idStr(v.createdBy), createdAt: toDate(v.createdAt), updatedAt: toDate(v.updatedAt),
+    })));
+
+    const procPolicies = await dbo.collection('procurement_policies').find({}).toArray();
+    counts.procurement_policies = await upsertBatched('procurement_policies', procPolicies.map((p) => ({
+      id: idStr(p._id), name: p.name ?? null, description: p.description ?? null, appliesTo: p.appliesTo ? JSON.stringify(p.appliesTo) : null,
+      approvalChain: p.approvalChain ? JSON.stringify(p.approvalChain) : null, requiresQuotationAbove: p.requiresQuotationAbove ?? null,
+      preferredVendors: Array.isArray(p.preferredVendors) ? p.preferredVendors.map(String) : null,
+      isDefault: p.isDefault ?? false, isActive: p.isActive ?? true, createdBy: idStr(p.createdBy),
+      createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+    })));
+
+    const expPolicies = await dbo.collection('expense_policies').find({}).toArray();
+    counts.expense_policies = await upsertBatched('expense_policies', expPolicies.map((p) => ({
+      id: idStr(p._id), name: p.name ?? null, description: p.description ?? null, isDefault: p.isDefault ?? false,
+      appliesTo: p.appliesTo ? JSON.stringify(p.appliesTo) : null, categories: p.categories ? JSON.stringify(p.categories) : null,
+      approvalChain: p.approvalChain ? JSON.stringify(p.approvalChain) : null, perDiemRates: p.perDiemRates ? JSON.stringify(p.perDiemRates) : null,
+      defaultPerDiemRate: p.defaultPerDiemRate ?? null, mileageRate: p.mileageRate ?? null,
+      categoryLimits: p.categoryLimits ? JSON.stringify(p.categoryLimits) : null, autoApproveUnder: p.autoApproveUnder ?? null,
+      hrApprovalThreshold: p.hrApprovalThreshold ?? null, reimbursementCycle: p.reimbursementCycle ?? null,
+      isActive: p.isActive ?? true, createdBy: idStr(p.createdBy), createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt),
+    })));
+
+    // vendors/procurement_policies/employees must all exist before purchase_requests (FK) — written above.
+    const purchaseRequests = await dbo.collection('purchase_requests').find({}).toArray();
+    counts.purchase_requests = await upsertBatched('purchase_requests', purchaseRequests.map((r) => ({
+      id: idStr(r._id), title: r.title ?? null, description: r.description ?? null, justification: r.justification ?? null,
+      estimatedCost: r.estimatedCost ?? null, currency: r.currency ?? null, priority: r.priority ?? null, vendor: r.vendor ?? null,
+      vendorId: idStr(r.vendorId), department: r.department ?? null, items: r.items ? JSON.stringify(r.items) : null,
+      neededBy: toDate(r.neededBy), policyId: idStr(r.policyId), approvalChain: r.approvalChain ? JSON.stringify(r.approvalChain) : null,
+      currentApprovalLevel: r.currentApprovalLevel ?? 0, requestedBy: idStr(r.requestedBy), employeeId: idStr(r.employeeId),
+      status: r.status ?? null, convertedToPOId: idStr(r.convertedToPOId), approvedBy: idStr(r.approvedBy), approvedAt: toDate(r.approvedAt),
+      rejectedBy: idStr(r.rejectedBy), rejectedAt: toDate(r.rejectedAt), rejectionReason: r.rejectionReason ?? null,
+      createdAt: toDate(r.createdAt), updatedAt: toDate(r.updatedAt),
+    })));
+
+    // purchase_requests/vendors must both exist before purchase_orders (FK) — written above.
+    const purchaseOrders = await dbo.collection('purchase_orders').find({}).toArray();
+    counts.purchase_orders = await upsertBatched('purchase_orders', purchaseOrders.map((o) => ({
+      id: idStr(o._id), requisitionId: idStr(o.requisitionId), poNumber: o.poNumber ?? null, vendorId: idStr(o.vendorId),
+      requestedBy: idStr(o.requestedBy), departmentId: o.departmentId ?? null, status: o.status ?? null,
+      items: o.items ? JSON.stringify(o.items) : null, totalAmount: o.totalAmount ?? null, currency: o.currency ?? null,
+      deliveryAddress: o.deliveryAddress ?? null, expectedDeliveryDate: toDate(o.expectedDeliveryDate), actualDeliveryDate: toDate(o.actualDeliveryDate),
+      paymentTerms: o.paymentTerms ?? null, notes: o.notes ?? null,
+      attachmentUrls: Array.isArray(o.attachmentUrls) ? o.attachmentUrls.map(String) : null, invoiceId: idStr(o.invoiceId),
+      createdBy: idStr(o.createdBy), createdAt: toDate(o.createdAt), updatedAt: toDate(o.updatedAt),
+    })));
+
+    // purchase_orders must exist before goods_receipts (FK) — written above.
+    const goodsReceipts = await dbo.collection('goods_receipts').find({}).toArray();
+    counts.goods_receipts = await upsertBatched('goods_receipts', goodsReceipts.map((g) => ({
+      id: idStr(g._id), purchaseOrderId: idStr(g.purchaseOrderId), receivedBy: idStr(g.receivedBy), receivedAt: toDate(g.receivedAt),
+      items: g.items ? JSON.stringify(g.items) : null, status: g.status ?? null, notes: g.notes ?? null,
+      attachmentUrls: Array.isArray(g.attachmentUrls) ? g.attachmentUrls.map(String) : null, createdAt: toDate(g.createdAt),
+    })));
+
+    // purchase_orders/vendors must both exist before vendor_invoices (FK) — written above.
+    const vendorInvoices = await dbo.collection('vendor_invoices').find({}).toArray();
+    counts.vendor_invoices = await upsertBatched('vendor_invoices', vendorInvoices.map((i) => ({
+      id: idStr(i._id), purchaseOrderId: idStr(i.purchaseOrderId), vendorId: idStr(i.vendorId), invoiceNumber: i.invoiceNumber ?? null,
+      poInvoiceNumber: i.poInvoiceNumber ?? null, invoiceDate: toDate(i.invoiceDate), dueDate: toDate(i.dueDate),
+      items: i.items ? JSON.stringify(i.items) : null, totalAmount: i.totalAmount ?? null, currency: i.currency ?? null,
+      status: i.status ?? null, threeWayMatchStatus: i.threeWayMatchStatus ?? null, discrepancyNotes: i.discrepancyNotes ?? null,
+      fileUrl: i.fileUrl ?? null, approvedBy: idStr(i.approvedBy), approvedAt: toDate(i.approvedAt), paidAt: toDate(i.paidAt),
+      paymentMethod: i.paymentMethod ?? null, paymentReference: i.paymentReference ?? null,
+      createdAt: toDate(i.createdAt), updatedAt: toDate(i.updatedAt),
+    })));
+
+    const corporateCards = await dbo.collection('corporate_cards').find({}).toArray();
+    counts.corporate_cards = await upsertBatched('corporate_cards', corporateCards.map((c) => ({
+      id: idStr(c._id), last4: c.last4 ?? null, cardHolder: c.cardHolder ?? null, assignedTo: idStr(c.assignedTo),
+      creditLimit: c.creditLimit ?? null, currency: c.currency ?? null, expiryDate: toDate(c.expiryDate), network: c.network ?? null,
+      status: c.status ?? null, createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
+    // corporate_cards must exist before card_transactions (FK) — written above.
+    const cardTransactions = await dbo.collection('card_transactions').find({}).toArray();
+    counts.card_transactions = await upsertBatched('card_transactions', cardTransactions.map((c) => ({
+      id: idStr(c._id), cardId: idStr(c.cardId), amount: c.amount ?? null, description: c.description ?? null, date: toDate(c.date),
+      merchant: c.merchant ?? null, category: c.category ?? null, type: c.type ?? null, createdAt: toDate(c.createdAt),
+    })));
+
+    // Legacy — 0 real rows expected, migrated for completeness (see migration file header).
+    const legacyExpenses = await dbo.collection('expenses').find({}).toArray();
+    counts.expenses = await upsertBatched('expenses', legacyExpenses.map((e) => ({
+      id: idStr(e._id), description: e.description ?? null, category: e.category ?? null, amount: e.amount ?? null,
+      currency: e.currency ?? null, date: toDate(e.date), vendor: e.vendor ?? null, paymentMethod: e.paymentMethod ?? null,
+      notes: e.notes ?? null, recordedBy: e.recordedBy ?? null, createdAt: toDate(e.createdAt), updatedAt: toDate(e.updatedAt),
+    })));
+
+    const legacyInvoices = await dbo.collection('invoices').find({}).toArray();
+    counts.invoices = await upsertBatched('invoices', legacyInvoices.map((i) => ({
+      id: idStr(i._id), vendor: i.vendor ?? null, amount: i.amount ?? null, currency: i.currency ?? null, dueDate: toDate(i.dueDate),
+      description: i.description ?? null, invoiceNumber: i.invoiceNumber ?? null, type: i.type ?? null, projectId: idStr(i.projectId),
+      items: i.items ? JSON.stringify(i.items) : null, status: i.status ?? null, submittedBy: idStr(i.submittedBy),
+      approvedBy: idStr(i.approvedBy), approvedAt: toDate(i.approvedAt), rejectedBy: idStr(i.rejectedBy), rejectedAt: toDate(i.rejectedAt),
+      rejectionReason: i.rejectionReason ?? null, paidAt: toDate(i.paidAt), paymentReference: i.paymentReference ?? null,
+      createdAt: toDate(i.createdAt), updatedAt: toDate(i.updatedAt),
+    })));
+
+    // expense_policies/employees/payroll_cycles must all exist before expense_claims (FK) — payroll_cycles is Postgres since Phase 2.
+    const expenseClaims = await dbo.collection('expense_claims').find({}).toArray();
+    counts.expense_claims = await upsertBatched('expense_claims', expenseClaims.map((c) => ({
+      id: idStr(c._id), employeeId: idStr(c.employeeId), department: c.department ?? null, type: c.type ?? null, category: c.category ?? null,
+      amount: c.amount ?? null, currency: c.currency ?? null, date: toDate(c.date), description: c.description ?? null, notes: c.notes ?? null,
+      receiptFile: c.receiptFile ?? null, destination: c.destination ?? null, startDate: toDate(c.startDate), endDate: toDate(c.endDate),
+      perDiemDays: c.perDiemDays ?? null, fromLocation: c.fromLocation ?? null, toLocation: c.toLocation ?? null, distanceKm: c.distanceKm ?? null,
+      isRoundTrip: c.isRoundTrip ?? false, projectId: idStr(c.projectId), isBillable: c.isBillable ?? false,
+      items: c.items ? JSON.stringify(c.items) : null, isPolicyViolation: c.isPolicyViolation ?? false, violationReason: c.violationReason ?? null,
+      policyId: idStr(c.policyId), approvalChain: c.approvalChain ? JSON.stringify(c.approvalChain) : null, currentApprovalLevel: c.currentApprovalLevel ?? 0,
+      status: c.status ?? null, approvedBy: idStr(c.approvedBy), approvedAt: toDate(c.approvedAt), rejectedBy: idStr(c.rejectedBy),
+      rejectedAt: toDate(c.rejectedAt), rejectionReason: c.rejectionReason ?? null, disputeReason: c.disputeReason ?? null, disputedAt: toDate(c.disputedAt),
+      reimbursedAt: toDate(c.reimbursedAt), reimbursedBy: idStr(c.reimbursedBy), reimbursementMethod: c.reimbursementMethod ?? null,
+      reimbursementReference: c.reimbursementReference ?? null, reimbursementEvidenceFilename: c.reimbursementEvidenceFilename ?? null,
+      reimbursementEvidenceOriginalName: c.reimbursementEvidenceOriginalName ?? null, payrollCycleId: idStr(c.payrollCycleId),
+      createdAt: toDate(c.createdAt), updatedAt: toDate(c.updatedAt),
+    })));
+
     log(DRY_RUN ? 'Dry run complete — row counts that WOULD be written:' : 'Migration complete — rows written:');
     console.table(counts);
   } finally {

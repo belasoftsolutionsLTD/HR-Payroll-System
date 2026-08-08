@@ -1,4 +1,3 @@
-const { ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const returnFunction = require('../../functions/returnFunction');
 const { validateRequiredFields, getPagination, paginatedResponse } = require('../../functions/Route Fns/routeFns');
@@ -7,8 +6,8 @@ const { validateRequiredFields, getPagination, paginatedResponse } = require('..
 // offboarding_tasks/offboarding_asset_checklist/offboarding_access_revocation/
 // offboarding_generated_documents), onboarding_documents, employees, users all now
 // live in Postgres. expense_claims/purchase_requests (via getOpenSpendItems) are
-// unmigrated (own future Spend phase) and stay on the Mongo helper — ObjectId is
-// still needed to call into it correctly.
+// Postgres too now (Phase 8) — getOpenSpendItems takes a plain string employeeId,
+// no ObjectId wrapping needed (found while sweeping Phase 8 for cross-cutting touches).
 const { knex, newId, insertOne, updateOne } = require('../../functions/Database/pgDBFunctions');
 const { notifyByRoles } = require('../../functions/HR/notifyUser');
 const { sendTemplatedEmail } = require('../../services/emailTemplateService');
@@ -219,8 +218,7 @@ const updateRecordTask = async (req, res) => {
   if (!list || !task) return returnFunction(res, 404, false, 'Task not found on this record.');
 
   if (status === 'completed' && task.taskType === 'spend_clearance') {
-    // expense_claims/purchase_requests are still Mongo — they expect a real ObjectId.
-    const { hasOpenItems, openClaims, openRequests } = await getOpenSpendItems(new ObjectId(record.employeeId));
+    const { hasOpenItems, openClaims, openRequests } = await getOpenSpendItems(record.employeeId);
     if (hasOpenItems) {
       return returnFunction(res, 400, false,
         `Cannot clear: ${openClaims.length} expense claim(s) and ${openRequests.length} purchase request(s) are still open. Approve or reject them first.`);

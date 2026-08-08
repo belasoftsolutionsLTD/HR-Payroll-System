@@ -1,5 +1,6 @@
-const { ObjectId } = require('mongodb');
-const { findOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 8) — employees/users have been Postgres since Phase 1; this
+// file was still reading them off the Mongo helper.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 
 // Resolves a concrete, ordered approval chain for one employee's expense claim or
 // purchase request — always live from org data, never hardcoded approver ids.
@@ -12,7 +13,7 @@ const { findOne } = require('../../functions/Database/commonDBFunctions');
 // claim never gets stuck because e.g. an employee has no manager on file.
 const buildApprovalChain = async (employeeId, amount, policy) => {
   const chain = [];
-  const employee = await findOne('employees', { _id: employeeId });
+  const employee = await knex('employees').where({ id: String(employeeId) }).first();
   if (!employee) return chain;
 
   const policyLevels = policy?.approvalChain?.length
@@ -29,25 +30,25 @@ const buildApprovalChain = async (employeeId, amount, policy) => {
     let approver = null;
     if (levelSpec.approverRole === 'manager' && employee.managerId) {
       const [managerEmp, managerUser] = await Promise.all([
-        findOne('employees', { _id: employee.managerId }, { projection: { fullName: 1 } }),
-        findOne('users', { employeeId: employee.managerId }, { projection: { _id: 1, name: 1 } }),
+        knex('employees').where({ id: employee.managerId }).select('fullName').first(),
+        knex('users').where({ employeeId: employee.managerId }).select('id', 'name').first(),
       ]);
-      if (managerUser) approver = { _id: managerUser._id, name: managerEmp?.fullName || managerUser.name };
+      if (managerUser) approver = { id: managerUser.id, name: managerEmp?.fullName || managerUser.name };
     } else if (levelSpec.approverRole === 'department_head' && employee.department) {
-      const deptHeadUser = await findOne('users', { role: 'department_head', department: employee.department }, { projection: { _id: 1, name: 1 } });
-      if (deptHeadUser) approver = { _id: deptHeadUser._id, name: deptHeadUser.name };
+      const deptHeadUser = await knex('users').where({ role: 'department_head', department: employee.department }).select('id', 'name').first();
+      if (deptHeadUser) approver = { id: deptHeadUser.id, name: deptHeadUser.name };
     } else if (['hr_manager', 'hr'].includes(levelSpec.approverRole)) {
-      const hrUser = await findOne('users', { role: { $in: ['hr_manager', 'super_admin'] } }, { projection: { _id: 1, name: 1 } });
-      if (hrUser) approver = { _id: hrUser._id, name: hrUser.name };
+      const hrUser = await knex('users').whereIn('role', ['hr_manager', 'super_admin']).select('id', 'name').first();
+      if (hrUser) approver = { id: hrUser.id, name: hrUser.name };
     } else if (levelSpec.approverRole === 'specificUser' && levelSpec.approverId) {
-      const specificUser = await findOne('users', { _id: new ObjectId(levelSpec.approverId) }, { projection: { _id: 1, name: 1 } });
-      if (specificUser) approver = { _id: specificUser._id, name: specificUser.name };
+      const specificUser = await knex('users').where({ id: String(levelSpec.approverId) }).select('id', 'name').first();
+      if (specificUser) approver = { id: specificUser.id, name: specificUser.name };
     }
 
     if (approver) {
       chain.push({
         level: levelSpec.level,
-        approverId: approver._id,
+        approverId: approver.id,
         approverName: approver.name || 'Unknown',
         approverRole: levelSpec.approverRole,
         status: 'pending',
@@ -74,11 +75,11 @@ const findCurrentLevelEntry = (record) => (record.approvalChain || []).find(
 const canActOnLevel = async (req, record, levelEntry) => {
   const isHR = ['super_admin', 'hr_manager'].includes(req.user?.role);
   if (isHR) return true;
-  if (levelEntry && String(levelEntry.approverId) === String(req.user?._id)) return true;
+  if (levelEntry && String(levelEntry.approverId) === String(req.user?.id)) return true;
   if (req.user?.role === 'department_head' && req.user?.employeeId && record.employeeId) {
     const [recordEmp, reqEmp] = await Promise.all([
-      findOne('employees', { _id: record.employeeId }, { projection: { department: 1 } }),
-      findOne('employees', { _id: req.user.employeeId }, { projection: { department: 1 } }),
+      knex('employees').where({ id: String(record.employeeId) }).select('department').first(),
+      knex('employees').where({ id: String(req.user.employeeId) }).select('department').first(),
     ]);
     if (recordEmp?.department && reqEmp?.department && recordEmp.department === reqEmp.department) return true;
   }

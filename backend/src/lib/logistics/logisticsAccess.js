@@ -1,4 +1,8 @@
-const { findOne } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 8) — employees/logistics_vehicles are Postgres now (employees
+// since Phase 1, logistics_vehicles this phase); this file was still reading employees
+// off the Mongo helper (found while sweeping for Phase 8, same gap as every other
+// module's own accessLevel file before its phase).
+const { knex } = require('../../functions/Database/pgDBFunctions');
 const { SUPER_ADMIN, HR_MANAGER, DEPT_HEAD, STAFF } = require('../../constants/roles');
 
 // Logistics has its own access model layered on the app's 4 real roles, same convention
@@ -26,9 +30,9 @@ const getLogisticsAccessLevel = async (user) => {
   if (user.role === DEPT_HEAD) return 'manager';
   if (user.role === STAFF) {
     if (user.employeeId) {
-      const directReport = await findOne('employees', { managerId: user.employeeId }, { projection: { _id: 1 } });
+      const directReport = await knex('employees').where({ managerId: String(user.employeeId) }).select('id').first();
       if (directReport) return 'manager';
-      const assignedVehicle = await findOne('logistics_vehicles', { driverId: user.employeeId }, { projection: { _id: 1 } });
+      const assignedVehicle = await knex('logistics_vehicles').where({ driverId: String(user.employeeId) }).select('id').first();
       if (assignedVehicle) return 'driver';
     }
   }

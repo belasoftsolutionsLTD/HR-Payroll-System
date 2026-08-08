@@ -1,4 +1,7 @@
-const { findMany } = require('../../functions/Database/commonDBFunctions');
+// Postgres migration (Phase 8) — expense_policies/procurement_policies are Postgres now.
+// `collection` stays the same table-name string parameter so both callers
+// (expenseClaimsFunctions.js, spendingFunctions.js) pass it unchanged.
+const { knex } = require('../../functions/Database/pgDBFunctions');
 
 // Shared by expense_policies and procurement_policies — both use the same
 // `appliesTo: { roles?, departments?, employeeIds? }` targeting shape. More specific
@@ -14,8 +17,8 @@ const specificity = (appliesTo, employeeId, role, department) => {
   return 0;
 };
 
-const resolvePolicy = async (collection, { employeeId, role, department }) => {
-  const policies = await findMany(collection, { isActive: { $ne: false } }, {});
+const resolvePolicy = async (table, { employeeId, role, department }) => {
+  const policies = await knex(table).whereNot({ isActive: false });
   if (!policies.length) return null;
 
   let best = null;
